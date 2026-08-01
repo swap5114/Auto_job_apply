@@ -1,3 +1,5 @@
 gspread #used for interacting with google sheets
 google-auth # used to maintain session between bot and sheet
-python-dotenv 
+python-dotenv
+requests
+beautifulsoup4
