@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup  # type: ignore
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 from storage.sheet_client import add_lead
+from skills.relevance_filter import matches_criteria
 
 URL = "https://jobicy.com/api/v2/remote-jobs"
 
@@ -12,6 +13,7 @@ URL = "https://jobicy.com/api/v2/remote-jobs"
 def run():
     added = 0
     skipped = 0
+    filtered_out = 0
 
     try:
         response = requests.get(URL, timeout=10)
@@ -33,6 +35,10 @@ def run():
                 "posted_date": job.get("pubDate", ""),
             }
 
+            if not matches_criteria(lead):
+                filtered_out += 1
+                continue
+
             if add_lead(lead):
                 added += 1
             else:
@@ -42,7 +48,7 @@ def run():
         print(f"API Call Failed: {e}")
         return
 
-    print(f"\nJobicy: {added} added, {skipped} skipped (duplicates).")
+    print(f"\nJobicy: {added} added, {skipped} skipped (duplicates), {filtered_out} filtered out.")
 
 
 if __name__ == "__main__":

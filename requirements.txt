@@ -3,3 +3,5 @@ google-auth # used to maintain session between bot and sheet
 python-dotenv
 requests
 beautifulsoup4
+anthropic
+xhtml2pdf

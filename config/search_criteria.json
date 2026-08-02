@@ -1,0 +1,23 @@
+{
+  "role_keywords": [
+    "developer", "engineer", "programmer", "software",
+    "backend", "back-end", "frontend", "front-end",
+    "full stack", "full-stack", "fullstack",
+    "mern", "react", "node", "javascript", "python", "java",
+    "ai", "ml", "machine learning", "data scientist",
+    "web developer", "mobile developer", "app developer"
+  ],
+  "seniority_exclude_keywords": [
+    "senior", "sr.", "lead", "principal", "staff",
+    "manager", "director", "head of", "vp", "chief"
+  ],
+  "years_experience_threshold": 1,
+  "location_keywords": [
+    "remote",
+    "usa", "united states", "u.s.", "us-based",
+    "australia",
+    "london", "uk", "united kingdom",
+    "europe", "european union", "eu",
+    "india"
+  ]
+}

@@ -17,6 +17,7 @@ HEADERS = [
     "id", "source", "company", "role", "jd_text", "contact_name",
     "contact_email", "x_handle", "status", "resume_version",
     "outreach_draft", "sent_at", "last_checked", "followup_count",
+    "listing_url", "posted_date", "domain",
 ]
 
 
@@ -53,14 +54,14 @@ def add_lead(lead: dict) -> bool:
     role = lead.get("role", "").strip()
     x_handle = lead.get("x_handle", "").strip()
 
-    if not company or not role:
-        raise ValueError("A lead requires at least 'company' and 'role'.")
+    if not (company and role) and not x_handle:
+        raise ValueError("A lead requires either 'company' and 'role', or an 'x_handle'.")
 
     worksheet = get_worksheet(os.getenv("GOOGLE_SHEET_ID"))
     existing_leads = worksheet.get_all_records()
 
     for existing in existing_leads:
-        same_company_role = (
+        same_company_role = bool(company) and bool(role) and (
             existing.get("company", "").strip().lower() == company.lower()
             and existing.get("role", "").strip().lower() == role.lower()
         )
