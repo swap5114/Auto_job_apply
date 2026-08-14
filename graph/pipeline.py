@@ -116,10 +116,110 @@ class PipelineState(TypedDict, total=False):
     followup_count: int
     listing_url: Optional[str]
     domain: Optional[str]
+    company_research: Optional[Dict[str, Any]]  # Added for research_company node
 
 # ---------------------------------------------------------------------------
 # Node definitions
 # ---------------------------------------------------------------------------
+
+def find_email_node(state: PipelineState) -> Dict[str, Any]:
+    """Find contact email for a lead using Hunter.io or regex scan."""
+    from skills.find_contact_email import find_contact_email_for_lead
+    
+    lead_id = state.get("lead_id", "")
+    company = state.get("company", "")
+    domain = state.get("domain")
+    x_handle = state.get("x_handle")
+    source = state.get("source", "")
+    
+    try:
+        # Mock lead dict for the skill function
+        lead = {
+            "id": lead_id,
+            "company": company,
+            "domain": domain,
+            "x_handle": x_handle,
+            "source": source,
+        }
+        result = find_contact_email_for_lead(lead)
+        
+        if result.get("contact_email"):
+            print(f"  📧 find_email_node: found email for {company}")
+            return {
+                "contact_email": result["contact_email"],
+                "contact_name": result.get("contact_name"),
+                "status": "email_found",
+            }
+        else:
+            print(f"  ⚠️  find_email_node: no email found for {company}")
+            return {"status": "email_not_found"}
+    except Exception as e:
+        print(f"  ❌ find_email_node failed for {company}: {e}")
+        return {"status": "email_search_failed"}
+
+def research_company_node(state: PipelineState) -> Dict[str, Any]:
+    """Research company using Context.dev Brand + Web Scrape APIs."""
+    from skills.research_company import research_company
+    
+    company = state.get("company", "")
+    domain = state.get("domain")
+    listing_url = state.get("listing_url")
+    
+    if not domain and not listing_url:
+        print(f"  ⚠️  research_company_node: no domain/URL for {company}, skipping")
+        return {"status": "research_skipped"}
+    
+    try:
+        research_data = research_company(company, domain, listing_url)
+        
+        if research_data:
+            print(f"  🔍 research_company_node: researched {company}")
+            return {
+                "company_research": research_data,
+                "status": "researched",
+            }
+        else:
+            print(f"  ⚠️  research_company_node: no data found for {company}")
+            return {"status": "research_failed"}
+    except Exception as e:
+        print(f"  ❌ research_company_node failed for {company}: {e}")
+        return {"status": "research_failed"}
+
+def tailor_resume_node(state: PipelineState) -> Dict[str, Any]:
+    """Tailor resume for a lead using Claude/Gemini."""
+    from skills.tailor_resume import tailor_resume_for_lead
+    
+    company = state.get("company", "")
+    role = state.get("role", "")
+    jd_text = state.get("jd_text", "")
+    company_research = state.get("company_research")
+    
+    if not jd_text:
+        print(f"  ⚠️  tailor_resume_node: no JD for {company}, skipping")
+        return {"status": "tailor_skipped"}
+    
+    try:
+        # Mock lead dict for the skill function
+        lead = {
+            "company": company,
+            "role": role,
+            "jd_text": jd_text,
+            "company_research": company_research,  # Pass research data to tailoring
+        }
+        result = tailor_resume_for_lead(lead)
+        
+        if result.get("resume_version"):
+            print(f"  📄 tailor_resume_node: tailored resume for {company}")
+            return {
+                "resume_version": result["resume_version"],
+                "status": "tailored",
+            }
+        else:
+            print(f"  ⚠️  tailor_resume_node: tailoring failed for {company}")
+            return {"status": "tailor_failed"}
+    except Exception as e:
+        print(f"  ❌ tailor_resume_node failed for {company}: {e}")
+        return {"status": "tailor_failed"}
 
 def review_node(state: PipelineState) -> Dict[str, Any]:
     """Interrupt execution for human review checkpoint.
@@ -258,6 +358,7 @@ def draft_node(state: PipelineState) -> Dict[str, Any]:
     resume_version = state.get("resume_version") or ""
     is_followup = state.get("is_followup", False)
     followup_count = state.get("followup_count", 0)
+    company_research = state.get("company_research")
 
     if not resume_version:
         print(f"  ⚠️  draft_node: no resume_version for {company}, skipping")
@@ -299,7 +400,16 @@ Previous message sent:
 {previous_draft}
 """
 
-    user_message = f"""{format_instruction}{followup_context}
+    # Add company research context if available
+    research_context = ""
+    if company_research:
+        research_context = f"""
+
+Company research data (use this to personalize the outreach):
+{json.dumps(company_research, indent=2)}
+"""
+
+    user_message = f"""{format_instruction}{followup_context}{research_context}
 
 Lead details:
 Source: {source}
@@ -352,23 +462,29 @@ def route_after_followup_check(state: PipelineState) -> str:
 def build_pipeline_graph(checkpointer=None):
     """Builds the full pipeline graph with review interrupt and follow-up cycle.
 
-    Main flow: START → review → [send | END]
-    Follow-up flow: START(followup_entry) → followup_check → [draft → review → send | END]
+    Full flow: START → find_email → research_company → tailor_resume → draft → review → [send | END]
+    Follow-up flow: followup_check → draft → review → send
 
-    NOTE: For the initial v1, leads enter the graph at the review node
-    (after skills have already run standalone and populated the Sheet).
-    Phase 10b will wire scrape/filter/email/tailor as upstream nodes.
+    Each node handles its own errors gracefully, allowing the graph to continue
+    processing other leads even if one fails.
     """
     builder = StateGraph(PipelineState)
 
     # Nodes
+    builder.add_node("find_email", find_email_node)
+    builder.add_node("research_company", research_company_node)
+    builder.add_node("tailor_resume", tailor_resume_node)
+    builder.add_node("draft", draft_node)
     builder.add_node("review", review_node)
     builder.add_node("send", send_node)
-    builder.add_node("draft", draft_node)
     builder.add_node("followup_check", followup_check_node)
 
-    # Main flow: leads enter at review (already have draft + resume)
-    builder.add_edge(START, "review")
+    # Main flow: START → find_email → research → tailor → draft → review → [send | END]
+    builder.add_edge(START, "find_email")
+    builder.add_edge("find_email", "research_company")
+    builder.add_edge("research_company", "tailor_resume")
+    builder.add_edge("tailor_resume", "draft")
+    builder.add_edge("draft", "review")
 
     # After review: route to send (approved) or END (rejected)
     builder.add_conditional_edges("review", route_after_review, ["send", END])
@@ -378,11 +494,7 @@ def build_pipeline_graph(checkpointer=None):
 
     # Follow-up cycle: followup_check → draft (if needed) → review → send
     # The followup_check node is entered via a separate graph invocation
-    # (from orchestrator/check_followups.py) that starts at followup_check
     builder.add_conditional_edges("followup_check", route_after_followup_check, ["draft", END])
-
-    # After drafting (follow-up or otherwise): goes to review
-    builder.add_edge("draft", "review")
 
     return builder.compile(checkpointer=checkpointer, interrupt_before=["review"])
 
@@ -391,7 +503,11 @@ def build_followup_graph(checkpointer=None):
 
     Flow: START → followup_check → [draft → review → send | END]
     This is a separate compiled graph that shares the same nodes but enters
-    at the followup_check node instead of review.
+    at the followup_check node instead of the main pipeline start.
+    
+    For follow-ups, we skip find_email and research_company since those were
+    already done in the initial pass. We may optionally re-tailor the resume
+    for follow-ups in the future.
     """
     builder = StateGraph(PipelineState)
 
