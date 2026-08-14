@@ -5,3 +5,5 @@ __pycache__/
 .vscode/
 .idea/
 config/credentials.json
+storage/checkpoints.sqlite
+resumes

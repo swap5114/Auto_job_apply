@@ -17,7 +17,8 @@ HEADERS = [
     "id", "source", "company", "role", "jd_text", "contact_name",
     "contact_email", "x_handle", "status", "resume_version",
     "outreach_draft", "sent_at", "last_checked", "followup_count",
-    "listing_url", "posted_date", "domain",
+    "listing_url", "posted_date", "domain", "review_decision",
+    "demo_idea", "company_info",
 ]
 
 
@@ -58,7 +59,9 @@ def add_lead(lead: dict) -> bool:
         raise ValueError("A lead requires either 'company' and 'role', or an 'x_handle'.")
 
     worksheet = get_worksheet(os.getenv("GOOGLE_SHEET_ID"))
-    existing_leads = worksheet.get_all_records()
+    
+    # Use expected_headers to avoid duplicate empty column errors
+    existing_leads = worksheet.get_all_records(expected_headers=HEADERS)
 
     for existing in existing_leads:
         same_company_role = bool(company) and bool(role) and (
@@ -79,15 +82,24 @@ def add_lead(lead: dict) -> bool:
         else:
             row.append(str(lead.get(field, "")))
 
-    worksheet.append_row(row)
-    print(f"Added lead: {company} - {role} (id={lead_id})")
+    # Instead of append_row which can go to wrong columns,
+    # explicitly write to the next row in columns A-T (20 columns)
+    next_row = len(worksheet.get_all_values()) + 1
+    cell_range = f"A{next_row}:T{next_row}"
+    
+    # Update the range with our row data
+    worksheet.update(cell_range, [row], value_input_option='RAW')
+    
+    print(f"Added lead: {company} - {role} (id={lead_id[:8]}...) to row {next_row}")
     return True
 
 
 def get_leads(status: str = None) -> list:
     """Returns all leads as a list of dicts, optionally filtered by status."""
     worksheet = get_worksheet(os.getenv("GOOGLE_SHEET_ID"))
-    records = worksheet.get_all_records()
+    
+    # Use expected_headers to avoid duplicate empty column errors
+    records = worksheet.get_all_records(expected_headers=HEADERS)
 
     if status is None:
         return records

@@ -2,18 +2,15 @@ import os
 import sys
 import re
 import json
-from anthropic import Anthropic
 from dotenv import load_dotenv
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from storage.sheet_client import get_leads, update_lead
+from skills.llm_client import llm_generate
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "config", ".env"))
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 RESUMES_DIR = os.path.join(os.path.dirname(__file__), "..", "resumes")
-
-MODEL = "claude-sonnet-5"
 
 SYSTEM_PROMPT = """You are an outreach-drafting assistant for a job candidate. You will be given the candidate's tailored resume (JSON) for one specific lead, plus details about that lead. Your job is to draft a short, personalized outreach message about that opportunity.
 
@@ -42,8 +39,6 @@ def load_tailored_resume(resume_version: str) -> dict:
 
 
 def draft_outreach_message(tailored_resume: dict, lead: dict) -> str:
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
-
     source = lead.get("source") or ""
     company = lead.get("company") or ""
     role = lead.get("role") or ""
@@ -79,14 +74,11 @@ Job description / hiring-signal text:
 Candidate's tailored resume for this lead (JSON):
 {json.dumps(tailored_resume, indent=2)}"""
 
-    response = client.messages.create(
-        model=MODEL,
+    raw_text = llm_generate(
+        system_prompt=SYSTEM_PROMPT,
+        user_message=user_message,
         max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
     )
-
-    raw_text = "".join(block.text for block in response.content if block.type == "text").strip()
 
     if raw_text.startswith("```"):
         raw_text = re.sub(r"^```\w*\s*", "", raw_text)
@@ -96,8 +88,10 @@ Candidate's tailored resume for this lead (JSON):
 
 
 def run():
-    if not ANTHROPIC_API_KEY:
-        print("ANTHROPIC_API_KEY not set in config/.env -- skipping draft_outreach.")
+    from skills.llm_client import MODEL_BACKEND, ANTHROPIC_API_KEY
+
+    if MODEL_BACKEND == "claude" and not ANTHROPIC_API_KEY:
+        print("MODEL_BACKEND=claude but ANTHROPIC_API_KEY not set -- skipping draft_outreach.")
         return
 
     leads = get_leads()
@@ -125,9 +119,9 @@ def run():
             print(f"Failed to draft outreach for {label}: {e}")
             continue
 
-        update_lead(lead["id"], {"outreach_draft": draft})
+        update_lead(lead["id"], {"outreach_draft": draft, "status": "pending_review"})
         drafted += 1
-        print(f"\nDrafted outreach for {label}:\n{'-' * 60}\n{draft}\n{'-' * 60}")
+        print(f"\nDrafted outreach for {label} [status -> pending_review]:\n{'-' * 60}\n{draft}\n{'-' * 60}")
 
     print(f"\ndraft_outreach: {drafted} drafts written.")
 

@@ -2,21 +2,18 @@ import os
 import sys
 import re
 import json
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from xhtml2pdf import pisa
 import html as html_lib
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from storage.sheet_client import get_leads, update_lead
+from skills.llm_client import llm_generate_json
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "config", ".env"))
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 BASE_RESUME_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "base_resume.json")
 RESUMES_DIR = os.path.join(os.path.dirname(__file__), "..", "resumes")
-
-MODEL = "claude-sonnet-5"
 
 SYSTEM_PROMPT = """You are a resume-tailoring assistant. You will be given a candidate's base resume (as structured JSON) and a job description. Your job is to produce a tailored version of the resume for this specific job.
 
@@ -43,8 +40,6 @@ def slugify(text: str) -> str:
 
 
 def tailor_resume(base_resume: dict, company: str, role: str, jd_text: str) -> dict:
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
-
     user_message = f"""Job description:
 Company: {company}
 Role: {role}
@@ -54,20 +49,11 @@ Role: {role}
 Base resume (JSON):
 {json.dumps(base_resume, indent=2)}"""
 
-    response = client.messages.create(
-        model=MODEL,
+    return llm_generate_json(
+        system_prompt=SYSTEM_PROMPT,
+        user_message=user_message,
         max_tokens=4096,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
     )
-
-    raw_text = "".join(block.text for block in response.content if block.type == "text").strip()
-
-    if raw_text.startswith("```"):
-        raw_text = re.sub(r"^```(json)?\s*", "", raw_text)
-        raw_text = re.sub(r"\s*```$", "", raw_text)
-
-    return json.loads(raw_text)
 
 
 def keyword_coverage(jd_text: str, tailored_resume: dict) -> float:
@@ -350,8 +336,10 @@ def backfill_pdfs():
 
 
 def run():
-    if not ANTHROPIC_API_KEY:
-        print("ANTHROPIC_API_KEY not set in config/.env -- skipping tailor_resume.")
+    from skills.llm_client import MODEL_BACKEND, ANTHROPIC_API_KEY
+
+    if MODEL_BACKEND == "claude" and not ANTHROPIC_API_KEY:
+        print("MODEL_BACKEND=claude but ANTHROPIC_API_KEY not set -- skipping tailor_resume.")
         return
 
     backfill_pdfs()

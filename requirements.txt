@@ -4,4 +4,10 @@ python-dotenv
 requests
 beautifulsoup4
 anthropic
+ollama
 xhtml2pdf
+langgraph
+langgraph-checkpoint-sqlite
+google-api-python-client
+google-auth-oauthlib
+google-genai

@@ -1,0 +1,96 @@
+"""Follow-up checker — starts the follow-up graph for sent leads.
+
+This is the cron entry point that:
+1. Reads all 'sent' leads from the Sheet
+2. Starts a followup_graph run for each one
+3. The graph checks for replies, drafts follow-ups if needed,
+   and pauses at the review interrupt
+
+Usage:
+    python -m orchestrator.check_followups
+"""
+
+import os
+import sys
+
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+
+from storage.db_client import get_leads, update_lead
+from graph.pipeline import build_followup_graph, get_checkpointer_connection, DB_PATH
+
+def check_and_queue_followups(db_path: str = DB_PATH) -> int:
+    """Check all sent leads for follow-up needs via the followup graph.
+
+    Returns the number of leads that entered the follow-up flow.
+    """
+    cp = get_checkpointer_connection(db_path)
+    graph = build_followup_graph(cp)
+
+    leads = get_leads(status="sent")
+
+    if not leads:
+        print("No sent leads to check for follow-ups.")
+        return 0
+
+    queued = 0
+
+    for lead in leads:
+        lead_id = lead.get("id")
+        if not lead_id:
+            continue
+
+        company = lead.get("company") or lead.get("x_handle") or lead_id
+
+        # Use a unique thread ID for follow-up runs to avoid collision
+        # with the main pipeline thread for the same lead
+        thread_id = f"{lead_id}_followup_{lead.get('followup_count', 0)}"
+        config = {"configurable": {"thread_id": thread_id}}
+
+        state = {
+            "lead_id": lead_id,
+            "source": lead.get("source", ""),
+            "company": lead.get("company", ""),
+            "role": lead.get("role", ""),
+            "jd_text": lead.get("jd_text", ""),
+            "contact_name": lead.get("contact_name") or None,
+            "contact_email": lead.get("contact_email") or None,
+            "x_handle": lead.get("x_handle") or None,
+            "resume_version": lead.get("resume_version") or None,
+            "outreach_draft": lead.get("outreach_draft") or None,
+            "followup_count": int(lead.get("followup_count") or 0),
+            "is_followup": False,  # followup_check_node will set this if needed
+            "status": "sent",
+        }
+
+        try:
+            graph.invoke(state, config)
+
+            # Check if it paused at review (meaning a follow-up draft was generated)
+            final_state = graph.get_state(config)
+            if final_state and final_state.next and "review" in final_state.next:
+                queued += 1
+                print(f"  📋 {company} — follow-up draft queued for review (thread: {thread_id})")
+            else:
+                # Ran to END — either replied, max followups, or check failed
+                status = final_state.values.get("status", "unknown") if final_state else "unknown"
+                print(f"  ✓  {company} — no follow-up needed (status: {status})")
+
+        except Exception as e:
+            print(f"  ❌ Error processing {company}: {e}")
+
+    return queued
+
+def main():
+    print("=" * 60)
+    print("  FOLLOW-UP CHECKER — Checking sent leads for reply status")
+    print("=" * 60)
+    print()
+
+    count = check_and_queue_followups()
+
+    if count > 0:
+        print(f"\n{count} follow-up drafts queued. Run review_cli digest to act on them.")
+    print()
+
+if __name__ == "__main__":
+    main()

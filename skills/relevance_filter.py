@@ -23,9 +23,8 @@ def _contains_keyword(text: str, keyword: str) -> bool:
 def matches_criteria(lead: dict) -> bool:
     """Returns True if the lead matches the user's job-search criteria.
 
-    Coarse, keyword-based heuristic -- not perfect. A JD saying "1-3 years"
-    can get caught by the years-of-experience check, and a lead with no
-    role/title (e.g. X leads) is checked on jd_text alone.
+    STRICT filter: requires BOTH a specific software role keyword AND a tech stack keyword.
+    This prevents matching non-software roles like "operations engineer" or "business developer".
     """
     criteria = load_criteria()
 
@@ -33,14 +32,29 @@ def matches_criteria(lead: dict) -> bool:
     jd_text = (lead.get("jd_text") or "").lower()
     combined = f"{title} {jd_text}"
 
+    # MUST match at least one specific software role keyword
     role_keywords = criteria.get("role_keywords", [])
-    if role_keywords and not any(_contains_keyword(combined, kw) for kw in role_keywords):
+    has_role_keyword = any(_contains_keyword(combined, kw) for kw in role_keywords)
+    
+    # MUST match at least one tech stack keyword (programming language, framework, tool)
+    tech_keywords = criteria.get("tech_stack_keywords", [])
+    has_tech_keyword = any(_contains_keyword(combined, kw) for kw in tech_keywords)
+    
+    # BOTH required - this is the key change
+    if not (has_role_keyword and has_tech_keyword):
         return False
 
+    # Exclude senior/lead roles
     seniority_keywords = criteria.get("seniority_exclude_keywords", [])
     if any(_contains_keyword(combined, kw) for kw in seniority_keywords):
         return False
 
+    # Exclude non-tech roles (operations, business, sales, etc.)
+    non_tech_keywords = criteria.get("non_tech_exclude_keywords", [])
+    if any(_contains_keyword(combined, kw) for kw in non_tech_keywords):
+        return False
+
+    # Exclude roles requiring too much experience
     threshold = criteria.get("years_experience_threshold")
     if threshold is not None:
         for match in re.finditer(r"(\d+)\+?\s*years", jd_text):

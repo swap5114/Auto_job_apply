@@ -1,0 +1,105 @@
+"""Graph feeder — bridges standalone skills with the LangGraph review interrupt.
+
+Reads all leads at status=pending_review from the Google Sheet, starts a
+LangGraph thread for each one (so the graph pauses at the review node), and
+marks the lead as 'in_review' in the Sheet to avoid double-feeding.
+
+Usage:
+    python -m orchestrator.feed_graph
+
+After this runs, use the review CLI to act on paused leads:
+    python -m orchestrator.review_cli digest
+    python -m orchestrator.review_cli approve <lead_id>
+"""
+
+import os
+import sys
+
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+
+from storage.sheet_client import get_leads, update_lead
+from graph.pipeline import build_pipeline_graph, get_checkpointer_connection, DB_PATH
+
+
+def feed_pending_leads(db_path: str = DB_PATH) -> int:
+    """Feeds all pending_review leads into the LangGraph pipeline.
+
+    Each lead gets its own thread (thread_id = lead's id). The graph will
+    pause at the review interrupt node, waiting for approve/edit/reject via
+    the CLI.
+
+    Returns the number of leads fed into the graph.
+    """
+    cp = get_checkpointer_connection(db_path)
+    graph = build_pipeline_graph(cp)
+
+    leads = get_leads(status="pending_review")
+
+    if not leads:
+        print("No leads at status=pending_review. Nothing to feed.")
+        return 0
+
+    fed = 0
+    skipped = 0
+
+    for lead in leads:
+        lead_id = lead.get("id")
+        if not lead_id:
+            print(f"Warning: skipping lead with no id — {lead.get('company', '?')}")
+            continue
+
+        # Check if this lead already has an active graph thread (avoid re-feeding)
+        config = {"configurable": {"thread_id": lead_id}}
+        existing_state = graph.get_state(config)
+        if existing_state and existing_state.values:
+            # Thread already exists for this lead — skip
+            skipped += 1
+            continue
+
+        # Build pipeline state from lead fields
+        state = {
+            "lead_id": lead_id,
+            "source": lead.get("source", ""),
+            "company": lead.get("company", ""),
+            "role": lead.get("role", ""),
+            "jd_text": lead.get("jd_text", ""),
+            "contact_name": lead.get("contact_name") or None,
+            "contact_email": lead.get("contact_email") or None,
+            "x_handle": lead.get("x_handle") or None,
+            "resume_version": lead.get("resume_version") or None,
+            "outreach_draft": lead.get("outreach_draft") or None,
+            "status": "in_review",
+        }
+
+        # Start graph execution — it will hit the review interrupt and pause
+        graph.invoke(state, config)
+
+        # Mark lead as in_review in the Sheet so we don't re-feed it
+        try:
+            update_lead(lead_id, {"status": "in_review"})
+        except Exception as e:
+            print(f"Warning: fed lead {lead_id} into graph but failed to update Sheet status: {e}")
+
+        fed += 1
+        label = lead.get("company") or lead.get("x_handle") or lead_id
+        print(f"  Fed into graph: {label} ({lead_id})")
+
+    print(f"\nfeed_graph: {fed} leads fed, {skipped} already had active threads.")
+    return fed
+
+
+def main():
+    print("=" * 60)
+    print("  GRAPH FEEDER — Loading pending_review leads into pipeline")
+    print("=" * 60)
+    print()
+
+    count = feed_pending_leads()
+
+    if count > 0:
+        print(f"\nDone. Run 'python -m orchestrator.review_cli digest' to review.")
+    print()
+
+
+if __name__ == "__main__":
+    main()
