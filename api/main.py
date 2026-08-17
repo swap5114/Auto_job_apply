@@ -85,11 +85,21 @@ class EditRequest(BaseModel):
     outreach_draft: str
 
 
+class DemoProjectResponse(BaseModel):
+    title: str
+    description: str
+    tech_stack: list[str]
+    deliverable: str
+    time_estimate: str
+    why_impressive: str
+
+
 class ResearchResponse(BaseModel):
     overview: str
     stage: str
     industry: str
     tech_signals: list[str]
+    demo_project: Optional[DemoProjectResponse] = None
     talking_points: list[str]
     smart_questions: list[str]
     fit_summary: str
@@ -283,7 +293,7 @@ def edit_lead(lead_id: str, body: EditRequest):
 
 @app.post("/api/leads/{lead_id}/research", response_model=ResearchResponse)
 def research_lead(lead_id: str):
-    """Generate structured company research for a lead using the LLM."""
+    """Generate structured company research with demo project idea for a lead."""
     get_leads, _, _ = _get_sheet_client()
 
     leads = get_leads()
@@ -299,11 +309,26 @@ def research_lead(lead_id: str):
             role=str(lead.get("role", "")),
             jd_text=str(lead.get("jd_text", "")),
         )
+        
+        # Build demo_project response if present
+        demo_project = None
+        if result.get("demo_project"):
+            dp = result["demo_project"]
+            demo_project = DemoProjectResponse(
+                title=dp.get("title", ""),
+                description=dp.get("description", ""),
+                tech_stack=dp.get("tech_stack", []),
+                deliverable=dp.get("deliverable", ""),
+                time_estimate=dp.get("time_estimate", "2-3 days"),
+                why_impressive=dp.get("why_impressive", ""),
+            )
+        
         return ResearchResponse(
             overview=result.get("overview", ""),
             stage=result.get("stage", "Unknown"),
             industry=result.get("industry", ""),
             tech_signals=result.get("tech_signals", []),
+            demo_project=demo_project,
             talking_points=result.get("talking_points", []),
             smart_questions=result.get("smart_questions", []),
             fit_summary=result.get("fit_summary", ""),

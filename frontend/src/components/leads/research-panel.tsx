@@ -10,6 +10,10 @@ import {
   HelpCircle,
   Target,
   Loader2,
+  Rocket,
+  Code2,
+  Clock,
+  ExternalLink,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { staggerContainer, fadeInUp } from "@/lib/motion";
@@ -38,33 +42,74 @@ function generateResearch(lead: {
   const stage = jd.includes("series") || jd.includes("funding")
     ? "Growth-stage"
     : jd.includes("startup")
-    ? "Early-stage"
-    : "Growth-stage";
+      ? "Early-stage"
+      : "Growth-stage";
+
+  // Generate a demo project idea based on JD signals
+  const demoIdeas = [
+    {
+      condition: jd.includes("ai") || jd.includes("llm") || jd.includes("ml"),
+      title: `AI Feature Demo for ${name}`,
+      description: `Build a small AI-powered tool that solves a problem related to ${name}'s product. For example, an intelligent data classifier, a smart search feature, or an automated content generator.`,
+      tech: ["Python", "FastAPI", "OpenAI API", "React"],
+      deliverable: "Live demo link + GitHub repo",
+      why: "Shows hands-on AI/ML experience directly relevant to their core product"
+    },
+    {
+      condition: jd.includes("api") || jd.includes("backend"),
+      title: `API Integration Demo`,
+      description: `Create a mini service that demonstrates clean API design and integration patterns. Include authentication, rate limiting, and comprehensive documentation.`,
+      tech: tech_signals.slice(0, 3),
+      deliverable: "Live API + Postman collection + GitHub",
+      why: "Demonstrates the exact backend skills they're looking for"
+    },
+    {
+      condition: jd.includes("dashboard") || jd.includes("analytics") || jd.includes("data"),
+      title: `Analytics Dashboard Prototype`,
+      description: `Build a real-time analytics dashboard that visualizes meaningful data. Include interactive charts, filters, and a clean UI that ${name} could imagine in their product.`,
+      tech: ["React", "TypeScript", "D3.js", "Node.js"],
+      deliverable: "Live demo + video walkthrough",
+      why: "Directly showcases frontend + data visualization skills they need"
+    },
+  ];
+
+  const matchedDemo = demoIdeas.find(d => d.condition) || {
+    title: `${lead.role || 'Full-Stack'} Skills Demo`,
+    description: `Build a focused tool that showcases your strengths in ${tech_signals.slice(0, 2).join(' and ')}. Make it relevant to ${name}'s domain by solving a real problem their users might face.`,
+    tech: tech_signals.slice(0, 4),
+    deliverable: "GitHub repo + live demo link",
+    why: "Shows initiative and ability to ship working software quickly"
+  };
 
   return {
-    overview: `${name} is building ${
-      jd.includes("ai") ? "AI-powered" : "modern"
-    } software for its market. Based on the role, they're investing in engineering capacity to scale their core product and ship faster.`,
+    overview: `${name} is building ${jd.includes("ai") ? "AI-powered" : "modern"
+      } software for its market. Based on the role, they're investing in engineering capacity to scale their core product and ship faster.`,
     stage,
     industry: jd.includes("ai")
       ? "AI / Developer Tools"
       : jd.includes("data")
-      ? "Data Infrastructure"
-      : "SaaS",
+        ? "Data Infrastructure"
+        : "SaaS",
     tech_signals: tech_signals.slice(0, 6),
+    demo_project: {
+      title: matchedDemo.title,
+      description: matchedDemo.description,
+      tech_stack: matchedDemo.tech,
+      deliverable: matchedDemo.deliverable,
+      time_estimate: "2-3 days",
+      why_impressive: matchedDemo.why,
+    },
     talking_points: [
-      `Their stack overlaps heavily with your experience (${tech_signals
-        .slice(0, 2)
-        .join(", ")}) — lead with a concrete project that used it.`,
-      `The ${lead.role || "role"} suggests they need someone who ships end-to-end; your multi-agent pipeline and Artha.ai projects show exactly that.`,
-      `Reference a specific problem from their JD rather than generic enthusiasm — it signals you actually read it.`,
+      `Lead with your demo project — mention you built something specifically for them.`,
+      `Their stack overlaps with your experience (${tech_signals.slice(0, 2).join(", ")}) — reference specific projects.`,
+      `The ${lead.role || "role"} suggests they need someone who ships end-to-end; your demo proves exactly that.`,
     ],
     smart_questions: [
       "What does the first 90 days look like for this role?",
       "How is the engineering team structured, and where would I fit?",
       "What's the biggest technical challenge the team is tackling right now?",
     ],
-    fit_summary: `Your hands-on full-stack + Python background maps directly to what ${name} is hiring for. A specific, JD-grounded outreach should resonate.`,
+    fit_summary: `Your hands-on full-stack background maps directly to what ${name} is hiring for. The demo project will make your outreach stand out from generic applications.`,
   };
 }
 
@@ -173,6 +218,69 @@ export function ResearchPanel({
           ))}
         </div>
       </motion.div>
+
+      {/* Demo Project Idea - THE KEY FEATURE */}
+      {research.demo_project && (
+        <motion.div
+          variants={fadeInUp}
+          className="rounded-xl border-2 border-accent1/30 bg-gradient-to-br from-accent1/5 to-accent1/10 p-4"
+        >
+          <div className="mb-3 flex items-center gap-2">
+            <div className="flex h-6 w-6 items-center justify-center rounded-full accent-gradient">
+              <Rocket className="h-3.5 w-3.5 text-white" />
+            </div>
+            <span className="text-xs font-semibold uppercase tracking-wide text-accent1">
+              Demo Project Idea
+            </span>
+            <span className="ml-auto rounded-full bg-accent1/20 px-2 py-0.5 text-[10px] font-bold text-accent1">
+              KEY DIFFERENTIATOR
+            </span>
+          </div>
+
+          <h3 className="text-base font-semibold text-foreground mb-2">
+            {research.demo_project.title}
+          </h3>
+
+          <p className="text-sm text-muted-foreground leading-relaxed mb-3">
+            {research.demo_project.description}
+          </p>
+
+          <div className="space-y-2">
+            <div className="flex items-center gap-2 text-sm">
+              <Code2 className="h-3.5 w-3.5 text-accent1" />
+              <span className="text-muted-foreground">Tech:</span>
+              <span className="text-foreground font-medium">
+                {research.demo_project.tech_stack.join(", ")}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 text-sm">
+              <ExternalLink className="h-3.5 w-3.5 text-accent1" />
+              <span className="text-muted-foreground">Deliverable:</span>
+              <span className="text-foreground font-medium">
+                {research.demo_project.deliverable}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 text-sm">
+              <Clock className="h-3.5 w-3.5 text-accent1" />
+              <span className="text-muted-foreground">Time:</span>
+              <span className="text-foreground font-medium">
+                {research.demo_project.time_estimate}
+              </span>
+            </div>
+          </div>
+
+          <div className="mt-3 pt-3 border-t border-accent1/20">
+            <div className="flex items-start gap-2">
+              <Sparkles className="h-4 w-4 text-accent1 mt-0.5 shrink-0" />
+              <p className="text-sm text-accent1 font-medium">
+                {research.demo_project.why_impressive}
+              </p>
+            </div>
+          </div>
+        </motion.div>
+      )}
 
       {/* Talking points */}
       <motion.div variants={fadeInUp} className="rounded-xl border bg-card p-4">

@@ -52,11 +52,21 @@ export interface Lead {
   review_decision: string;
 }
 
+export interface DemoProject {
+  title: string;
+  description: string;
+  tech_stack: string[];
+  deliverable: string;
+  time_estimate: string;
+  why_impressive: string;
+}
+
 export interface CompanyResearch {
   overview: string;
   stage: string;
   industry: string;
   tech_signals: string[];
+  demo_project: DemoProject;
   talking_points: string[];
   smart_questions: string[];
   fit_summary: string;
