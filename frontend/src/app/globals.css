@@ -1,0 +1,178 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* === Cal Sans display font (Cal.com's signature headline font) === */
+/* Loaded from fontsource CDN. Falls back to Geist Sans if unavailable. */
+@font-face {
+  font-family: "Cal Sans";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("https://cdn.jsdelivr.net/fontsource/fonts/cal-sans@latest/latin-600-normal.woff2") format("woff2"),
+    url("https://cdn.jsdelivr.net/npm/@fontsource/cal-sans@latest/files/cal-sans-latin-400-normal.woff2") format("woff2");
+}
+
+@layer base {
+  :root {
+    /* === Cal.com-inspired Design Tokens === */
+
+    /* Canvas is a subtle off-white (Cal.com uses near-white, not pure white) */
+    --background: 210 20% 98%;
+    --foreground: 210 30% 4%;
+
+    /* Cards sit on the canvas as pure white */
+    --card: 0 0% 100%;
+    --card-foreground: 210 30% 4%;
+
+    /* Primary (near-black brand — Cal.com style) */
+    --primary: 0 0% 6%;
+    --primary-foreground: 0 0% 100%;
+
+    /* Secondary */
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 220 6% 25%;
+
+    /* Muted */
+    --muted: 210 20% 97%;
+    --muted-foreground: 220 9% 46%;
+
+    /* Accent */
+    --accent: 220 14% 94%;
+    --accent-foreground: 210 30% 4%;
+
+    /* Destructive */
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* Borders & Inputs */
+    --border: 220 13% 91%;
+    --input: 216 12% 84%;
+    --ring: 0 0% 6%;
+
+    /* Grid line color (crosshair aesthetic) */
+    --grid-line: 220 13% 91%;
+
+    /* Accent — signature SaaS gradient (indigo -> violet), used sparingly */
+    --accent-1: 243 75% 59%;
+    --accent-2: 262 83% 58%;
+    --accent-soft: 243 75% 96%;
+
+    /* Radius (Cal.com scale) */
+    --radius-sm: 0.125rem;
+    --radius-md: 0.375rem;
+    --radius-lg: 0.5rem;
+    --radius-xl: 0.75rem;
+    --radius-2xl: 1rem;
+
+    /* Pipeline Status Colors */
+    --status-new: 220 9% 46%;
+    --status-review: 38 92% 50%;
+    --status-approved: 221 83% 53%;
+    --status-sent: 160 84% 39%;
+    --status-replied: 263 70% 50%;
+    --status-rejected: 0 84% 60%;
+
+    /* Sidebar */
+    --sidebar: 0 0% 100%;
+    --sidebar-foreground: 220 6% 25%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-active: 220 14% 96%;
+  }
+
+  * {
+    border-color: hsl(var(--border));
+  }
+
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-feature-settings: "rlig" 1, "calt" 1;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  /* Display font — Cal Sans with Geist fallback, tight tracking */
+  .font-display {
+    font-family: "Cal Sans", var(--font-geist-sans), system-ui, sans-serif;
+    letter-spacing: -0.02em;
+    font-weight: 600;
+  }
+
+  /* Crosshair marker used at grid intersections */
+  .grid-cross::before,
+  .grid-cross::after {
+    content: "";
+    position: absolute;
+    background-color: hsl(var(--grid-line));
+  }
+
+  .grid-cross::before {
+    width: 11px;
+    height: 1px;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+  }
+
+  .grid-cross::after {
+    width: 1px;
+    height: 11px;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+  }
+
+  /* Signature accent gradient text/bg helpers */
+  .accent-gradient {
+    background-image: linear-gradient(135deg,
+        hsl(var(--accent-1)),
+        hsl(var(--accent-2)));
+  }
+
+  .accent-text {
+    background-image: linear-gradient(135deg,
+        hsl(var(--accent-1)),
+        hsl(var(--accent-2)));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* Subtle dotted texture for dashboard canvas */
+  .dot-grid {
+    background-image: radial-gradient(hsl(var(--grid-line)) 1px,
+        transparent 1px);
+    background-size: 22px 22px;
+  }
+
+  /* Soft radial glow used behind section highlights */
+  .radial-glow {
+    background: radial-gradient(60% 60% at 50% 0%,
+        hsl(var(--accent-soft) / 0.7) 0%,
+        transparent 100%);
+  }
+
+  /* Glass surface */
+  .glass {
+    background-color: hsl(0 0% 100% / 0.72);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}

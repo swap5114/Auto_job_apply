@@ -123,7 +123,7 @@ Every node follows the same shape: **read leads missing some field → do the wo
 |---|---|---|---|---|
 | **LLM Backend** | **Claude Sonnet 4 (primary), Google Gemini (fallback)** | Ollama 7B/14B local models | Claude Sonnet 4 for production quality (zero-fabrication discipline), Gemini flash-lite-latest ($0 free tier, 15 RPM, 1M tokens/day) for testing when Claude API unavailable. Ollama 7B hallucinated resume content; 14B not downloaded due to size. | Gemini has lower quality output and thinking-token overhead; Claude preferred but requires API access. `skills/llm_client.py` supports both via `MODEL_BACKEND` env var. |
 | **X Scraping** | **Sorsa API (primary) + GetX API (fallback)** | Sorsa-only | Sorsa went down intermittently (90%+ downtime during development). GetX API ($0.001/call, $0.10 free credit) provides resilience. | GetX credit exhausts quickly at scale; Sorsa preferred when available. Fallback auto-triggers on Sorsa timeout. |
-| **Company Research** | **Context.dev Brand API + Web Scrape** | Firecrawl alone | Context.dev Brand API returns structured company data (description, tags, industry) in one call (10 credits); Web Scrape API (1 credit) fetches careers page as markdown. LLM generates demo idea from combined data. 500 free credits. | Credits deplete on heavy use. Fixed endpoints: POST `/v1/brand/retrieve` with `{"type": "by_domain", "domain": "..."}`, GET `/v1/web/scrape/markdown` with query params `{"url": "...", "useMainContentOnly": "true"}`. |
+| **Company Research** | **LLM-based extraction from job description** | Context.dev Brand API + Web Scrape | LLM analyzes the JD text directly to extract company signals (stage, tech stack, talking points). More reliable and zero external API dependency. Follows same zero-fabrication discipline as tailoring. | Can't fetch data outside the JD (no funding/headcount lookups). Acceptable since outreach should reference what's in the JD anyway, not external research the company didn't share. |
 | **Relevance Filter V3** | **Strict dual-keyword matching: role_keywords AND tech_stack_keywords** | Single keyword list (V1), or software_exclude_keywords (V2) | V1/V2 let non-software roles pass (mechanical engineer, operations admin). V3 requires BOTH a software-specific role keyword ("software engineer", "backend developer") AND a tech stack keyword (react, node, python). Added `non_tech_exclude_keywords` (operations, business, sales, admin). | May filter out valid roles with unconventional titles; whole-word matching still can't catch spoken-language requirements (German B2+) or framework mismatches (Rails-specific when candidate has Django). |
 | **Sheet Write Method** | **Explicit cell range update** `worksheet.update(f"A{row}:T{row}", [row])` | `append_row()` | `append_row()` wrote to wrong columns when sheet had formatting/hidden columns. Explicit range guarantees correct column mapping. All reads use `expected_headers=HEADERS` for validation. | Slightly more verbose; requires manual row calculation. |
 | Leads database | Google Sheets (`gspread` + service account) | A real DB (Postgres/SQLite) | Zero infrastructure, and it *is* the human review UI for free — no separate dashboard needed, which keeps "no web dashboard" out of scope honestly. | Not queryable — every read is `get_all_records()` + Python filtering (scans the whole sheet), every write is a rate-limited Sheets API call. Fine at personal job-search volume, wouldn't scale past low thousands of rows. |
@@ -140,12 +140,22 @@ Every node follows the same shape: **read leads missing some field → do the wo
 ## Repo structure
 
 ```
+api/
+  main.py                FastAPI backend for dashboard
+  __init__.py
 graph/
   pipeline.py            LangGraph orchestration: nodes, edges, interrupts, state
 orchestrator/
   feed_graph.py          Queue leads from Sheet into graph
   review_cli.py          Human review checkpoint CLI
   check_followups.py     Monitor sent leads and re-queue stale ones
+frontend/
+  src/                   Next.js dashboard UI
+    components/
+      marketing/         Landing page components
+    pages/               Dashboard pages (leads list, detail view)
+  public/                Static assets
+  package.json           Frontend dependencies
 skills/
   scrape_job_boards/
     arbeitnow.py         Arbeitnow public job API (free, no key)
@@ -155,7 +165,7 @@ skills/
   scrape_x_leads.py      Sorsa API (primary) + GetX API (fallback) — X hiring-signal leads
   relevance_filter.py    Strict dual-keyword filter (role + tech stack) applied before every add_lead()
   find_contact_email.py  Hunter.io Domain Search + regex bio/tweet scan
-  research_company.py    Context.dev Brand + Web Scrape APIs for company research
+  research_company.py    LLM-based company research from job description
   tailor_resume.py       Claude/Gemini-powered resume tailoring + PDF/MD/JSON generation
   draft_outreach.py      Claude/Gemini-powered outreach drafting (email or X-DM)
   send_via_gmail.py      Gmail API send (drafts-first, then approved-send)
@@ -203,7 +213,7 @@ tests/
 
 **`find_contact_email.py`** — X leads get a free regex scan of their bio/tweet text first. Company leads with a known `domain` use it directly; otherwise, `arbeitnow`/`jobicy` leads get a domain *guessed* from the company name (legal-entity suffixes like "B.V."/"Inc"/"GmbH" stripped, both a smashed-together and hyphenated candidate tried against Hunter, since it costs nothing on a miss); `careers_page` leads use the real domain straight from their `listing_url`. A miss is always printed with which domains were tried, never silently counted.
 
-**`research_company.py`** — uses Context.dev Brand API (POST `/v1/brand/retrieve` with `{"type": "by_domain", "domain": "..."}`) to fetch structured company data (description, tags, industry) and Web Scrape API (GET `/v1/web/scrape/markdown` with query params `{"url": "...", "useMainContentOnly": "true"}`) to scrape careers page. LLM generates a company-specific demo idea from combined data. 500 free credits (10 per brand call, 1 per scrape).
+**`research_company.py`** — uses LLM (Claude/Gemini) to generate structured company research from the job description. Extracts: overview, stage (early/growth/established), industry, tech signals from JD, talking points for outreach, and smart questions to ask. Designed to power both the dashboard's Company Research tab and provide richer context for `draft_outreach.py`. Zero-fabrication discipline: claims must be grounded in JD text or widely-known facts.
 
 **`tailor_resume.py`** — sends the base resume (JSON) and a lead's JD to Claude Sonnet 4 or Gemini (via `llm_client.py`) under a strict zero-fabrication system prompt (nothing invented; bullets may be reordered/reworded but never claim new scope, tools, or metrics beyond what the base resume already supports). Saves the tailored resume as `.json`, `.md`, and a template-matched `.pdf` per lead, and prints a rough (directional-only) ATS keyword-coverage percentage.
 
