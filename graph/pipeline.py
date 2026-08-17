@@ -158,22 +158,32 @@ def find_email_node(state: PipelineState) -> Dict[str, Any]:
         return {"status": "email_search_failed"}
 
 def research_company_node(state: PipelineState) -> Dict[str, Any]:
-    """Research company using Context.dev Brand + Web Scrape APIs."""
+    """Research company and generate demo project idea using LLM."""
     from skills.research_company import research_company
     
     company = state.get("company", "")
-    domain = state.get("domain")
-    listing_url = state.get("listing_url")
+    domain = state.get("domain") or ""
+    role = state.get("role") or ""
+    jd_text = state.get("jd_text") or ""
     
-    if not domain and not listing_url:
-        print(f"  ⚠️  research_company_node: no domain/URL for {company}, skipping")
+    # Need at least company name or JD to research
+    if not company and not jd_text:
+        print(f"  ⚠️  research_company_node: no company/JD, skipping research")
         return {"status": "research_skipped"}
     
     try:
-        research_data = research_company(company, domain, listing_url)
+        research_data = research_company(
+            company=company,
+            domain=domain,
+            role=role,
+            jd_text=jd_text,
+        )
         
         if research_data:
+            demo = research_data.get("demo_project", {})
+            demo_title = demo.get("title", "N/A") if demo else "N/A"
             print(f"  🔍 research_company_node: researched {company}")
+            print(f"     Demo idea: {demo_title}")
             return {
                 "company_research": research_data,
                 "status": "researched",
@@ -400,10 +410,27 @@ Previous message sent:
 {previous_draft}
 """
 
-    # Add company research context if available
+    # Add company research context if available (especially the demo project idea)
     research_context = ""
     if company_research:
-        research_context = f"""
+        demo_project = company_research.get("demo_project", {})
+        if demo_project:
+            research_context = f"""
+
+IMPORTANT - DEMO PROJECT TO MENTION:
+The candidate has built/is building a demo project specifically for this company:
+- Title: {demo_project.get('title', 'N/A')}
+- Description: {demo_project.get('description', 'N/A')}
+- Deliverable: {demo_project.get('deliverable', 'N/A')}
+
+Reference this demo in the outreach! It's the key differentiator. Mention that the candidate 
+built something specifically relevant to their product/problem and offer to share it.
+
+Full company research data:
+{json.dumps(company_research, indent=2)}
+"""
+        else:
+            research_context = f"""
 
 Company research data (use this to personalize the outreach):
 {json.dumps(company_research, indent=2)}
