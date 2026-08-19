@@ -10,10 +10,12 @@ Or from project root:
 import os
 import sys
 import json
+import threading
+from datetime import datetime, timezone
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -127,14 +129,18 @@ class ResearchResponse(BaseModel):
 
 class SettingsResponse(BaseModel):
     role_keywords: list[str]
+    tech_stack_keywords: list[str]
     seniority_exclude_keywords: list[str]
+    non_tech_exclude_keywords: list[str]
     years_experience_threshold: int
     location_keywords: list[str]
 
 
 class SettingsUpdateRequest(BaseModel):
     role_keywords: Optional[list[str]] = None
+    tech_stack_keywords: Optional[list[str]] = None
     seniority_exclude_keywords: Optional[list[str]] = None
+    non_tech_exclude_keywords: Optional[list[str]] = None
     years_experience_threshold: Optional[int] = None
     location_keywords: Optional[list[str]] = None
 
@@ -263,52 +269,56 @@ def get_lead(lead_id: str):
 
 @app.post("/api/leads/{lead_id}/approve")
 def approve_lead(lead_id: str):
-    """Approve a lead — resumes the LangGraph review checkpoint."""
+    """Approve a lead.
+
+    Tries to resume the LangGraph review checkpoint first; if the lead isn't
+    currently paused in the graph, falls back to updating the Sheet directly
+    so the dashboard button always works.
+    """
     try:
         from orchestrator.review_cli import approve_lead as _approve
-        success = _approve(lead_id)
-        if not success:
-            raise HTTPException(status_code=400, detail="Lead not currently paused at review")
-        return {"status": "approved", "lead_id": lead_id}
-    except ImportError:
-        # Fallback: just update the sheet directly
-        _, update_lead, _ = _get_sheet_client()
-        update_lead(lead_id, {"status": "approved", "review_decision": "approved"})
-        return {"status": "approved", "lead_id": lead_id}
+        if _approve(lead_id):
+            return {"status": "approved", "lead_id": lead_id, "via": "graph"}
+    except Exception as e:
+        print(f"  approve via graph failed ({e}), falling back to sheet update")
+
+    _, update_lead, _ = _get_sheet_client()
+    update_lead(lead_id, {"status": "approved", "review_decision": "approved"})
+    return {"status": "approved", "lead_id": lead_id, "via": "sheet"}
 
 
 @app.post("/api/leads/{lead_id}/reject")
 def reject_lead(lead_id: str):
-    """Reject a lead — resumes the LangGraph review checkpoint with rejection."""
+    """Reject a lead (graph resume, or Sheet fallback)."""
     try:
         from orchestrator.review_cli import reject_lead as _reject
-        success = _reject(lead_id)
-        if not success:
-            raise HTTPException(status_code=400, detail="Lead not currently paused at review")
-        return {"status": "rejected", "lead_id": lead_id}
-    except ImportError:
-        _, update_lead, _ = _get_sheet_client()
-        update_lead(lead_id, {"status": "rejected", "review_decision": "rejected"})
-        return {"status": "rejected", "lead_id": lead_id}
+        if _reject(lead_id):
+            return {"status": "rejected", "lead_id": lead_id, "via": "graph"}
+    except Exception as e:
+        print(f"  reject via graph failed ({e}), falling back to sheet update")
+
+    _, update_lead, _ = _get_sheet_client()
+    update_lead(lead_id, {"status": "rejected", "review_decision": "rejected"})
+    return {"status": "rejected", "lead_id": lead_id, "via": "sheet"}
 
 
 @app.post("/api/leads/{lead_id}/edit")
 def edit_lead(lead_id: str, body: EditRequest):
-    """Edit outreach draft and approve the lead."""
+    """Edit outreach draft and approve the lead (graph resume, or Sheet fallback)."""
     try:
         from orchestrator.review_cli import edit_lead as _edit
-        success = _edit(lead_id, body.outreach_draft)
-        if not success:
-            raise HTTPException(status_code=400, detail="Lead not currently paused at review")
-        return {"status": "approved", "lead_id": lead_id, "draft_updated": True}
-    except ImportError:
-        _, update_lead, _ = _get_sheet_client()
-        update_lead(lead_id, {
-            "status": "approved",
-            "outreach_draft": body.outreach_draft,
-            "review_decision": "edited",
-        })
-        return {"status": "approved", "lead_id": lead_id, "draft_updated": True}
+        if _edit(lead_id, body.outreach_draft):
+            return {"status": "approved", "lead_id": lead_id, "draft_updated": True, "via": "graph"}
+    except Exception as e:
+        print(f"  edit via graph failed ({e}), falling back to sheet update")
+
+    _, update_lead, _ = _get_sheet_client()
+    update_lead(lead_id, {
+        "status": "approved",
+        "outreach_draft": body.outreach_draft,
+        "review_decision": "edited",
+    })
+    return {"status": "approved", "lead_id": lead_id, "draft_updated": True, "via": "sheet"}
 
 
 @app.post("/api/leads/{lead_id}/research", response_model=ResearchResponse)
@@ -439,6 +449,134 @@ def trigger_scrape(sources: Optional[list[str]] = None):
     return {"results": results}
 
 
+# ---------------------------------------------------------------------------
+# On-demand full pipeline run (Phase 10b — dashboard "Run Pipeline" button)
+# ---------------------------------------------------------------------------
+
+# Shared run-state, updated live by the background pipeline thread.
+_pipeline_run_state: dict = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "current_step": None,
+    "steps": [],        # [{step, status}]
+    "summary": None,    # final summary dict from the runner
+    "error": None,
+}
+_pipeline_lock = threading.Lock()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class RunPipelineRequest(BaseModel):
+    sources: Optional[list[str]] = None
+    yc_max_leads: int = 15
+    x_max_leads: int = 5
+    csv_path: Optional[str] = None
+
+
+def _run_pipeline_bg(sources, yc_max_leads, x_max_leads, csv_path):
+    """Background worker that runs the sourcing pipeline and tracks progress."""
+    from orchestrator.pipeline_runner import run_sourcing_pipeline
+
+    with _pipeline_lock:
+        _pipeline_run_state.update({
+            "running": True,
+            "started_at": _now_iso(),
+            "finished_at": None,
+            "current_step": "starting",
+            "steps": [],
+            "summary": None,
+            "error": None,
+        })
+
+    def on_step(label: str, status: str):
+        with _pipeline_lock:
+            _pipeline_run_state["current_step"] = label if status == "running" else None
+            # Record only terminal states to keep the list clean
+            if status in ("ok", "error"):
+                _pipeline_run_state["steps"].append({"step": label, "status": status})
+
+    try:
+        summary = run_sourcing_pipeline(
+            sources=sources,
+            yc_max_leads=yc_max_leads,
+            x_max_leads=x_max_leads,
+            csv_path=csv_path,
+            progress_callback=on_step,
+        )
+        with _pipeline_lock:
+            _pipeline_run_state["summary"] = summary
+    except Exception as e:
+        with _pipeline_lock:
+            _pipeline_run_state["error"] = str(e)
+    finally:
+        with _pipeline_lock:
+            _pipeline_run_state["running"] = False
+            _pipeline_run_state["current_step"] = None
+            _pipeline_run_state["finished_at"] = _now_iso()
+
+
+@app.post("/api/pipeline/run")
+def run_pipeline(body: RunPipelineRequest):
+    """Start the full sourcing+processing pipeline on demand (non-blocking).
+
+    Runs in a background thread; poll /api/pipeline/run-status for progress.
+    """
+    with _pipeline_lock:
+        if _pipeline_run_state["running"]:
+            raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    sources = body.sources or ["arbeitnow", "jobicy", "yc"]
+    threading.Thread(
+        target=_run_pipeline_bg,
+        args=(sources, body.yc_max_leads, body.x_max_leads, body.csv_path),
+        daemon=True,
+    ).start()
+
+    return {"status": "started", "sources": sources}
+
+
+@app.get("/api/pipeline/run-status")
+def pipeline_run_status():
+    """Return the live state of the current/last pipeline run."""
+    with _pipeline_lock:
+        return dict(_pipeline_run_state)
+
+
+@app.post("/api/pipeline/upload-csv")
+async def upload_csv(file: UploadFile = File(...)):
+    """Upload a companies CSV and run the company_list scraper + processing.
+
+    The CSV is saved to config/uploaded_companies.csv, then the pipeline runs
+    with only the company_list source in the background.
+    """
+    with _pipeline_lock:
+        if _pipeline_run_state["running"]:
+            raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Please upload a .csv file")
+
+    save_path = os.path.join(PROJECT_ROOT, "config", "uploaded_companies.csv")
+    try:
+        content = await file.read()
+        with open(save_path, "wb") as f:
+            f.write(content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save CSV: {e}")
+
+    threading.Thread(
+        target=_run_pipeline_bg,
+        args=(["company_list"], 15, 5, save_path),
+        daemon=True,
+    ).start()
+
+    return {"status": "started", "filename": file.filename, "saved_to": save_path}
+
+
 @app.post("/api/pipeline/find-emails")
 def trigger_find_emails():
     """Run the contact email discovery skill."""
@@ -521,7 +659,9 @@ def get_search_criteria():
 
     return SettingsResponse(
         role_keywords=data.get("role_keywords", []),
+        tech_stack_keywords=data.get("tech_stack_keywords", []),
         seniority_exclude_keywords=data.get("seniority_exclude_keywords", []),
+        non_tech_exclude_keywords=data.get("non_tech_exclude_keywords", []),
         years_experience_threshold=data.get("years_experience_threshold", 1),
         location_keywords=data.get("location_keywords", []),
     )
@@ -542,8 +682,12 @@ def update_search_criteria(body: SettingsUpdateRequest):
     # Merge updates
     if body.role_keywords is not None:
         data["role_keywords"] = body.role_keywords
+    if body.tech_stack_keywords is not None:
+        data["tech_stack_keywords"] = body.tech_stack_keywords
     if body.seniority_exclude_keywords is not None:
         data["seniority_exclude_keywords"] = body.seniority_exclude_keywords
+    if body.non_tech_exclude_keywords is not None:
+        data["non_tech_exclude_keywords"] = body.non_tech_exclude_keywords
     if body.years_experience_threshold is not None:
         data["years_experience_threshold"] = body.years_experience_threshold
     if body.location_keywords is not None:

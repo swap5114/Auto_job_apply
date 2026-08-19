@@ -1,7 +1,8 @@
 "use client";
 
-import { useState } from "react";
-import { Save, X, Plus } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Save, X, Loader2, RefreshCw } from "lucide-react";
+import { toast } from "sonner";
 import { Header } from "@/components/layout/header";
 import { PageTransition } from "@/components/layout/page-transition";
 import { Button } from "@/components/ui/button";
@@ -9,8 +10,8 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
+import { api, type SearchCriteria, type PipelineConfig } from "@/lib/api";
 
-// Tag Input Component
 function TagInput({
   label,
   tags,
@@ -38,28 +39,28 @@ function TagInput({
     <div className="space-y-2">
       <label className="text-sm font-medium text-foreground">{label}</label>
       <div className="rounded-lg border p-3">
-        <div className="flex flex-wrap gap-2 mb-2">
+        <div className="mb-2 flex flex-wrap gap-2">
           {tags.map((tag) => (
             <span
               key={tag}
               className="inline-flex items-center gap-1 rounded-md bg-secondary px-2.5 py-1 text-xs font-medium text-secondary-foreground"
             >
               {tag}
-              <button
-                onClick={() => onRemove(tag)}
-                className="ml-0.5 rounded-sm hover:bg-muted-foreground/20"
-              >
+              <button onClick={() => onRemove(tag)} className="ml-0.5 rounded-sm hover:bg-muted-foreground/20">
                 <X className="h-3 w-3" />
               </button>
             </span>
           ))}
+          {tags.length === 0 && (
+            <span className="text-xs text-muted-foreground">None yet</span>
+          )}
         </div>
         <Input
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={placeholder || "Type and press Enter to add"}
-          className="border-0 p-0 h-8 focus-visible:ring-0 focus-visible:ring-offset-0"
+          className="h-8 border-0 p-0 focus-visible:ring-0 focus-visible:ring-offset-0"
         />
       </div>
     </div>
@@ -67,23 +68,53 @@ function TagInput({
 }
 
 export default function SettingsPage() {
-  // Search criteria state
-  const [roleKeywords, setRoleKeywords] = useState([
-    "developer", "engineer", "react", "python", "full stack", "backend", "frontend", "node", "javascript",
-  ]);
-  const [seniorityExclusions, setSeniorityExclusions] = useState([
-    "senior", "lead", "principal", "staff", "manager", "director",
-  ]);
-  const [locationKeywords, setLocationKeywords] = useState([
-    "remote", "india", "usa", "europe", "uk",
-  ]);
-  const [yearsThreshold, setYearsThreshold] = useState(1);
+  const [criteria, setCriteria] = useState<SearchCriteria | null>(null);
+  const [config, setConfig] = useState<PipelineConfig | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  // Pipeline config state
-  const [llmBackend, setLlmBackend] = useState<"claude" | "ollama">("claude");
-  const [followupDays, setFollowupDays] = useState(5);
-  const [maxFollowups, setMaxFollowups] = useState(2);
-  const [gmailMode, setGmailMode] = useState<"drafts" | "direct">("drafts");
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const [c, p] = await Promise.all([
+        api.settings.getSearchCriteria(),
+        api.settings.getPipelineConfig(),
+      ]);
+      setCriteria(c);
+      setConfig(p);
+    } catch (e: any) {
+      setError(e?.message || "Failed to load settings");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function handleSave() {
+    if (!criteria || !config) return;
+    setSaving(true);
+    try {
+      await Promise.all([
+        api.settings.updateSearchCriteria(criteria),
+        api.settings.updatePipelineConfig(config),
+      ]);
+      toast.success("Settings saved");
+    } catch (e: any) {
+      toast.error(e?.message || "Save failed");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // Helpers to update criteria arrays immutably
+  function updateList(key: keyof SearchCriteria, updater: (list: string[]) => string[]) {
+    setCriteria((c) => (c ? { ...c, [key]: updater((c[key] as string[]) || []) } : c));
+  }
 
   return (
     <PageTransition>
@@ -91,185 +122,189 @@ export default function SettingsPage() {
         title="Settings"
         description="Configure your pipeline behavior"
         action={
-          <Button size="sm">
-            <Save className="mr-2 h-3.5 w-3.5" />
-            Save Changes
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={load} disabled={loading}>
+              <RefreshCw className={`mr-2 h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
+              Reload
+            </Button>
+            <Button size="sm" onClick={handleSave} disabled={saving || loading || !criteria}>
+              {saving ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <Save className="mr-2 h-3.5 w-3.5" />}
+              Save Changes
+            </Button>
+          </div>
         }
       />
 
-      <div className="pb-16">
-        <Tabs defaultValue="criteria" className="space-y-6">
-          <TabsList>
-            <TabsTrigger value="criteria">Search Criteria</TabsTrigger>
-            <TabsTrigger value="pipeline">Pipeline Config</TabsTrigger>
-          </TabsList>
+      {error && (
+        <div className="mb-4 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+          {error} — is the API running on port 8000?
+        </div>
+      )}
 
-          {/* Search Criteria Tab */}
-          <TabsContent value="criteria" className="space-y-6">
-            <Card>
-              <CardContent className="p-6 space-y-6">
-                <TagInput
-                  label="Role Keywords"
-                  tags={roleKeywords}
-                  onAdd={(tag) => setRoleKeywords((prev) => [...prev, tag])}
-                  onRemove={(tag) =>
-                    setRoleKeywords((prev) => prev.filter((t) => t !== tag))
-                  }
-                  placeholder="e.g. developer, react, python..."
-                />
+      {loading || !criteria || !config ? (
+        <div className="flex items-center justify-center py-24 text-muted-foreground">
+          <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+          Loading settings…
+        </div>
+      ) : (
+        <div className="pb-16">
+          <Tabs defaultValue="criteria" className="space-y-6">
+            <TabsList>
+              <TabsTrigger value="criteria">Search Criteria</TabsTrigger>
+              <TabsTrigger value="pipeline">Pipeline Config</TabsTrigger>
+            </TabsList>
 
-                <Separator />
-
-                <TagInput
-                  label="Seniority Exclusions"
-                  tags={seniorityExclusions}
-                  onAdd={(tag) => setSeniorityExclusions((prev) => [...prev, tag])}
-                  onRemove={(tag) =>
-                    setSeniorityExclusions((prev) => prev.filter((t) => t !== tag))
-                  }
-                  placeholder="e.g. senior, lead, principal..."
-                />
-
-                <Separator />
-
-                <div className="space-y-2">
-                  <label className="text-sm font-medium text-foreground">
-                    Experience Threshold
-                  </label>
-                  <p className="text-xs text-muted-foreground">
-                    Exclude jobs requiring more than this many years of experience
-                  </p>
-                  <Input
-                    type="number"
-                    value={yearsThreshold}
-                    onChange={(e) => setYearsThreshold(Number(e.target.value))}
-                    min={0}
-                    max={10}
-                    className="w-24"
+            {/* Search Criteria */}
+            <TabsContent value="criteria" className="space-y-6">
+              <Card>
+                <CardContent className="space-y-6 p-6">
+                  <TagInput
+                    label="Role Keywords (a lead must match one)"
+                    tags={criteria.role_keywords}
+                    onAdd={(t) => updateList("role_keywords", (l) => [...l, t])}
+                    onRemove={(t) => updateList("role_keywords", (l) => l.filter((x) => x !== t))}
+                    placeholder="e.g. software engineer, backend developer…"
                   />
-                </div>
-
-                <Separator />
-
-                <TagInput
-                  label="Location Keywords"
-                  tags={locationKeywords}
-                  onAdd={(tag) => setLocationKeywords((prev) => [...prev, tag])}
-                  onRemove={(tag) =>
-                    setLocationKeywords((prev) => prev.filter((t) => t !== tag))
-                  }
-                  placeholder="e.g. remote, india, usa..."
-                />
-              </CardContent>
-            </Card>
-          </TabsContent>
-
-          {/* Pipeline Config Tab */}
-          <TabsContent value="pipeline" className="space-y-6">
-            <Card>
-              <CardContent className="p-6 space-y-6">
-                {/* LLM Backend */}
-                <div className="space-y-3">
-                  <label className="text-sm font-medium text-foreground">
-                    LLM Backend
-                  </label>
-                  <div className="flex gap-3">
-                    <button
-                      onClick={() => setLlmBackend("claude")}
-                      className={`rounded-lg border px-4 py-2.5 text-sm font-medium transition-colors ${llmBackend === "claude"
-                          ? "border-primary bg-primary text-primary-foreground"
-                          : "border-border bg-background text-muted-foreground hover:bg-muted"
-                        }`}
-                    >
-                      Claude (API)
-                    </button>
-                    <button
-                      onClick={() => setLlmBackend("ollama")}
-                      className={`rounded-lg border px-4 py-2.5 text-sm font-medium transition-colors ${llmBackend === "ollama"
-                          ? "border-primary bg-primary text-primary-foreground"
-                          : "border-border bg-background text-muted-foreground hover:bg-muted"
-                        }`}
-                    >
-                      Ollama (Local)
-                    </button>
-                  </div>
-                </div>
-
-                <Separator />
-
-                {/* Follow-up Settings */}
-                <div className="grid grid-cols-2 gap-6">
+                  <Separator />
+                  <TagInput
+                    label="Tech Stack Keywords (a lead must match one)"
+                    tags={criteria.tech_stack_keywords}
+                    onAdd={(t) => updateList("tech_stack_keywords", (l) => [...l, t])}
+                    onRemove={(t) => updateList("tech_stack_keywords", (l) => l.filter((x) => x !== t))}
+                    placeholder="e.g. react, node, python…"
+                  />
+                  <Separator />
+                  <TagInput
+                    label="Seniority Exclusions"
+                    tags={criteria.seniority_exclude_keywords}
+                    onAdd={(t) => updateList("seniority_exclude_keywords", (l) => [...l, t])}
+                    onRemove={(t) => updateList("seniority_exclude_keywords", (l) => l.filter((x) => x !== t))}
+                    placeholder="e.g. senior, lead, principal…"
+                  />
+                  <Separator />
+                  <TagInput
+                    label="Non-Tech Exclusions"
+                    tags={criteria.non_tech_exclude_keywords}
+                    onAdd={(t) => updateList("non_tech_exclude_keywords", (l) => [...l, t])}
+                    onRemove={(t) => updateList("non_tech_exclude_keywords", (l) => l.filter((x) => x !== t))}
+                    placeholder="e.g. operations, sales, admin…"
+                  />
+                  <Separator />
                   <div className="space-y-2">
-                    <label className="text-sm font-medium text-foreground">
-                      Follow-up Days
-                    </label>
+                    <label className="text-sm font-medium text-foreground">Experience Threshold</label>
                     <p className="text-xs text-muted-foreground">
-                      Days to wait before sending a follow-up
+                      Exclude jobs requiring more than this many years of experience
                     </p>
                     <Input
                       type="number"
-                      value={followupDays}
-                      onChange={(e) => setFollowupDays(Number(e.target.value))}
-                      min={1}
-                      max={30}
-                      className="w-24"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-foreground">
-                      Max Follow-ups
-                    </label>
-                    <p className="text-xs text-muted-foreground">
-                      Maximum follow-up messages per lead
-                    </p>
-                    <Input
-                      type="number"
-                      value={maxFollowups}
-                      onChange={(e) => setMaxFollowups(Number(e.target.value))}
+                      value={criteria.years_experience_threshold}
+                      onChange={(e) =>
+                        setCriteria((c) => (c ? { ...c, years_experience_threshold: Number(e.target.value) } : c))
+                      }
                       min={0}
-                      max={5}
+                      max={10}
                       className="w-24"
                     />
                   </div>
-                </div>
+                  <Separator />
+                  <TagInput
+                    label="Location Keywords (informational)"
+                    tags={criteria.location_keywords}
+                    onAdd={(t) => updateList("location_keywords", (l) => [...l, t])}
+                    onRemove={(t) => updateList("location_keywords", (l) => l.filter((x) => x !== t))}
+                    placeholder="e.g. remote, india, usa…"
+                  />
+                </CardContent>
+              </Card>
+            </TabsContent>
 
-                <Separator />
-
-                {/* Gmail Mode */}
-                <div className="space-y-3">
-                  <label className="text-sm font-medium text-foreground">
-                    Gmail Mode
-                  </label>
-                  <p className="text-xs text-muted-foreground">
-                    Choose whether to create drafts for manual review or send directly
-                  </p>
-                  <div className="flex gap-3">
-                    <button
-                      onClick={() => setGmailMode("drafts")}
-                      className={`rounded-lg border px-4 py-2.5 text-sm font-medium transition-colors ${gmailMode === "drafts"
-                          ? "border-primary bg-primary text-primary-foreground"
-                          : "border-border bg-background text-muted-foreground hover:bg-muted"
-                        }`}
-                    >
-                      Drafts Only
-                    </button>
-                    <button
-                      onClick={() => setGmailMode("direct")}
-                      className={`rounded-lg border px-4 py-2.5 text-sm font-medium transition-colors ${gmailMode === "direct"
-                          ? "border-primary bg-primary text-primary-foreground"
-                          : "border-border bg-background text-muted-foreground hover:bg-muted"
-                        }`}
-                    >
-                      Direct Send
-                    </button>
+            {/* Pipeline Config */}
+            <TabsContent value="pipeline" className="space-y-6">
+              <Card>
+                <CardContent className="space-y-6 p-6">
+                  {/* LLM Backend */}
+                  <div className="space-y-3">
+                    <label className="text-sm font-medium text-foreground">LLM Backend</label>
+                    <div className="flex gap-3">
+                      {(["claude", "gemini"] as const).map((backend) => (
+                        <button
+                          key={backend}
+                          onClick={() => setConfig((c) => (c ? { ...c, model_backend: backend } : c))}
+                          className={`rounded-lg border px-4 py-2.5 text-sm font-medium capitalize transition-colors ${config.model_backend === backend
+                              ? "border-primary bg-primary text-primary-foreground"
+                              : "border-border bg-background text-muted-foreground hover:bg-muted"
+                            }`}
+                        >
+                          {backend === "claude" ? "Claude (API)" : "Gemini (Free)"}
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              </CardContent>
-            </Card>
-          </TabsContent>
-        </Tabs>
-      </div>
+
+                  <Separator />
+
+                  <div className="grid grid-cols-2 gap-6">
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium text-foreground">Follow-up Days</label>
+                      <p className="text-xs text-muted-foreground">Days to wait before a follow-up</p>
+                      <Input
+                        type="number"
+                        value={config.followup_days}
+                        onChange={(e) => setConfig((c) => (c ? { ...c, followup_days: Number(e.target.value) } : c))}
+                        min={1}
+                        max={30}
+                        className="w-24"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium text-foreground">Max Follow-ups</label>
+                      <p className="text-xs text-muted-foreground">Max follow-up messages per lead</p>
+                      <Input
+                        type="number"
+                        value={config.max_followups}
+                        onChange={(e) => setConfig((c) => (c ? { ...c, max_followups: Number(e.target.value) } : c))}
+                        min={0}
+                        max={5}
+                        className="w-24"
+                      />
+                    </div>
+                  </div>
+
+                  <Separator />
+
+                  {/* Gmail Mode */}
+                  <div className="space-y-3">
+                    <label className="text-sm font-medium text-foreground">Gmail Mode</label>
+                    <p className="text-xs text-muted-foreground">
+                      Create drafts for manual review, or send directly on approval
+                    </p>
+                    <div className="flex gap-3">
+                      <button
+                        onClick={() => setConfig((c) => (c ? { ...c, gmail_direct_send: false } : c))}
+                        className={`rounded-lg border px-4 py-2.5 text-sm font-medium transition-colors ${!config.gmail_direct_send
+                            ? "border-primary bg-primary text-primary-foreground"
+                            : "border-border bg-background text-muted-foreground hover:bg-muted"
+                          }`}
+                      >
+                        Drafts Only
+                      </button>
+                      <button
+                        onClick={() => setConfig((c) => (c ? { ...c, gmail_direct_send: true } : c))}
+                        className={`rounded-lg border px-4 py-2.5 text-sm font-medium transition-colors ${config.gmail_direct_send
+                            ? "border-primary bg-primary text-primary-foreground"
+                            : "border-border bg-background text-muted-foreground hover:bg-muted"
+                          }`}
+                      >
+                        Direct Send
+                      </button>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            </TabsContent>
+          </Tabs>
+        </div>
+      )}
     </PageTransition>
   );
 }

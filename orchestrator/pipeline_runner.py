@@ -31,33 +31,43 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _run_step(label: str, fn, *args, **kwargs) -> dict:
+def _run_step(label: str, fn, *args, callback=None, **kwargs) -> dict:
     """Run a single pipeline step, catching and reporting any error.
+
+    If a `callback(label, status)` is given, it's invoked when the step starts
+    ("running") and when it finishes ("ok"/"error") — used for live progress.
 
     Returns a small result dict: {step, status, error}.
     """
     print(f"\n{'─' * 60}")
     print(f"▶  {label}  [{_now()}]")
     print(f"{'─' * 60}")
+    if callback:
+        callback(label, "running")
     try:
         fn(*args, **kwargs)
         print(f"✅ {label} — done")
-        return {"step": label, "status": "ok", "error": None}
+        result = {"step": label, "status": "ok", "error": None}
     except Exception as e:
         print(f"❌ {label} — failed: {e}")
         traceback.print_exc()
-        return {"step": label, "status": "error", "error": str(e)}
+        result = {"step": label, "status": "error", "error": str(e)}
+    if callback:
+        callback(label, result["status"])
+    return result
 
 
 def run_sourcing_pipeline(
     sources: list[str] | None = None,
     yc_max_leads: int = 15,
     x_max_leads: int = 5,
+    csv_path: str | None = None,
+    progress_callback=None,
 ) -> dict:
     """Run the full sourcing + processing chain.
 
     Order:
-      1. Scrape sources (arbeitnow, jobicy, careers_page, yc, x)
+      1. Scrape sources (arbeitnow, jobicy, careers_page, company_list, yc, x)
       2. find_contact_email
       3. tailor_resume
       4. draft_outreach
@@ -67,6 +77,8 @@ def run_sourcing_pipeline(
         sources: which scrapers to run. Defaults to the free/no-key ones + yc.
         yc_max_leads: cap on YC startups per run.
         x_max_leads: cap on X leads per run.
+        csv_path: path to a companies CSV (required if 'company_list' in sources).
+        progress_callback: optional fn(step_label, status) for live progress.
 
     Returns a summary dict with per-step results.
     """
@@ -77,43 +89,50 @@ def run_sourcing_pipeline(
     if sources is None:
         sources = ["arbeitnow", "jobicy", "yc"]
 
+    cb = progress_callback
     results = []
 
     # --- 1. Sourcing ---
     for source in sources:
         if source == "arbeitnow":
             from skills.scrape_job_boards.arbeitnow import run as arbeitnow_run
-            results.append(_run_step("scrape:arbeitnow", arbeitnow_run))
+            results.append(_run_step("scrape:arbeitnow", arbeitnow_run, callback=cb))
         elif source == "jobicy":
             from skills.scrape_job_boards.jobicy import run as jobicy_run
-            results.append(_run_step("scrape:jobicy", jobicy_run))
+            results.append(_run_step("scrape:jobicy", jobicy_run, callback=cb))
         elif source == "careers_page":
             from skills.scrape_job_boards.careers_page import run as careers_run
-            results.append(_run_step("scrape:careers_page", careers_run))
+            results.append(_run_step("scrape:careers_page", careers_run, callback=cb))
+        elif source == "company_list":
+            if csv_path:
+                from skills.scrape_job_boards.company_list import run as cl_run
+                results.append(_run_step("scrape:company_list", cl_run, csv_path, callback=cb))
+            else:
+                print("  ⚠️  'company_list' requested but no csv_path provided, skipping")
         elif source == "yc":
             from skills.scrape_job_boards.yc_startups import run as yc_run
-            results.append(_run_step("scrape:yc", yc_run, yc_max_leads))
+            results.append(_run_step("scrape:yc", yc_run, yc_max_leads, callback=cb))
         elif source == "x":
             from skills.scrape_x_leads import run as x_run
-            results.append(_run_step("scrape:x", x_run, x_max_leads))
+            results.append(_run_step("scrape:x", x_run, x_max_leads, callback=cb))
         else:
             print(f"  ⚠️  Unknown source '{source}', skipping")
 
     # --- 2. Enrich: find contact emails ---
     from skills.find_contact_email import run as find_email_run
-    results.append(_run_step("find_contact_email", find_email_run))
+    results.append(_run_step("find_contact_email", find_email_run, callback=cb))
 
     # --- 3. Tailor resumes ---
     from skills.tailor_resume import run as tailor_run
-    results.append(_run_step("tailor_resume", tailor_run))
+    results.append(_run_step("tailor_resume", tailor_run, callback=cb))
 
     # --- 4. Draft outreach ---
     from skills.draft_outreach import run as draft_run
-    results.append(_run_step("draft_outreach", draft_run))
+    results.append(_run_step("draft_outreach", draft_run, callback=cb))
 
     # --- 5. Feed into graph (pause at review) ---
     from orchestrator.feed_graph import feed_pending_leads
-    results.append(_run_step("feed_graph", feed_pending_leads))
+    results.append(_run_step("feed_graph", feed_pending_leads, callback=cb))
 
     ok = sum(1 for r in results if r["status"] == "ok")
     failed = sum(1 for r in results if r["status"] == "error")
@@ -126,7 +145,7 @@ def run_sourcing_pipeline(
     return {"pipeline": "sourcing", "ok": ok, "failed": failed, "steps": results}
 
 
-def run_followup_pipeline() -> dict:
+def run_followup_pipeline(progress_callback=None) -> dict:
     """Run the follow-up check: re-queue stale sent leads through the graph."""
     print("\n" + "=" * 60)
     print(f"  FOLLOW-UP PIPELINE START  [{_now()}]")
@@ -135,7 +154,7 @@ def run_followup_pipeline() -> dict:
     results = []
 
     from orchestrator.check_followups import check_and_queue_followups
-    results.append(_run_step("check_followups", check_and_queue_followups))
+    results.append(_run_step("check_followups", check_and_queue_followups, callback=progress_callback))
 
     ok = sum(1 for r in results if r["status"] == "ok")
     failed = sum(1 for r in results if r["status"] == "error")

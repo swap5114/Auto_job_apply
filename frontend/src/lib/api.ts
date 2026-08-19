@@ -85,7 +85,9 @@ export interface Stats {
 
 export interface SearchCriteria {
   role_keywords: string[];
+  tech_stack_keywords: string[];
   seniority_exclude_keywords: string[];
+  non_tech_exclude_keywords: string[];
   years_experience_threshold: number;
   location_keywords: string[];
 }
@@ -95,6 +97,33 @@ export interface PipelineConfig {
   followup_days: number;
   max_followups: number;
   gmail_direct_send: boolean;
+}
+
+export interface PipelineStep {
+  step: string;
+  status: "ok" | "error" | "running";
+}
+
+export interface PipelineRunState {
+  running: boolean;
+  started_at: string | null;
+  finished_at: string | null;
+  current_step: string | null;
+  steps: PipelineStep[];
+  summary: {
+    pipeline: string;
+    ok: number;
+    failed: number;
+    steps: PipelineStep[];
+  } | null;
+  error: string | null;
+}
+
+export interface RunPipelineOptions {
+  sources?: string[];
+  yc_max_leads?: number;
+  x_max_leads?: number;
+  csv_path?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +158,30 @@ export const api = {
   },
 
   pipeline: {
+    // On-demand full pipeline run (the "Run Pipeline" button)
+    run: (opts?: RunPipelineOptions) =>
+      request<{ status: string; sources: string[] }>("/pipeline/run", {
+        method: "POST",
+        body: JSON.stringify(opts ?? {}),
+      }),
+
+    runStatus: () => request<PipelineRunState>("/pipeline/run-status"),
+
+    uploadCsv: async (file: File) => {
+      // multipart upload — don't set Content-Type, the browser sets the boundary
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch(`${BASE}/pipeline/upload-csv`, {
+        method: "POST",
+        body: form,
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || `Upload failed: ${res.status}`);
+      }
+      return res.json() as Promise<{ status: string; filename: string }>;
+    },
+
     scrape: (sources?: string[]) =>
       request<{ results: Record<string, string> }>("/pipeline/scrape", {
         method: "POST",

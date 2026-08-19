@@ -11,19 +11,21 @@ import {
   Settings,
   Zap,
   Play,
+  Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-
-const navigation = [
-  { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard, badge: null },
-  { name: "Leads", href: "/leads", icon: FileText, badge: 12 },
-  { name: "Review", href: "/review", icon: CheckCircle2, badge: 5 },
-  { name: "Settings", href: "/settings", icon: Settings, badge: null },
-];
+import { api, type Stats } from "@/lib/api";
+import { usePipelineStatus } from "@/lib/use-pipeline-status";
+import { RunPipelineDialog } from "@/components/pipeline/run-pipeline-dialog";
 
 export function TopBar() {
   const pathname = usePathname();
   const [scrolled, setScrolled] = useState(false);
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [runOpen, setRunOpen] = useState(false);
+
+  const { state } = usePipelineStatus();
+  const running = state?.running ?? false;
 
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 10);
@@ -31,6 +33,40 @@ export function TopBar() {
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
+
+  // Fetch real counts for nav badges; refresh periodically + when a run finishes
+  useEffect(() => {
+    let active = true;
+    const fetchStats = () => {
+      api.stats
+        .get()
+        .then((s) => active && setStats(s))
+        .catch(() => { });
+    };
+    fetchStats();
+    const id = setInterval(fetchStats, 10000);
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
+  }, []);
+
+  // Refresh badges shortly after a run completes
+  useEffect(() => {
+    if (!running && state?.finished_at) {
+      api.stats.get().then(setStats).catch(() => { });
+    }
+  }, [running, state?.finished_at]);
+
+  const leadsBadge = stats?.total ?? null;
+  const reviewBadge = stats ? (stats.pending_review ?? 0) + (stats.in_review ?? 0) : null;
+
+  const navigation = [
+    { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard, badge: null as number | null },
+    { name: "Leads", href: "/leads", icon: FileText, badge: leadsBadge },
+    { name: "Review", href: "/review", icon: CheckCircle2, badge: reviewBadge },
+    { name: "Settings", href: "/settings", icon: Settings, badge: null as number | null },
+  ];
 
   return (
     <motion.header
@@ -73,9 +109,7 @@ export function TopBar() {
                 href={item.href}
                 className={cn(
                   "group relative flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium transition-colors",
-                  isActive
-                    ? "text-foreground"
-                    : "text-muted-foreground hover:text-foreground"
+                  isActive ? "text-foreground" : "text-muted-foreground hover:text-foreground"
                 )}
               >
                 {isActive && (
@@ -92,13 +126,11 @@ export function TopBar() {
                   )}
                 />
                 <span className="relative z-10 hidden md:block">{item.name}</span>
-                {item.badge != null && (
+                {item.badge != null && item.badge > 0 && (
                   <span
                     className={cn(
                       "relative z-10 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold",
-                      isActive
-                        ? "bg-accent1/10 text-accent1"
-                        : "bg-muted text-muted-foreground"
+                      isActive ? "bg-accent1/10 text-accent1" : "bg-muted text-muted-foreground"
                     )}
                   >
                     {item.badge}
@@ -120,11 +152,18 @@ export function TopBar() {
                 className="hidden items-center gap-1.5 overflow-hidden whitespace-nowrap rounded-full bg-muted/70 px-2.5 py-1 lg:flex"
               >
                 <span className="relative flex h-1.5 w-1.5">
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
-                  <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                  {running && (
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent1 opacity-75" />
+                  )}
+                  <span
+                    className={cn(
+                      "relative inline-flex h-1.5 w-1.5 rounded-full",
+                      running ? "bg-accent1" : "bg-emerald-500"
+                    )}
+                  />
                 </span>
                 <span className="text-[11px] font-medium text-muted-foreground">
-                  Idle
+                  {running ? "Running" : "Idle"}
                 </span>
               </motion.div>
             )}
@@ -133,13 +172,16 @@ export function TopBar() {
           <motion.button
             whileHover={{ scale: 1.03 }}
             whileTap={{ scale: 0.97 }}
+            onClick={() => setRunOpen(true)}
             className="inline-flex items-center gap-1.5 rounded-xl accent-gradient px-3.5 py-2 text-sm font-medium text-white shadow-[0_4px_12px_-4px_hsl(var(--accent-1)/0.6)]"
           >
-            <Play className="h-3.5 w-3.5" />
-            <span className="hidden sm:block">Run</span>
+            {running ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+            <span className="hidden sm:block">{running ? "Running" : "Run"}</span>
           </motion.button>
         </div>
       </motion.div>
+
+      <RunPipelineDialog open={runOpen} onOpenChange={setRunOpen} />
     </motion.header>
   );
 }

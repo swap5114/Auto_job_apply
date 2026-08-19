@@ -17,7 +17,8 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { staggerContainer, fadeInUp } from "@/lib/motion";
-import type { CompanyResearch } from "@/lib/api";
+import { api, type CompanyResearch } from "@/lib/api";
+import { toast } from "sonner";
 
 /**
  * Generates contextual research from a lead's own data. Used as the demo
@@ -123,11 +124,17 @@ export function ResearchPanel({
 
   async function runResearch() {
     setState("loading");
-    // Simulated generation delay for the demo. When wired to live data, swap
-    // for: const data = await api.leads.research(lead.id).catch(() => generateResearch(lead));
-    await new Promise((r) => setTimeout(r, 1400));
-    setResearch(generateResearch(lead));
-    setState("done");
+    try {
+      // Real LLM-backed research from the API
+      const data = await api.leads.research(lead.id);
+      setResearch(data);
+    } catch (e: any) {
+      // Graceful fallback so the panel still shows something useful
+      toast.error(e?.message || "Live research failed — showing a generated draft");
+      setResearch(generateResearch(lead));
+    } finally {
+      setState("done");
+    }
   }
 
   if (state === "idle") {
