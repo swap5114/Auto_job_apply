@@ -212,6 +212,7 @@ def send_node(state: PipelineState) -> Dict[str, Any]:
             extract_subject_and_body,
             create_draft,
             send_email,
+            resume_pdf_path,
             GMAIL_DIRECT_SEND,
             SENDER_EMAIL,
             _now_iso,
@@ -220,12 +221,15 @@ def send_node(state: PipelineState) -> Dict[str, Any]:
         service = get_gmail_service()
         subject, body = extract_subject_and_body(outreach_draft, company, role)
 
+        # Attach the tailored resume PDF if available
+        attachment = resume_pdf_path({"resume_version": state.get("resume_version")})
+
         if GMAIL_DIRECT_SEND:
-            result = send_email(service, contact_email, subject, body)
+            result = send_email(service, contact_email, subject, body, attachment)
             print(f"  ✅ send_node: SENT to {contact_email} ({company})")
             return {"status": "sent"}
         else:
-            result = create_draft(service, contact_email, subject, body)
+            result = create_draft(service, contact_email, subject, body, attachment)
             print(f"  📝 send_node: DRAFT created for {contact_email} ({company})")
             return {"status": "draft_created"}
 

@@ -22,6 +22,7 @@ import { Button } from "@/components/ui/button";
 import { AnimatedCounter } from "@/components/ui/animated-counter";
 import { DonutChart } from "@/components/ui/donut-chart";
 import { RunPipelineButton } from "@/components/pipeline/run-pipeline-dialog";
+import { SendApprovedButton } from "@/components/pipeline/send-approved-button";
 import { staggerContainer, fadeInUp, scaleIn, slideInLeft } from "@/lib/motion";
 import { api, type Lead, type Stats } from "@/lib/api";
 
@@ -143,6 +144,9 @@ export default function DashboardPage() {
               <RefreshCw className={`mr-2 h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
               Refresh
             </Button>
+            {(stats?.approved ?? 0) > 0 && (
+              <SendApprovedButton count={stats?.approved} onDone={load} />
+            )}
             <RunPipelineButton />
           </div>
         }

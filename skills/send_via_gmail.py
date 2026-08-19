@@ -18,10 +18,13 @@ import json
 import base64
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 from dotenv import load_dotenv
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from storage.db_client import get_leads, update_lead
+from storage.sheet_client import get_leads, update_lead
+
+RESUMES_DIR = os.path.join(os.path.dirname(__file__), "..", "resumes")
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "config", ".env"))
 
@@ -105,8 +108,18 @@ def get_gmail_service():
 # Email construction
 # ---------------------------------------------------------------------------
 
-def build_email_message(to: str, subject: str, body: str, sender: str = "") -> str:
-    """Construct a MIME email and return base64url-encoded raw message."""
+def build_email_message(
+    to: str,
+    subject: str,
+    body: str,
+    sender: str = "",
+    attachment_path: str = "",
+) -> str:
+    """Construct a MIME email and return base64url-encoded raw message.
+
+    If attachment_path points to an existing file (the tailored resume PDF),
+    it's attached to the message.
+    """
     message = MIMEMultipart()
     message["to"] = to
     message["subject"] = subject
@@ -116,8 +129,28 @@ def build_email_message(to: str, subject: str, body: str, sender: str = "") -> s
     msg_body = MIMEText(body, "plain")
     message.attach(msg_body)
 
+    if attachment_path and os.path.exists(attachment_path):
+        with open(attachment_path, "rb") as f:
+            part = MIMEApplication(f.read(), _subtype="pdf")
+        part.add_header(
+            "Content-Disposition",
+            "attachment",
+            filename=os.path.basename(attachment_path),
+        )
+        message.attach(part)
+
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
     return raw
+
+
+def resume_pdf_path(lead: dict) -> str:
+    """Resolve the tailored resume PDF path from a lead's resume_version."""
+    version = (lead.get("resume_version") or "").strip()
+    if not version:
+        return ""
+    # resume_version is the base filename (no extension)
+    path = os.path.join(RESUMES_DIR, f"{version}.pdf")
+    return path if os.path.exists(path) else ""
 
 def extract_subject_and_body(outreach_draft: str, company: str, role: str) -> tuple[str, str]:
     """Parse the outreach draft into subject line and body.
@@ -140,9 +173,9 @@ def extract_subject_and_body(outreach_draft: str, company: str, role: str) -> tu
 # Core actions: create draft / send
 # ---------------------------------------------------------------------------
 
-def create_draft(service, to: str, subject: str, body: str) -> dict:
-    """Create a Gmail draft. Returns the draft resource."""
-    raw_message = build_email_message(to, subject, body, SENDER_EMAIL)
+def create_draft(service, to: str, subject: str, body: str, attachment_path: str = "") -> dict:
+    """Create a Gmail draft (optionally with a PDF attachment)."""
+    raw_message = build_email_message(to, subject, body, SENDER_EMAIL, attachment_path)
     draft_body = {"message": {"raw": raw_message}}
 
     draft = service.users().drafts().create(
@@ -151,9 +184,9 @@ def create_draft(service, to: str, subject: str, body: str) -> dict:
 
     return draft
 
-def send_email(service, to: str, subject: str, body: str) -> dict:
-    """Send an email directly. Returns the message resource."""
-    raw_message = build_email_message(to, subject, body, SENDER_EMAIL)
+def send_email(service, to: str, subject: str, body: str, attachment_path: str = "") -> dict:
+    """Send an email directly (optionally with a PDF attachment)."""
+    raw_message = build_email_message(to, subject, body, SENDER_EMAIL, attachment_path)
     message_body = {"raw": raw_message}
 
     sent = service.users().messages().send(
@@ -166,10 +199,11 @@ def send_email(service, to: str, subject: str, body: str) -> dict:
 # Main skill logic
 # ---------------------------------------------------------------------------
 
-def process_approved_lead(service, lead: dict) -> bool:
+def process_approved_lead(service, lead: dict) -> str:
     """Process a single approved lead: create draft or send.
 
-    Returns True if successful, False otherwise.
+    Returns one of: "sent", "draft_created", "skipped_no_email",
+    "skipped_no_draft", "failed".
     """
     lead_id = lead.get("id")
     company = lead.get("company") or lead.get("x_handle") or "Unknown"
@@ -179,71 +213,89 @@ def process_approved_lead(service, lead: dict) -> bool:
 
     if not contact_email:
         print(f"  ⚠️  Skipping {company} ({lead_id}) — no contact_email")
-        return False
+        return "skipped_no_email"
 
     if not outreach_draft:
         print(f"  ⚠️  Skipping {company} ({lead_id}) — no outreach_draft")
-        return False
+        return "skipped_no_draft"
 
     subject, body = extract_subject_and_body(outreach_draft, company, role)
 
+    # Attach the tailored resume PDF if one exists for this lead
+    attachment = resume_pdf_path(lead)
+    if not attachment:
+        print(f"  ⚠️  {company} ({lead_id}) — no tailored resume PDF found, sending without attachment")
+
     try:
         if GMAIL_DIRECT_SEND:
-            result = send_email(service, contact_email, subject, body)
+            result = send_email(service, contact_email, subject, body, attachment)
             msg_id = result.get("id", "?")
             update_lead(lead_id, {"status": "sent", "sent_at": _now_iso()})
-            print(f"  ✅ SENT to {contact_email} ({company}) — msg_id: {msg_id}")
+            attach_note = " (+resume)" if attachment else ""
+            print(f"  ✅ SENT to {contact_email} ({company}){attach_note} — msg_id: {msg_id}")
+            return "sent"
         else:
-            result = create_draft(service, contact_email, subject, body)
+            result = create_draft(service, contact_email, subject, body, attachment)
             draft_id = result.get("id", "?")
-            update_lead(lead_id, {"status": "draft_created"})
-            print(f"  📝 DRAFT created for {contact_email} ({company}) — draft_id: {draft_id}")
-
-        return True
+            update_lead(lead_id, {"status": "draft_created", "sent_at": _now_iso()})
+            attach_note = " (+resume)" if attachment else ""
+            print(f"  📝 DRAFT created for {contact_email} ({company}){attach_note} — draft_id: {draft_id}")
+            return "draft_created"
 
     except Exception as e:
         print(f"  ❌ Failed for {company} ({lead_id}): {e}")
-        return False
+        return "failed"
 
 def _now_iso() -> str:
     """Return current UTC time as ISO string."""
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
 
-def run():
-    """Main entry point: process all approved leads."""
+def run() -> dict:
+    """Main entry point: process all approved leads.
+
+    Returns a summary dict: {sent, draft_created, skipped_no_email,
+    skipped_no_draft, failed, total, error}.
+    """
     print("=" * 60)
     print("  GMAIL SKILL — Processing approved leads")
     print(f"  Mode: {'DIRECT SEND' if GMAIL_DIRECT_SEND else 'DRAFTS ONLY'}")
     print("=" * 60)
     print()
 
+    summary = {
+        "sent": 0, "draft_created": 0, "skipped_no_email": 0,
+        "skipped_no_draft": 0, "failed": 0, "total": 0, "error": None,
+    }
+
     try:
         service = get_gmail_service()
     except FileNotFoundError as e:
         print(f"ERROR: {e}")
-        return
+        summary["error"] = str(e)
+        return summary
     except Exception as e:
         print(f"ERROR: Failed to authenticate with Gmail: {e}")
-        return
+        summary["error"] = str(e)
+        return summary
 
     # Get leads that have been approved (via review CLI) and not yet sent/drafted
     leads = get_leads(status="approved")
+    summary["total"] = len(leads)
 
     if not leads:
         print("No approved leads to process.")
-        return
-
-    success_count = 0
-    fail_count = 0
+        return summary
 
     for lead in leads:
-        if process_approved_lead(service, lead):
-            success_count += 1
-        else:
-            fail_count += 1
+        outcome = process_approved_lead(service, lead)
+        summary[outcome] = summary.get(outcome, 0) + 1
 
-    print(f"\nDone: {success_count} processed, {fail_count} skipped/failed.")
+    print(
+        f"\nDone: {summary['sent']} sent, {summary['draft_created']} drafts, "
+        f"{summary['skipped_no_email']} no-email, {summary['failed']} failed."
+    )
+    return summary
 
 if __name__ == "__main__":
     run()

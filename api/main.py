@@ -659,11 +659,12 @@ def trigger_feed_graph():
 
 @app.post("/api/pipeline/send")
 def trigger_send():
-    """Send approved leads via Gmail."""
+    """Send (or draft) all approved leads via Gmail. Returns a summary."""
     try:
-        from skills.send_via_gmail import run
-        run()
-        return {"status": "success"}
+        from skills.send_via_gmail import run, GMAIL_DIRECT_SEND
+        summary = run()
+        _invalidate_leads_cache()
+        return {"status": "success", "mode": "direct" if GMAIL_DIRECT_SEND else "drafts", "summary": summary}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

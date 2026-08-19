@@ -201,7 +201,19 @@ export const api = {
       request<{ status: string; leads_fed: number }>("/pipeline/feed-graph", { method: "POST" }),
 
     send: () =>
-      request<{ status: string }>("/pipeline/send", { method: "POST" }),
+      request<{
+        status: string;
+        mode: "direct" | "drafts";
+        summary: {
+          sent: number;
+          draft_created: number;
+          skipped_no_email: number;
+          skipped_no_draft: number;
+          failed: number;
+          total: number;
+          error: string | null;
+        };
+      }>("/pipeline/send", { method: "POST" }),
 
     checkFollowups: () =>
       request<{ status: string; followups_queued: number }>("/pipeline/check-followups", { method: "POST" }),
