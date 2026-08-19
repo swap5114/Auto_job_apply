@@ -20,7 +20,6 @@ from datetime import datetime, timedelta
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 from storage.sheet_client import add_lead
-from skills.relevance_filter import matches_criteria
 
 # YC OSS API endpoints (no auth required, updated daily)
 YC_API_BASE = "https://yc-oss.github.io/api"
@@ -98,6 +97,46 @@ def is_tech_company(company: dict) -> bool:
             return True
     
     return False
+
+
+def yc_matches_criteria(lead: dict, company: dict) -> bool:
+    """Light filter for YC companies - they're already tech startups.
+    
+    Only excludes:
+    - Non-tech industries (healthcare services, food & beverage, etc.)
+    - Companies with exclude keywords in description
+    """
+    industries = company.get("industries", [])
+    tags = company.get("tags", [])
+    description = (company.get("long_description") or "").lower()
+    one_liner = (company.get("one_liner") or "").lower()
+    combined = f"{description} {one_liner}"
+    
+    # Exclude certain industries that are clearly non-engineering focused
+    non_engineering_industries = [
+        "Food and Beverage",
+        "Healthcare Services", 
+        "Travel, Leisure and Tourism",
+        "Apparel and Cosmetics",
+        "Transportation Services",
+    ]
+    for industry in industries:
+        if industry in non_engineering_industries:
+            return False
+    
+    # Exclude non-tech keywords
+    non_tech_keywords = [
+        "mechanical", "civil", "electrical", "chemical", "maintenance",
+        "manufacturing", "construction", "hvac", "plumbing", "plant",
+        "petroleum", "oil & gas", "warehouse", "driver"
+    ]
+    for kw in non_tech_keywords:
+        if kw in combined:
+            return False
+    
+    # Prefer companies with tech-related tags
+    # (but don't require - YC companies are generally tech)
+    return True
 
 
 def company_to_lead(company: dict) -> dict:
@@ -202,20 +241,21 @@ def run(max_leads: int = 20):
         name = company.get("name", "Unknown")
         batch = company.get("batch", "")
         
-        # Apply relevance filter (light filter - mainly checks for non-tech exclusions)
-        if not matches_criteria(lead):
-            print(f"  ⏭️  {name} ({batch}) — filtered out by relevance_filter")
+        # Use YC-specific light filter (not the strict relevance_filter)
+        # YC companies are already tech startups, so we just exclude non-engineering industries
+        if not yc_matches_criteria(lead, company):
+            print(f"  ⏭️  {name} ({batch}) — filtered out (non-tech industry)")
             filtered_out += 1
             continue
         
         # Add to sheet
         try:
-            result = add_lead(lead)
-            if result == "added":
+            was_added = add_lead(lead)
+            if was_added:
                 print(f"  ✅ {name} ({batch}) — added")
                 added += 1
             else:
-                print(f"  ⏭️  {name} ({batch}) — {result}")
+                print(f"  ⏭️  {name} ({batch}) — duplicate")
                 skipped += 1
         except Exception as e:
             print(f"  ❌ {name} — error: {e}")
