@@ -382,10 +382,10 @@ def get_stats():
 def trigger_scrape(sources: Optional[list[str]] = None):
     """Trigger scraping from one or more sources.
 
-    Valid sources: arbeitnow, jobicy, x, careers_page, company_list
+    Valid sources: arbeitnow, jobicy, x, careers_page, yc
     If no sources specified, runs all available.
     """
-    available_sources = ["arbeitnow", "jobicy", "x", "careers_page"]
+    available_sources = ["arbeitnow", "jobicy", "x", "careers_page", "yc"]
     targets = sources or available_sources
     results = {}
 
@@ -405,6 +405,10 @@ def trigger_scrape(sources: Optional[list[str]] = None):
                 results[source] = "success"
             elif source == "careers_page":
                 from skills.scrape_job_boards.careers_page import run
+                run()
+                results[source] = "success"
+            elif source == "yc":
+                from skills.scrape_job_boards.yc_startups import run
                 run()
                 results[source] = "success"
             else:

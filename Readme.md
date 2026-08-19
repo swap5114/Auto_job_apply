@@ -207,7 +207,9 @@ tests/
 
 **`storage/sheet_client.py`** — the shared data layer. `add_lead` rejects duplicates (same company+role, case-insensitive, or same non-empty `x_handle`) and raises loudly if a lead has neither identifying field. `get_leads` optionally filters by `status`. `update_lead` writes named fields by row lookup on `id`.
 
-**Scrapers** (`arbeitnow.py`, `jobicy.py`, `careers_page.py`, `company_list.py`, `scrape_x_leads.py`) — each pulls raw postings from one source, builds a lead dict, runs it through `relevance_filter.matches_criteria`, and calls `add_lead`. Every one prints a summary line (`added` / `skipped` / `filtered_out`) so a run's outcome is never silent.
+**Scrapers** (`arbeitnow.py`, `jobicy.py`, `careers_page.py`, `company_list.py`, `scrape_x_leads.py`, `yc_startups.py`) — each pulls raw postings from one source, builds a lead dict, runs it through `relevance_filter.matches_criteria`, and calls `add_lead`. Every one prints a summary line (`added` / `skipped` / `filtered_out`) so a run's outcome is never silent.
+
+**`yc_startups.py`** — scrapes Y Combinator startups that are hiring and recently funded (last 4-6 months). Uses the unofficial YC OSS API (`yc-oss.github.io/api`) which mirrors YC's Algolia index — no API key needed. Filters for recent batches (Winter/Spring/Summer 2026) and prioritizes tech-focused companies (B2B, Developer Tools, Infrastructure, etc.).
 
 **`relevance_filter.py`** — strict dual-keyword matching (V3): requires BOTH a software-specific role keyword ("software engineer", "backend developer", "full stack") AND a tech stack keyword (react, node, python, etc.). Also filters out non-tech roles via `non_tech_exclude_keywords` (operations, business, sales, admin). Whole-word matching prevents substring false positives (e.g., "ai" inside "maintain").
 
@@ -248,6 +250,7 @@ python -m skills.scrape_job_boards.arbeitnow
 python -m skills.scrape_job_boards.jobicy
 python -m skills.scrape_job_boards.careers_page
 python -m skills.scrape_job_boards.company_list path/to/companies.csv
+python -m skills.scrape_job_boards.yc_startups 10  # YC startups hiring + recently funded
 python -m skills.scrape_x_leads 2  # optional: limit to N leads for testing
 
 # 2. Feed leads into the graph and process
