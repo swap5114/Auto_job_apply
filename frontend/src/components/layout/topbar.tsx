@@ -34,20 +34,17 @@ export function TopBar() {
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
 
-  // Fetch real counts for nav badges; refresh periodically + when a run finishes
+  // Fetch real counts for nav badges once on mount. Stats reads hit Google
+  // Sheets (slow + rate-limited), so we do NOT poll on an interval — badges
+  // refresh only when a pipeline run finishes (below).
   useEffect(() => {
     let active = true;
-    const fetchStats = () => {
-      api.stats
-        .get()
-        .then((s) => active && setStats(s))
-        .catch(() => { });
-    };
-    fetchStats();
-    const id = setInterval(fetchStats, 10000);
+    api.stats
+      .get()
+      .then((s) => active && setStats(s))
+      .catch(() => { });
     return () => {
       active = false;
-      clearInterval(id);
     };
   }, []);
 

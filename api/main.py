@@ -10,6 +10,7 @@ Or from project root:
 import os
 import sys
 import json
+import time
 import threading
 from datetime import datetime, timezone
 from typing import Optional
@@ -175,6 +176,38 @@ def _get_sheet_client():
         )
 
 
+# --- Short-lived leads cache -------------------------------------------------
+# Reading the whole Sheet is slow and rate-limited. A single page load fires
+# several read endpoints (stats + leads + review filters), each of which would
+# otherwise hit the Sheet independently. This TTL cache collapses those into
+# one Sheet read, which is the main fix for slow page loads.
+_LEADS_TTL = 8  # seconds
+_leads_cache: dict = {"data": None, "ts": 0.0}
+_leads_cache_lock = threading.Lock()
+
+
+def _get_all_leads_cached(force: bool = False) -> list[dict]:
+    """Return all leads, served from an in-memory cache when fresh."""
+    now = time.monotonic()
+    with _leads_cache_lock:
+        if not force and _leads_cache["data"] is not None and (now - _leads_cache["ts"]) < _LEADS_TTL:
+            return _leads_cache["data"]
+
+    get_leads, _, _ = _get_sheet_client()
+    data = get_leads()
+    with _leads_cache_lock:
+        _leads_cache["data"] = data
+        _leads_cache["ts"] = time.monotonic()
+    return data
+
+
+def _invalidate_leads_cache():
+    """Drop the cached leads so the next read re-fetches from the Sheet."""
+    with _leads_cache_lock:
+        _leads_cache["data"] = None
+        _leads_cache["ts"] = 0.0
+
+
 def _get_search_criteria_path():
     return os.path.join(PROJECT_ROOT, "config", "search_criteria.json")
 
@@ -202,10 +235,10 @@ def _read_env_value(key: str, default: str = "") -> str:
 
 @app.get("/api/leads", response_model=list[LeadResponse])
 def list_leads(status: Optional[str] = Query(None, description="Filter by status")):
-    """List all leads, optionally filtered by status."""
-    get_leads, _, _ = _get_sheet_client()
-
-    leads = get_leads(status=status) if status else get_leads()
+    """List all leads, optionally filtered by status (served from TTL cache)."""
+    leads = _get_all_leads_cached()
+    if status:
+        leads = [l for l in leads if str(l.get("status", "")).strip() == status]
 
     # Normalize all fields to strings
     result = []
@@ -236,10 +269,8 @@ def list_leads(status: Optional[str] = Query(None, description="Filter by status
 
 @app.get("/api/leads/{lead_id}", response_model=LeadResponse)
 def get_lead(lead_id: str):
-    """Get a single lead by ID."""
-    get_leads, _, _ = _get_sheet_client()
-
-    leads = get_leads()
+    """Get a single lead by ID (served from TTL cache)."""
+    leads = _get_all_leads_cached()
     lead = next((l for l in leads if str(l.get("id", "")) == lead_id), None)
 
     if not lead:
@@ -278,12 +309,14 @@ def approve_lead(lead_id: str):
     try:
         from orchestrator.review_cli import approve_lead as _approve
         if _approve(lead_id):
+            _invalidate_leads_cache()
             return {"status": "approved", "lead_id": lead_id, "via": "graph"}
     except Exception as e:
         print(f"  approve via graph failed ({e}), falling back to sheet update")
 
     _, update_lead, _ = _get_sheet_client()
     update_lead(lead_id, {"status": "approved", "review_decision": "approved"})
+    _invalidate_leads_cache()
     return {"status": "approved", "lead_id": lead_id, "via": "sheet"}
 
 
@@ -293,12 +326,14 @@ def reject_lead(lead_id: str):
     try:
         from orchestrator.review_cli import reject_lead as _reject
         if _reject(lead_id):
+            _invalidate_leads_cache()
             return {"status": "rejected", "lead_id": lead_id, "via": "graph"}
     except Exception as e:
         print(f"  reject via graph failed ({e}), falling back to sheet update")
 
     _, update_lead, _ = _get_sheet_client()
     update_lead(lead_id, {"status": "rejected", "review_decision": "rejected"})
+    _invalidate_leads_cache()
     return {"status": "rejected", "lead_id": lead_id, "via": "sheet"}
 
 
@@ -308,6 +343,7 @@ def edit_lead(lead_id: str, body: EditRequest):
     try:
         from orchestrator.review_cli import edit_lead as _edit
         if _edit(lead_id, body.outreach_draft):
+            _invalidate_leads_cache()
             return {"status": "approved", "lead_id": lead_id, "draft_updated": True, "via": "graph"}
     except Exception as e:
         print(f"  edit via graph failed ({e}), falling back to sheet update")
@@ -318,15 +354,14 @@ def edit_lead(lead_id: str, body: EditRequest):
         "outreach_draft": body.outreach_draft,
         "review_decision": "edited",
     })
+    _invalidate_leads_cache()
     return {"status": "approved", "lead_id": lead_id, "draft_updated": True, "via": "sheet"}
 
 
 @app.post("/api/leads/{lead_id}/research", response_model=ResearchResponse)
 def research_lead(lead_id: str):
     """Generate structured company research with demo project idea for a lead."""
-    get_leads, _, _ = _get_sheet_client()
-
-    leads = get_leads()
+    leads = _get_all_leads_cached()
     lead = next((l for l in leads if str(l.get("id", "")) == lead_id), None)
     if not lead:
         raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
@@ -376,10 +411,8 @@ def research_lead(lead_id: str):
 
 @app.get("/api/stats", response_model=StatsResponse)
 def get_stats():
-    """Dashboard stats — count leads by status."""
-    get_leads, _, _ = _get_sheet_client()
-
-    leads = get_leads()
+    """Dashboard stats — count leads by status (served from TTL cache)."""
+    leads = _get_all_leads_cached()
     total = len(leads)
 
     counts = {
@@ -513,6 +546,9 @@ def _run_pipeline_bg(sources, yc_max_leads, x_max_leads, csv_path):
         with _pipeline_lock:
             _pipeline_run_state["error"] = str(e)
     finally:
+        # New leads were likely written to the Sheet — drop the cache so the
+        # next dashboard/leads read reflects them.
+        _invalidate_leads_cache()
         with _pipeline_lock:
             _pipeline_run_state["running"] = False
             _pipeline_run_state["current_step"] = None
