@@ -15,3 +15,6 @@ google-genai
 # API server
 fastapi
 uvicorn[standard]
+
+# Scheduling (Phase 10b)
+apscheduler

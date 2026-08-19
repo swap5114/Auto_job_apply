@@ -22,7 +22,7 @@ This is a personal learning project, not a product. It's built and driven by me;
 | 8 | Send via Gmail (drafts-first, then approved-send) | ✅ Done, verified end-to-end |
 | 9 | Track follow-ups (cyclic edge back into draft_outreach) | ✅ Done, verified end-to-end |
 | 10 | Wire everything into an actual LangGraph graph | ✅ Done, verified end-to-end |
-| 10b | Vellum Assistant as the cron trigger | ⬜ Not started |
+| 10b | Cron trigger (APScheduler, replaces the Vellum plan) | ✅ Done, verified end-to-end |
 | 11 | Deploy to a VM | ⬜ Not started |
 
 A cross-cutting piece not in the original phase numbering: `skills/relevance_filter.py` + `config/search_criteria.json`, a keyword filter applied by every scraper before a lead is even written to the Sheet.
@@ -37,7 +37,7 @@ The pipeline is designed as a **graph**, not a script — nodes are skills, edge
 
 ```mermaid
 flowchart TD
-    Vellum["Vellum Assistant\n(cron trigger only)"] -->|starts a run| Scrape
+    Scheduler["APScheduler\n(cron trigger)"] -->|starts a run| Scrape
 
     subgraph Scrape["Lead sourcing (parallel nodes)"]
         A1[arbeitnow.py]
@@ -45,6 +45,7 @@ flowchart TD
         A3[careers_page.py]
         A4[company_list.py]
         A5[scrape_x_leads.py]
+        A6[yc_startups.py]
     end
 
     Scrape -->|relevance_filter, then add_lead| Sheet[(Google Sheet\nleads DB)]
@@ -133,7 +134,7 @@ Every node follows the same shape: **read leads missing some field → do the wo
 | Resume PDF rendering | HTML/CSS template rendered via `xhtml2pdf` | `fpdf2` with manually positioned cells (the original approach) | `fpdf2` hit two real bugs (assumed `response.content[0]` was always text when Sonnet 5 returns a thinking block first; `multi_cell` doesn't reset the cursor like `cell` does) and even once fixed, the output didn't visually match the candidate's real resume template. HTML/CSS gives close visual control for far less code. | An extra dependency, plus PDF-encoding quirks — the default fonts only support Latin-1/WinAnsi, so a `sanitize_for_pdf` step swaps em-dashes/smart quotes/arrows for ASCII equivalents before rendering. |
 | Relevance filtering | Keyword/regex filter (`relevance_filter.py`) | An LLM classifier per listing | Zero marginal cost — a scrape run can pull hundreds of listings, and an LLM call per listing just to decide "is this worth tailoring for" would be needless spend before any real filtering value is added. | Coarse. Whole-word matching fixed one real bug (substring match on `"ai"` matching inside `"maintain"`/`"email"`) but the filter still can't catch tech-stack-specific mismatches (a "Full Stack" JD that turns out to require Rails specifically) or spoken-language requirements (German B2+). Those slip through to the expensive Claude stages — caught only by the zero-fabrication discipline there, not blocked upstream. Known, accepted gap. |
 | Orchestration | LangGraph graph (**planned**, not yet built) | A single linear script | Phase 7 (pause-and-wait-for-human) and Phase 9 (cycle back into `draft_outreach`) aren't naturally linear — see the Architecture section above for the full reasoning. | Until Phase 10 is built, there's no automatic sequencing between phases — see the Architecture tradeoffs table above. |
-| Scheduling | Vellum Assistant as a thin cron trigger (**planned**, not yet built) | Scheduling logic built into the app itself | Keeps the pipeline's own code free of scheduling concerns — Vellum's only job is "wake up on a schedule, start a LangGraph run." | An external dependency for something as simple as a cron tick — accepted since it was already part of the original plan and keeps the app itself simpler. |
+| Scheduling | **APScheduler `BackgroundScheduler`, embedded in the FastAPI process** | Vellum Assistant as an external cron trigger (original plan); OS-level cron; GitHub Actions | Self-contained and Python-native — no external service to depend on, no separate deploy. Reads `config/schedule.json`, so cron times are editable without touching code. Runs in-process with the API, and the same jobs can be triggered on demand from the dashboard. | Requires a long-running process (the API must stay up for cron to fire) — fine once Phase 11 puts it on a VM, but a laptop that sleeps will miss runs. `misfire_grace_time` softens this but doesn't fully solve it. |
 
 ---
 
@@ -149,6 +150,8 @@ orchestrator/
   feed_graph.py          Queue leads from Sheet into graph
   review_cli.py          Human review checkpoint CLI
   check_followups.py     Monitor sent leads and re-queue stale ones
+  pipeline_runner.py     Chains sourcing + processing into single callables (Phase 10b)
+  scheduler.py           APScheduler cron trigger for the pipeline (Phase 10b)
 frontend/
   src/                   Next.js dashboard UI
     components/
@@ -182,6 +185,7 @@ config/
   gmail_token.json       Gmail OAuth token (gitignored)
   base_resume.json       The candidate's real resume, as structured JSON
   search_criteria.json   Relevance-filter criteria (roles, tech stack, seniority, location)
+  schedule.json          Cron schedule config for the scheduler (Phase 10b)
 resumes/
   swapnil_jain_resume.pdf                 Original resume (template reference)
   swapnil_jain_resume_{company}.{json,md,pdf}   Tailored output, one set per lead
@@ -274,6 +278,33 @@ python -m skills.draft_outreach
 # Manual review in Google Sheet, then send by hand (or use send_via_gmail.py)
 ```
 
+**Automated scheduling (Phase 10b):**
+
+The scheduler wraps everything above into two cron jobs, defined in `config/schedule.json`:
+
+- **Sourcing job** (default 8:00 AM): scrape all sources → find emails → tailor → draft → feed into the review queue.
+- **Follow-up job** (default 6:00 PM): check sent leads for replies and re-queue stale ones.
+
+```bash
+# Run the scheduler standalone (blocking; keeps running until Ctrl+C)
+python -m orchestrator.scheduler
+
+# Or run either pipeline once, by hand
+python -m orchestrator.pipeline_runner sourcing
+python -m orchestrator.pipeline_runner followups
+```
+
+To run the scheduler *inside* the API process, set `ENABLE_SCHEDULER=true` in `config/.env` and start the API. The dashboard/API can then inspect and control it:
+
+```
+GET  /api/scheduler/status          # running? next run times?
+POST /api/scheduler/start           # start it
+POST /api/scheduler/stop            # stop it
+POST /api/scheduler/trigger/{job}   # run 'sourcing' or 'followups' now
+```
+
+Edit `config/schedule.json` to change cron times, timezone, enabled jobs, or the sourcing params (which scrapers to run, YC/X lead caps). The human review gate is unchanged — the scheduler only fills the queue and re-queues follow-ups; nothing is sent without approval.
+
 ### Setup
 
 1. `python -m venv venv` and activate it, then `pip install -r requirements.txt`.
@@ -284,6 +315,7 @@ python -m skills.draft_outreach
      - Gemini: `GEMINI_API_KEY=...` (free tier fallback, 15 RPM, 1M tokens/day)
    - **APIs:** `SORSA_API_KEY` (X scraping, primary), `GETX_API_KEY` (X scraping fallback), `HUNTER_API_KEY` (email discovery), `FIRECRAWL_API_KEY` (web scraping), `CONTEXT_API_KEY` (company research)
    - **Gmail (Phase 8):** `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET` (from Google Cloud Console OAuth2 credentials), `gmail_credentials.json`, `gmail_token.json` (auto-generated on first OAuth flow)
+   - **Scheduler (Phase 10b):** `ENABLE_SCHEDULER=true` to start the cron scheduler with the API (default off)
 3. Add a Google service-account key at `config/credentials.json` (never committed — see `.gitignore`), shared with edit access on the target Sheet.
 4. `config/base_resume.json` and `config/search_criteria.json` are already checked in — edit them to match your own resume and search preferences.
 

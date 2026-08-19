@@ -1,0 +1,26 @@
+{
+  "timezone": "Asia/Kolkata",
+  "jobs": {
+    "sourcing": {
+      "enabled": true,
+      "description": "Scrape all sources, enrich, tailor, draft, and feed into review queue",
+      "cron": {
+        "hour": 8,
+        "minute": 0
+      },
+      "params": {
+        "sources": ["arbeitnow", "jobicy", "yc"],
+        "yc_max_leads": 15,
+        "x_max_leads": 5
+      }
+    },
+    "followups": {
+      "enabled": true,
+      "description": "Check sent leads for replies and re-queue stale ones for follow-up",
+      "cron": {
+        "hour": 18,
+        "minute": 0
+      }
+    }
+  }
+}

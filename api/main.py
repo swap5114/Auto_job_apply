@@ -24,8 +24,28 @@ sys.path.insert(0, PROJECT_ROOT)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup/shutdown lifecycle."""
+    """Startup/shutdown lifecycle.
+
+    If ENABLE_SCHEDULER=true in the environment, the APScheduler-based cron
+    trigger (Phase 10b) starts with the API and shuts down cleanly on exit.
+    """
+    scheduler_started = False
+    if os.getenv("ENABLE_SCHEDULER", "false").lower() == "true":
+        try:
+            from orchestrator.scheduler import start_scheduler
+            start_scheduler()
+            scheduler_started = True
+        except Exception as e:
+            print(f"⚠️  Failed to start scheduler: {e}")
+
     yield
+
+    if scheduler_started:
+        try:
+            from orchestrator.scheduler import stop_scheduler
+            stop_scheduler()
+        except Exception as e:
+            print(f"⚠️  Failed to stop scheduler cleanly: {e}")
 
 
 app = FastAPI(
@@ -583,6 +603,62 @@ def update_pipeline_config(body: PipelineConfigUpdateRequest):
         f.writelines(lines)
 
     return {"status": "updated"}
+
+
+# ---------------------------------------------------------------------------
+# Routes: Scheduler (Phase 10b)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/scheduler/status")
+def scheduler_status():
+    """Return whether the scheduler is running and its jobs' next run times."""
+    try:
+        from orchestrator.scheduler import get_scheduler, get_jobs_status
+        sched = get_scheduler()
+        running = bool(sched and sched.running)
+        return {"running": running, "jobs": get_jobs_status()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/scheduler/start")
+def scheduler_start():
+    """Start the scheduler (idempotent)."""
+    try:
+        from orchestrator.scheduler import start_scheduler, get_jobs_status
+        start_scheduler()
+        return {"status": "started", "jobs": get_jobs_status()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/scheduler/stop")
+def scheduler_stop():
+    """Stop the scheduler."""
+    try:
+        from orchestrator.scheduler import stop_scheduler
+        stop_scheduler()
+        return {"status": "stopped"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/scheduler/trigger/{job_id}")
+def scheduler_trigger(job_id: str):
+    """Manually trigger a scheduled job now (runs in the background).
+
+    Valid job_ids: sourcing, followups
+    """
+    try:
+        from orchestrator.scheduler import trigger_job_now
+        ok = trigger_job_now(job_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"Unknown job '{job_id}'")
+        return {"status": "triggered", "job_id": job_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
