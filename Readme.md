@@ -1,6 +1,6 @@
 # Job Application Multi-Agent Pipeline
 
-A personal automation pipeline for job hunting. It finds leads from job boards, company career pages, and X, structures them into one tracked list, then uses Claude to tailor a resume and draft outreach for each one. **Nothing goes out automatically** — every tailored resume and every outreach draft sits in a review queue (a Google Sheet) until it's manually approved. Once approved, it will be sent via Gmail (not yet built), and the system will track replies to trigger follow-ups on leads that go quiet (not yet built either).
+A personal automation pipeline for job hunting. It finds leads from job boards, company career pages, and X, structures them into one tracked list, then uses Claude to tailor a resume and draft outreach for each one. **Nothing goes out automatically** — every tailored resume and every outreach draft sits in a review queue (a Google Sheet) until it's manually approved. Once approved, it sends via Gmail and tracks replies to trigger follow-ups on leads that go quiet.
 
 This is a personal learning project, not a product. It's built and driven by me; Claude Code is used as a pair-programming guide — I review every skill's real output before moving to the next one, not just the diff.
 
@@ -15,7 +15,7 @@ This is a personal learning project, not a product. It's built and driven by me;
 | 2 | Scrape job boards — Arbeitnow, Jobicy, one careers page | ✅ Done |
 | 2b | `company_list.py` — CSV-driven bulk company scraping (not in the original plan, added later) | ⚠️ Built, not yet verified against a live run |
 | 3 | Scrape X for hiring-signal leads (Sorsa API) | ✅ Done |
-| 4 | Find contact email (Hunter.io) | ✅ Done, verified end-to-end |
+| 4 | Find contact email (Apollo.io + Hunter.io) | ✅ Done, verified end-to-end |
 | 5 | Tailor resume per lead (Claude + PDF generation) | ✅ Done, thoroughly verified |
 | 6 | Draft outreach per lead (Claude) | ✅ Done, verified end-to-end |
 | 7 | Human review checkpoint (LangGraph interrupt) | ✅ Done, verified end-to-end |
@@ -50,7 +50,7 @@ flowchart TD
 
     Scrape -->|relevance_filter, then add_lead| Sheet[(Google Sheet\nleads DB)]
 
-    Sheet --> FCE[find_contact_email.py\nHunter.io]
+    Sheet --> FCE[find_contact_email.py\nApollo + Hunter]
     FCE --> TR[tailor_resume.py\nClaude + PDF]
     TR --> DO[draft_outreach.py\nClaude]
     DO --> Review{{"Review checkpoint\n(LangGraph interrupt)"}}
@@ -128,7 +128,7 @@ Every node follows the same shape: **read leads missing some field → do the wo
 | **Relevance Filter V3** | **Strict dual-keyword matching: role_keywords AND tech_stack_keywords** | Single keyword list (V1), or software_exclude_keywords (V2) | V1/V2 let non-software roles pass (mechanical engineer, operations admin). V3 requires BOTH a software-specific role keyword ("software engineer", "backend developer") AND a tech stack keyword (react, node, python). Added `non_tech_exclude_keywords` (operations, business, sales, admin). | May filter out valid roles with unconventional titles; whole-word matching still can't catch spoken-language requirements (German B2+) or framework mismatches (Rails-specific when candidate has Django). |
 | **Sheet Write Method** | **Explicit cell range update** `worksheet.update(f"A{row}:T{row}", [row])` | `append_row()` | `append_row()` wrote to wrong columns when sheet had formatting/hidden columns. Explicit range guarantees correct column mapping. All reads use `expected_headers=HEADERS` for validation. | Slightly more verbose; requires manual row calculation. |
 | Leads database | Google Sheets (`gspread` + service account) | A real DB (Postgres/SQLite) | Zero infrastructure, and it *is* the human review UI for free — no separate dashboard needed, which keeps "no web dashboard" out of scope honestly. | Not queryable — every read is `get_all_records()` + Python filtering (scans the whole sheet), every write is a rate-limited Sheets API call. Fine at personal job-search volume, wouldn't scale past low thousands of rows. |
-| Contact discovery | Hunter.io Domain Search | Apollo | Apollo's free tier returns `403 API_INACCESSIBLE` on its email-enrichment endpoint — confirmed live, not a docs-reading mistake. Hunter's Domain Search is usable on a free key. | Hunter's free index has real coverage gaps for small/startup domains — confirmed live: correct domain, zero emails returned. No fix for that other than accepting some leads need a manual contact lookup. `APOLLO_API_KEY` still sits unused in `.env` for reference. |
+| Contact discovery | **Apollo.io (primary) + Hunter.io (fallback)** | Hunter-only (original), Apollo People Search (blocked) | Apollo's People Search endpoint returns `403 API_INACCESSIBLE`, but Organization Enrichment + People Match work on standard keys. Apollo gives a *named* founder/CEO (ideal for personalized cold outreach at YC startups); Hunter provides generic role inboxes as fallback when Apollo has no coverage. | Each Apollo domain lookup spends credits (org enrichment + email unlock). Hunter's free index still has real coverage gaps for small/startup domains. Leads without any discoverable email are flagged in the dashboard. |
 | Scraping backend | Firecrawl REST API called directly from Python | "Hermes Agent" (local Ollama model + Scrapling), per the original plan | The `hermes -z` one-shot agent CLI was unreliable — it hallucinated fake environment limitations and ignored its own tools. Ironically, Hermes itself generated a plain Firecrawl-REST-plus-regex solution that worked, which is the pattern that got ported into the real code. | Lost the "an agent figures out selectors per site" flexibility. `company_list.py`'s role-link extraction is a hand-rolled heuristic (markdown link regex + known-ATS-domain matching + a nav-link denylist) — it will miss some postings and occasionally pick up a stray link, capped at 20 roles/company as a budget guard. |
 | Resume-tailoring model | Claude Sonnet 5 | Claude Haiku ("for volume", per the original plan) | Resume content directly represents the candidate to employers — fabrication risk was judged too high-stakes for a cheaper/smaller model. | Higher per-call cost, but tailoring is inherently one call per lead (low volume), so the absolute cost difference is small. Easy call once framed that way. |
 | Resume PDF rendering | HTML/CSS template rendered via `xhtml2pdf` | `fpdf2` with manually positioned cells (the original approach) | `fpdf2` hit two real bugs (assumed `response.content[0]` was always text when Sonnet 5 returns a thinking block first; `multi_cell` doesn't reset the cursor like `cell` does) and even once fixed, the output didn't visually match the candidate's real resume template. HTML/CSS gives close visual control for far less code. | An extra dependency, plus PDF-encoding quirks — the default fonts only support Latin-1/WinAnsi, so a `sanitize_for_pdf` step swaps em-dashes/smart quotes/arrows for ASCII equivalents before rendering. |
@@ -167,14 +167,14 @@ skills/
     company_list.py      CSV-driven bulk scraping + Firecrawl career-page auto-discovery
   scrape_x_leads.py      Sorsa API (primary) + GetX API (fallback) — X hiring-signal leads
   relevance_filter.py    Strict dual-keyword filter (role + tech stack) applied before every add_lead()
-  find_contact_email.py  Hunter.io Domain Search + regex bio/tweet scan
+  find_contact_email.py  Apollo.io org enrichment (primary) + Hunter.io Domain Search (fallback)
   research_company.py    LLM-based company research from job description
   tailor_resume.py       Claude/Gemini-powered resume tailoring + PDF/MD/JSON generation
   draft_outreach.py      Claude/Gemini-powered outreach drafting (email or X-DM)
   send_via_gmail.py      Gmail API send (drafts-first, then approved-send)
   track_followups.py     Followup tracking and stale lead detection
   check_followups.py     Orchestrator for followup monitoring
-  llm_client.py          Unified LLM client (Claude + Gemini backends)
+  llm_client.py          Unified LLM client (Claude + Gemini) with transient-error retry
 storage/
   sheet_client.py        The shared leads DB: add_lead, get_leads, update_lead
 config/
@@ -209,7 +209,7 @@ tests/
 
 ## Skills reference
 
-**`storage/sheet_client.py`** — the shared data layer. `add_lead` rejects duplicates (same company+role, case-insensitive, or same non-empty `x_handle`) and raises loudly if a lead has neither identifying field. `get_leads` optionally filters by `status`. `update_lead` writes named fields by row lookup on `id`.
+**`storage/sheet_client.py`** — the shared data layer. `add_lead` rejects duplicates (same company+role, case-insensitive, or same non-empty `x_handle`) and raises loudly if a lead has neither identifying field. `get_leads` optionally filters by `status`. `update_lead` writes named fields by row lookup on `id`. **Performance:** worksheet handles are cached per `sheet_id` (avoids re-authorization on every call), and dedup keys are loaded into an in-memory cache on first access then kept in sync — so scraping many leads performs only one full-sheet read total instead of one per candidate (prevents Google Sheets API rate limit errors).
 
 **Scrapers** (`arbeitnow.py`, `jobicy.py`, `careers_page.py`, `company_list.py`, `scrape_x_leads.py`, `yc_startups.py`) — each pulls raw postings from one source, builds a lead dict, runs it through `relevance_filter.matches_criteria`, and calls `add_lead`. Every one prints a summary line (`added` / `skipped` / `filtered_out`) so a run's outcome is never silent.
 
@@ -217,7 +217,7 @@ tests/
 
 **`relevance_filter.py`** — strict dual-keyword matching (V3): requires BOTH a software-specific role keyword ("software engineer", "backend developer", "full stack") AND a tech stack keyword (react, node, python, etc.). Also filters out non-tech roles via `non_tech_exclude_keywords` (operations, business, sales, admin). Whole-word matching prevents substring false positives (e.g., "ai" inside "maintain").
 
-**`find_contact_email.py`** — X leads get a free regex scan of their bio/tweet text first. Company leads with a known `domain` use it directly; otherwise, `arbeitnow`/`jobicy` leads get a domain *guessed* from the company name (legal-entity suffixes like "B.V."/"Inc"/"GmbH" stripped, both a smashed-together and hyphenated candidate tried against Hunter, since it costs nothing on a miss); `careers_page` leads use the real domain straight from their `listing_url`. A miss is always printed with which domains were tried, never silently counted.
+**`find_contact_email.py`** — multi-strategy email discovery. **Apollo.io is the primary provider:** Organization Enrichment (by domain) identifies the founder/CEO via `org_chart_root_people_ids`, then People Match unlocks a verified email for that person — ideal for personalized cold outreach to YC startups. **Hunter.io is the fallback** when Apollo has no coverage: Domain Search returns generic role inboxes (engineering@, founders@). X leads get a free regex scan of their bio/tweet text first. Company leads with a known `domain` use it directly; otherwise, a domain is *guessed* from the company name (legal-entity suffixes stripped, both smashed-together and hyphenated variants tried). A miss is always printed with which domains were tried, never silently counted.
 
 **`research_company.py`** — the key differentiator for cold outreach. Uses LLM to analyze the company and JD, then generates a **demo project idea** (2-3 days of work) that the candidate can build and attach to their email. The demo is designed to be directly relevant to the company's product/problem, making the outreach stand out. Output includes: company overview, stage, tech stack signals from JD, specific demo project (title, description, tech stack, deliverable), talking points, and fit summary. Zero-fabrication discipline applies.
 
@@ -225,11 +225,11 @@ tests/
 
 **`draft_outreach.py`** — reads the *tailored* resume (not the base one) so the message stays consistent with what actually gets sent. Two formats by `source`: a short email (`Subject:` line + body, hard-capped at 150 words) for company leads, a casual DM (hard-capped at 60 words) for X leads. Same zero-fabrication discipline as tailoring, plus rules earned from a real review pass: no cover-letter clichés ("I came across your opening", "I look forward to hearing from you"), and every message must pull a genuinely company-specific hook from the actual JD text rather than a compliment generic enough to paste into any other outreach.
 
-**`send_via_gmail.py`** — sends approved emails via Gmail API. Creates drafts first for final review, then sends on confirmation. Handles OAuth2 flow with `gmail_credentials.json` and `gmail_token.json`.
+**`send_via_gmail.py`** — sends approved emails via Gmail API. Creates drafts first for final review, then sends on confirmation. The `GMAIL_DIRECT_SEND` setting is read **live from `config/.env`** at call time (not at import time), so toggling the dashboard switch takes effect immediately without restarting the server. In direct-send mode, leads previously stuck at `draft_created` status are automatically reprocessed as real sends. Handles OAuth2 flow with `gmail_credentials.json` and `gmail_token.json`.
 
 **`track_followups.py` + `check_followups.py`** — monitors sent leads for replies. `track_followups.py` updates `last_checked` timestamp and `followup_count`. `check_followups.py` identifies stale leads (no reply after N days) and re-queues them through `draft_outreach.py` via the graph's cyclic edge.
 
-**`llm_client.py`** — unified LLM client supporting Claude (via Anthropic API) and Gemini (via Google GenAI REST API). Switched via `MODEL_BACKEND` env var. Claude preferred for production; Gemini (`models/gemini-flash-lite-latest`) for testing when Claude unavailable.
+**`llm_client.py`** — unified LLM client supporting Claude (via Anthropic API) and Gemini (via Google GenAI REST API). Switched via `MODEL_BACKEND` env var. Claude preferred for production; Gemini (`models/gemini-flash-lite-latest`) for testing when Claude unavailable. Includes **automatic retry with exponential backoff** for transient provider errors (503 overload, 429 rate limit, 5xx, timeouts) — configurable via `LLM_MAX_RETRIES` (default 5) and `LLM_BACKOFF_BASE`/`LLM_BACKOFF_MAX` env vars.
 
 ---
 
@@ -313,14 +313,14 @@ Edit `config/schedule.json` to change cron times, timezone, enabled jobs, or the
    - **LLM Backend:** Choose one via `MODEL_BACKEND=claude` or `MODEL_BACKEND=gemini`
      - Claude: `ANTHROPIC_API_KEY=sk-ant-api03-...` (preferred for production)
      - Gemini: `GEMINI_API_KEY=...` (free tier fallback, 15 RPM, 1M tokens/day)
-   - **APIs:** `SORSA_API_KEY` (X scraping, primary), `GETX_API_KEY` (X scraping fallback), `HUNTER_API_KEY` (email discovery), `FIRECRAWL_API_KEY` (web scraping), `CONTEXT_API_KEY` (company research)
+   - **APIs:** `APOLLO_API_KEY` (email discovery, primary), `HUNTER_API_KEY` (email discovery, fallback), `SORSA_API_KEY` (X scraping, primary), `GETX_API_KEY` (X scraping fallback), `FIRECRAWL_API_KEY` (web scraping)
    - **Gmail (Phase 8):** `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET` (from Google Cloud Console OAuth2 credentials), `gmail_credentials.json`, `gmail_token.json` (auto-generated on first OAuth flow)
    - **Scheduler (Phase 10b):** `ENABLE_SCHEDULER=true` to start the cron scheduler with the API (default off)
 3. Add a Google service-account key at `config/credentials.json` (never committed — see `.gitignore`), shared with edit access on the target Sheet.
 4. `config/base_resume.json` and `config/search_criteria.json` are already checked in — edit them to match your own resume and search preferences.
 
 **API Credits Status (as of testing):**
-- Context.dev: 200/500 credits remaining (10 per brand call, 1 per web scrape)
+- Apollo.io: active, org enrichment + people match functional
+- Hunter.io: domain search functional on free tier (fallback)
 - GetX API: ~$0.09/$0.10 free credit remaining ($0.001/call)
 - Sorsa API: confirmed working after downtime
-- Hunter.io: domain search functional on free tier

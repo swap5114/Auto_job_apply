@@ -99,6 +99,7 @@ class StatsResponse(BaseModel):
     pending_review: int
     in_review: int
     approved: int
+    draft_created: int
     sent: int
     replied: int
     rejected: int
@@ -420,6 +421,7 @@ def get_stats():
         "pending_review": 0,
         "in_review": 0,
         "approved": 0,
+        "draft_created": 0,
         "sent": 0,
         "replied": 0,
         "rejected": 0,
@@ -429,8 +431,6 @@ def get_stats():
         status = str(lead.get("status", "")).strip()
         if status in counts:
             counts[status] += 1
-        elif status == "draft_created":
-            counts["sent"] += 1
         elif not status:
             counts["new"] += 1
 
@@ -661,10 +661,10 @@ def trigger_feed_graph():
 def trigger_send():
     """Send (or draft) all approved leads via Gmail. Returns a summary."""
     try:
-        from skills.send_via_gmail import run, GMAIL_DIRECT_SEND
+        from skills.send_via_gmail import run, is_direct_send
         summary = run()
         _invalidate_leads_cache()
-        return {"status": "success", "mode": "direct" if GMAIL_DIRECT_SEND else "drafts", "summary": summary}
+        return {"status": "success", "mode": "direct" if is_direct_send() else "drafts", "summary": summary}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

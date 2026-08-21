@@ -89,6 +89,11 @@ def run_sourcing_pipeline(
     if sources is None:
         sources = ["arbeitnow", "jobicy", "yc"]
 
+    # Reset the dedup cache so this run reflects the current sheet state, then it
+    # stays in memory for the whole run (1 sheet read total instead of 1-per-lead).
+    from storage.sheet_client import reset_dedup_cache
+    reset_dedup_cache()
+
     cb = progress_callback
     results = []
 

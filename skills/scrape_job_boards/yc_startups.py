@@ -233,7 +233,9 @@ def run(max_leads: int = 20):
     
     print(f"\n🔍 Processing candidates...")
     
-    for company in candidates[:max_leads * 2]:  # Process extra in case of filters
+    # Scan the full candidate pool (dedup is now cheap/in-memory) so we skip past
+    # already-added companies and keep going until we find max_leads NEW ones.
+    for company in candidates:
         if added >= max_leads:
             break
             

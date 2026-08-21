@@ -110,6 +110,26 @@ export default function DashboardPage() {
   const repliedCount = stats?.replied ?? 0;
   const replyRate = sentCount > 0 ? Math.round((repliedCount / sentCount) * 100) : 0;
 
+  // Only leads with an email can actually be sent. Approved leads without an
+  // email (e.g. X handles, or companies Hunter found no email for) can't be
+  // emailed, so they must not inflate the "Send Approved" count.
+  const sendableCount = useMemo(
+    () =>
+      leads.filter(
+        (l) =>
+          (l.status === "approved" || l.status === "draft_created") &&
+          (l.contact_email || "").trim()
+      ).length,
+    [leads]
+  );
+  const approvedNoEmailCount = useMemo(
+    () =>
+      leads.filter(
+        (l) => l.status === "approved" && !(l.contact_email || "").trim()
+      ).length,
+    [leads]
+  );
+
   const kpis = [
     { label: "Total Leads", value: stats?.total ?? 0, icon: FileText },
     { label: "Pending Review", value: (stats?.pending_review ?? 0) + (stats?.in_review ?? 0), icon: Clock },
@@ -144,8 +164,8 @@ export default function DashboardPage() {
               <RefreshCw className={`mr-2 h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
               Refresh
             </Button>
-            {(stats?.approved ?? 0) > 0 && (
-              <SendApprovedButton count={stats?.approved} onDone={load} />
+            {sendableCount > 0 && (
+              <SendApprovedButton count={sendableCount} onDone={load} />
             )}
             <RunPipelineButton />
           </div>
@@ -165,6 +185,14 @@ export default function DashboardPage() {
         </div>
       ) : (
         <div className="space-y-4 pb-16">
+          {approvedNoEmailCount > 0 && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+              {approvedNoEmailCount} approved lead{approvedNoEmailCount > 1 ? "s have" : " has"} no
+              contact email, so {approvedNoEmailCount > 1 ? "they" : "it"} can't be emailed. Find an
+              email (re-run the pipeline) or reach out manually — these won't count toward "Send Approved".
+            </div>
+          )}
+
           {/* KPI ROW */}
           <motion.div
             className="grid grid-cols-2 gap-4 lg:grid-cols-4"

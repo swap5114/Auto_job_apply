@@ -45,6 +45,26 @@ SCOPES = [
 GMAIL_DIRECT_SEND = os.getenv("GMAIL_DIRECT_SEND", "false").lower() == "true"
 SENDER_EMAIL = os.getenv("GMAIL_SENDER_EMAIL", "")  # Your Gmail address
 
+
+def is_direct_send() -> bool:
+    """Read GMAIL_DIRECT_SEND live from config/.env at call time.
+
+    Reading live (instead of the import-time constant) means toggling the
+    Settings -> Gmail Mode switch, which writes to .env, takes effect on the
+    next send without restarting the server.
+    """
+    env_path = os.path.join(CONFIG_DIR, ".env")
+    try:
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("GMAIL_DIRECT_SEND="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    return val.lower() == "true"
+    except FileNotFoundError:
+        pass
+    return os.getenv("GMAIL_DIRECT_SEND", "false").lower() == "true"
+
 # ---------------------------------------------------------------------------
 # OAuth2 token management
 # ---------------------------------------------------------------------------
@@ -164,7 +184,7 @@ def extract_subject_and_body(outreach_draft: str, company: str, role: str) -> tu
         subject = lines[0].split(":", 1)[1].strip()
         body = "\n".join(lines[1:]).strip()
     else:
-        subject = f"Re: {role} opportunity at {company}" if role else f"Reaching out — {company}"
+        subject = f"{role} + your team at {company}" if role else f"Reaching out — {company}"
         body = outreach_draft.strip()
 
     return subject, body
@@ -227,7 +247,7 @@ def process_approved_lead(service, lead: dict) -> str:
         print(f"  ⚠️  {company} ({lead_id}) — no tailored resume PDF found, sending without attachment")
 
     try:
-        if GMAIL_DIRECT_SEND:
+        if is_direct_send():
             result = send_email(service, contact_email, subject, body, attachment)
             msg_id = result.get("id", "?")
             update_lead(lead_id, {"status": "sent", "sent_at": _now_iso()})
@@ -257,9 +277,10 @@ def run() -> dict:
     Returns a summary dict: {sent, draft_created, skipped_no_email,
     skipped_no_draft, failed, total, error}.
     """
+    direct_send = is_direct_send()
     print("=" * 60)
     print("  GMAIL SKILL — Processing approved leads")
-    print(f"  Mode: {'DIRECT SEND' if GMAIL_DIRECT_SEND else 'DRAFTS ONLY'}")
+    print(f"  Mode: {'DIRECT SEND' if direct_send else 'DRAFTS ONLY'}")
     print("=" * 60)
     print()
 
@@ -279,12 +300,30 @@ def run() -> dict:
         summary["error"] = str(e)
         return summary
 
-    # Get leads that have been approved (via review CLI) and not yet sent/drafted
-    leads = get_leads(status="approved")
+    # Which statuses to (re)process:
+    #  - always 'approved' (newly approved, not yet actioned)
+    #  - in DIRECT-SEND mode, also 'draft_created' — those are leads whose
+    #    Gmail draft was created but never actually sent (e.g. draft deleted),
+    #    so they should now go out as real emails. In drafts-only mode we skip
+    #    them to avoid creating duplicate drafts.
+    statuses = ["approved"]
+    if direct_send:
+        statuses.append("draft_created")
+
+    all_leads = get_leads()
+    seen = set()
+    leads = []
+    for lead in all_leads:
+        if str(lead.get("status", "")).strip() in statuses:
+            lid = lead.get("id")
+            if lid not in seen:
+                seen.add(lid)
+                leads.append(lead)
+
     summary["total"] = len(leads)
 
     if not leads:
-        print("No approved leads to process.")
+        print(f"No leads to process (statuses: {', '.join(statuses)}).")
         return summary
 
     for lead in leads:

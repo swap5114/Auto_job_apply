@@ -78,6 +78,7 @@ export interface Stats {
   pending_review: number;
   in_review: number;
   approved: number;
+  draft_created: number;
   sent: number;
   replied: number;
   rejected: number;

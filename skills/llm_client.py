@@ -19,6 +19,8 @@ Per-call overrides are possible via the `backend` and `model` parameters.
 import os
 import json
 import re
+import time
+import random
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "config", ".env"))
@@ -28,6 +30,27 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", "config", ".env"))
 # ---------------------------------------------------------------------------
 
 MODEL_BACKEND = os.getenv("MODEL_BACKEND", "claude").lower()  # "ollama" or "claude"
+
+# Retry config for transient provider errors (503 overload, 429 rate limit,
+# 5xx, timeouts). Providers like Gemini return 503 "high demand" in bursts;
+# without retries every lead in that burst fails permanently for the run.
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "5"))
+LLM_BACKOFF_BASE = float(os.getenv("LLM_BACKOFF_BASE", "2.0"))
+LLM_BACKOFF_MAX = float(os.getenv("LLM_BACKOFF_MAX", "30.0"))
+
+# Substrings that mark an error as transient/retryable (matched case-insensitively).
+_TRANSIENT_MARKERS = (
+    "503", "429", "500", "502", "504", "529",
+    "unavailable", "overloaded", "high demand", "resource_exhausted",
+    "rate limit", "ratelimit", "too many requests", "timeout", "timed out",
+    "temporarily", "connection", "try again",
+)
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """True if an exception looks like a transient provider error worth retrying."""
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _TRANSIENT_MARKERS)
 
 # Claude defaults
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")

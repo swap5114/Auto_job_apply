@@ -56,13 +56,16 @@ def find_email_node(state: PipelineState) -> Dict[str, Any]:
     source = state.get("source", "")
     
     try:
-        # Mock lead dict for the skill function
+        # Mock lead dict for the skill function. jd_text/listing_url are needed
+        # so the X (bio/tweet scan) and careers_page (site domain) paths work.
         lead = {
             "id": lead_id,
             "company": company,
             "domain": domain,
             "x_handle": x_handle,
             "source": source,
+            "jd_text": state.get("jd_text", ""),
+            "listing_url": state.get("listing_url", ""),
         }
         result = find_contact_email_for_lead(lead)
         

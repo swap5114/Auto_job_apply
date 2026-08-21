@@ -34,15 +34,80 @@ def get_service_account_credentials(path: str, scopes: list) -> Credentials:
     return creds
 
 
+# Cache the authorized worksheet handle per sheet_id so we don't re-authorize
+# (a network/token call) and re-open the spreadsheet on every single add_lead call.
+_worksheet_cache: dict = {}
+
+
 def get_worksheet(sheet_id: str):
-    """Authenticates and fetches the first sheet of the target Google Spreadsheet."""
+    """Authenticates and fetches the first sheet of the target Google Spreadsheet.
+
+    The worksheet handle is cached per sheet_id for the life of the process to
+    avoid repeated authorization / open_by_key calls (which count against quota).
+    """
     if not sheet_id:
         raise ValueError("GOOGLE_SHEET_ID environment variable is missing or empty.")
 
+    if sheet_id in _worksheet_cache:
+        return _worksheet_cache[sheet_id]
+
     creds = get_service_account_credentials(CREDENTIALS_PATH, SCOPES)
     spreadsheet_client = gspread.authorize(creds)
+    worksheet = spreadsheet_client.open_by_key(sheet_id).sheet1
 
-    return spreadsheet_client.open_by_key(sheet_id).sheet1
+    _worksheet_cache[sheet_id] = worksheet
+    return worksheet
+
+
+# In-run cache of existing dedup keys. Populated once (a single sheet read) and
+# then kept in sync on every add, so we NEVER re-read the whole sheet per lead.
+# This is what prevents the Google Sheets read-quota rate limit during scraping.
+_dedup_cache: set | None = None
+
+
+def _norm(value) -> str:
+    return (value or "").strip().lower()
+
+
+def _lead_keys(lead: dict) -> list:
+    """Return the dedup key(s) for a lead: company+role and/or x_handle."""
+    company = _norm(lead.get("company"))
+    role = _norm(lead.get("role"))
+    x_handle = _norm(lead.get("x_handle"))
+
+    keys = []
+    if company and role:
+        keys.append(f"cr::{company}|{role}")
+    if x_handle:
+        keys.append(f"xh::{x_handle}")
+    return keys
+
+
+def load_dedup_cache(worksheet=None, force: bool = False) -> set:
+    """Load existing lead dedup keys from the sheet ONCE, then reuse in memory.
+
+    Pass force=True to rebuild it (e.g. if the sheet was changed externally).
+    """
+    global _dedup_cache
+    if _dedup_cache is not None and not force:
+        return _dedup_cache
+
+    ws = worksheet or get_worksheet(os.getenv("GOOGLE_SHEET_ID"))
+    existing_leads = ws.get_all_records(expected_headers=HEADERS)
+
+    cache = set()
+    for existing in existing_leads:
+        for key in _lead_keys(existing):
+            cache.add(key)
+
+    _dedup_cache = cache
+    return _dedup_cache
+
+
+def reset_dedup_cache() -> None:
+    """Drop the in-memory dedup cache (forces a fresh read on next add_lead)."""
+    global _dedup_cache
+    _dedup_cache = None
 
 
 def add_lead(lead: dict) -> bool:
@@ -50,29 +115,26 @@ def add_lead(lead: dict) -> bool:
 
     Duplicate = same company+role (case-insensitive), or same non-empty x_handle.
     Returns True if the lead was added, False if it was skipped as a duplicate.
+
+    De-duplication uses an in-memory cache that is loaded from the sheet only
+    once per process run, so scraping many leads no longer performs one full-sheet
+    read per candidate (which is what triggered the Sheets API rate limit).
     """
-    company = lead.get("company", "").strip()
-    role = lead.get("role", "").strip()
-    x_handle = lead.get("x_handle", "").strip()
+    company = (lead.get("company") or "").strip()
+    role = (lead.get("role") or "").strip()
+    x_handle = (lead.get("x_handle") or "").strip()
 
     if not (company and role) and not x_handle:
         raise ValueError("A lead requires either 'company' and 'role', or an 'x_handle'.")
 
     worksheet = get_worksheet(os.getenv("GOOGLE_SHEET_ID"))
-    
-    # Use expected_headers to avoid duplicate empty column errors
-    existing_leads = worksheet.get_all_records(expected_headers=HEADERS)
 
-    for existing in existing_leads:
-        same_company_role = bool(company) and bool(role) and (
-            existing.get("company", "").strip().lower() == company.lower()
-            and existing.get("role", "").strip().lower() == role.lower()
-        )
-        same_handle = bool(x_handle) and existing.get("x_handle", "").strip().lower() == x_handle.lower()
+    cache = load_dedup_cache(worksheet)
+    keys = _lead_keys(lead)
 
-        if same_company_role or same_handle:
-            print(f"Skipped duplicate lead: {company} - {role}")
-            return False
+    if any(key in cache for key in keys):
+        print(f"Skipped duplicate lead: {company} - {role}")
+        return False
 
     lead_id = uuid.uuid4().hex
     row = []
@@ -82,15 +144,16 @@ def add_lead(lead: dict) -> bool:
         else:
             row.append(str(lead.get(field, "")))
 
-    # Instead of append_row which can go to wrong columns,
-    # explicitly write to the next row in columns A-T (20 columns)
-    next_row = len(worksheet.get_all_values()) + 1
-    cell_range = f"A{next_row}:T{next_row}"
-    
-    # Update the range with our row data
-    worksheet.update(cell_range, [row], value_input_option='RAW')
-    
-    print(f"Added lead: {company} - {role} (id={lead_id[:8]}...) to row {next_row}")
+    # append_row (anchored at A1) writes to the first empty row starting at column A.
+    # This needs no extra read to compute the next row, unlike the previous
+    # get_all_values() approach.
+    worksheet.append_row(row, value_input_option="RAW", table_range="A1")
+
+    # Keep the cache in sync so duplicates within the same run are also caught.
+    for key in keys:
+        cache.add(key)
+
+    print(f"Added lead: {company} - {role} (id={lead_id[:8]}...)")
     return True
 
 

@@ -5,5 +5,8 @@ __pycache__/
 .vscode/
 .idea/
 config/credentials.json
+config/gmail_credentials.json
+config/gmail_token.json
 storage/checkpoints.sqlite
+storage/test_*.sqlite
 resumes
