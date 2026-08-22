@@ -50,7 +50,9 @@ def get_pending_review_leads(db_path: str = DB_PATH) -> List[Dict[str, Any]]:
                 "role": values.get("role", "N/A"),
                 "source": values.get("source", "N/A"),
                 "resume_version": values.get("resume_version", "N/A"),
-                "outreach_draft": values.get("outreach_draft", "N/A"),
+                "outreach_draft": values.get("outreach_draft") or "",
+                "demo_url": values.get("demo_url") or "",
+                "demo_status": values.get("demo_status") or "",
                 "status": values.get("status", "pending_review")
             })
     return pending
@@ -73,17 +75,35 @@ def print_digest(db_path: str = DB_PATH) -> None:
         print(f"\n[{idx}] LEAD ID: {lead['lead_id']}")
         print(f"    Company: {lead['company']} | Role: {lead['role']} | Source: {lead['source']}")
         print(f"    Resume File: {lead['resume_version']}")
+
+        # Demo checkpoint: show the live link (or why there isn't one).
+        demo_status = lead.get("demo_status") or ""
+        demo_url = lead.get("demo_url") or ""
+        if demo_status == "deployed" and demo_url:
+            print(f"    DEMO: ✅ LIVE — {demo_url}")
+            print("          (approve => outreach WITH this link; send-plain => WITHOUT it)")
+        elif demo_status == "build_failed":
+            print("    DEMO: ⚠️  build failed — outreach will go WITHOUT a demo link")
+        elif demo_status == "skipped":
+            print("    DEMO: — none (demo build skipped) — outreach WITHOUT a link")
+        else:
+            print(f"    DEMO: (status: {demo_status or 'n/a'})")
+
         print("    " + "-" * 72)
-        print("    OUTREACH DRAFT:")
-        draft_lines = lead['outreach_draft'].splitlines()
-        for line in draft_lines:
-            print(f"        {line}")
+        draft = lead.get("outreach_draft") or ""
+        if draft.strip():
+            print("    OUTREACH DRAFT:")
+            for line in draft.splitlines():
+                print(f"        {line}")
+        else:
+            print("    OUTREACH DRAFT: (generated on approval, using your demo decision)")
         print("    " + "-" * 72)
 
     print(f"\nTo take action, run:")
-    print("    python -m orchestrator.review_cli approve <lead_id>")
-    print("    python -m orchestrator.review_cli edit <lead_id> [--draft \"...\"]")
-    print("    python -m orchestrator.review_cli reject <lead_id>")
+    print("    python -m orchestrator.review_cli approve <lead_id>       # send WITH demo link if live")
+    print("    python -m orchestrator.review_cli send-plain <lead_id>    # send WITHOUT the demo link")
+    print("    python -m orchestrator.review_cli edit <lead_id> [--draft \"...\"]  # manual draft, then send")
+    print("    python -m orchestrator.review_cli reject <lead_id>        # do NOT send")
     print("=" * 80 + "\n")
 
 
@@ -104,6 +124,29 @@ def approve_lead(lead_id: str, db_path: str = DB_PATH) -> bool:
     if SHEET_CLIENT_AVAILABLE:
         try:
             update_lead(lead_id, {"status": "approved", "review_decision": "approved"})
+        except Exception as e:
+            print(f"⚠️ Warning: Could not update Google Sheet status for lead '{lead_id}': {e}")
+
+    return True
+
+
+def approve_without_demo_lead(lead_id: str, db_path: str = DB_PATH) -> bool:
+    """Resume review authorizing the send but WITHOUT the demo link."""
+    cp = get_checkpointer_connection(db_path)
+    graph = build_pipeline_graph(cp)
+    config = {"configurable": {"thread_id": lead_id}}
+
+    state = graph.get_state(config)
+    if not state or not state.next or "review" not in state.next:
+        print(f"Error: Lead ID '{lead_id}' is not currently paused at review.")
+        return False
+
+    graph.invoke(Command(resume="approved_no_demo"), config)
+    print(f"✅ [APPROVED — NO DEMO] Lead '{lead_id}' will be sent WITHOUT the demo link.")
+
+    if SHEET_CLIENT_AVAILABLE:
+        try:
+            update_lead(lead_id, {"status": "approved", "review_decision": "approved_no_demo"})
         except Exception as e:
             print(f"⚠️ Warning: Could not update Google Sheet status for lead '{lead_id}': {e}")
 
@@ -186,9 +229,13 @@ def main():
     subparsers.add_parser("digest", help="Display summary digest of all leads pending review")
     subparsers.add_parser("list", help="Display summary digest of all leads pending review")
 
-    # approve command
-    approve_parser = subparsers.add_parser("approve", help="Approve a lead by lead_id")
+    # approve command (WITH demo link if a demo is live)
+    approve_parser = subparsers.add_parser("approve", help="Approve a lead (WITH demo link if live)")
     approve_parser.add_argument("lead_id", help="Lead ID to approve")
+
+    # send-plain command (approve WITHOUT the demo link)
+    plain_parser = subparsers.add_parser("send-plain", help="Approve a lead but WITHOUT the demo link")
+    plain_parser.add_argument("lead_id", help="Lead ID to approve without demo")
 
     # edit command
     edit_parser = subparsers.add_parser("edit", help="Edit draft and approve a lead by lead_id")
@@ -205,6 +252,8 @@ def main():
         print_digest()
     elif args.command == "approve":
         approve_lead(args.lead_id)
+    elif args.command == "send-plain":
+        approve_without_demo_lead(args.lead_id)
     elif args.command == "edit":
         edit_lead(args.lead_id, args.draft)
     elif args.command == "reject":

@@ -19,6 +19,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from storage.sheet_client import get_leads, update_lead
 from graph.pipeline import build_pipeline_graph, get_checkpointer_connection, DB_PATH
+from skills.build_demo import get_config as get_demo_config
 
 
 def feed_pending_leads(db_path: str = DB_PATH) -> int:
@@ -41,6 +42,12 @@ def feed_pending_leads(db_path: str = DB_PATH) -> int:
 
     fed = 0
     skipped = 0
+
+    # Per-run demo cost cap: allow demo builds for at most max_per_run leads
+    # (only relevant when the demo feature is enabled).
+    demo_cfg = get_demo_config()
+    demo_budget = demo_cfg.max_per_run if demo_cfg.enabled else 0
+    demos_allowed = 0
 
     for lead in leads:
         lead_id = lead.get("id")
@@ -68,15 +75,37 @@ def feed_pending_leads(db_path: str = DB_PATH) -> int:
             "x_handle": lead.get("x_handle") or None,
             "resume_version": lead.get("resume_version") or None,
             "outreach_draft": lead.get("outreach_draft") or None,
+            "domain": lead.get("domain") or None,
+            "listing_url": lead.get("listing_url") or None,
             "status": "in_review",
         }
 
-        # Start graph execution — it will hit the review interrupt and pause
+        # Enforce the per-run demo cap: once the budget is spent, tell build_demo
+        # to skip (no LLM/sandbox/deploy cost) for the remaining leads this run.
+        if demo_cfg.enabled and demos_allowed < demo_budget:
+            demos_allowed += 1
+        else:
+            state["skip_demo_build"] = True
+
+        # Start graph execution — runs find_email → research → tailor → build_demo,
+        # then pauses at the review interrupt (demo already built/deployed).
         graph.invoke(state, config)
 
-        # Mark lead as in_review in the Sheet so we don't re-feed it
+        # Read back the demo result the graph produced so we can persist it.
+        demo_fields = {}
         try:
-            update_lead(lead_id, {"status": "in_review"})
+            snap = graph.get_state(config)
+            vals = snap.values if snap else {}
+            demo_fields = {
+                "demo_url": vals.get("demo_url", "") or "",
+                "demo_status": vals.get("demo_status", "") or "",
+            }
+        except Exception as e:
+            print(f"Warning: could not read demo state for {lead_id}: {e}")
+
+        # Mark lead as in_review in the Sheet (with demo result) so we don't re-feed it
+        try:
+            update_lead(lead_id, {"status": "in_review", **demo_fields})
         except Exception as e:
             print(f"Warning: fed lead {lead_id} into graph but failed to update Sheet status: {e}")
 

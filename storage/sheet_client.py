@@ -19,6 +19,9 @@ HEADERS = [
     "outreach_draft", "sent_at", "last_checked", "followup_count",
     "listing_url", "posted_date", "domain", "review_decision",
     "demo_idea", "company_info",
+    # Auto-built demo projects (Option 2). demo_url = live deployed URL;
+    # demo_status = deployed | build_failed | skipped | "" (not attempted).
+    "demo_url", "demo_status",
 ]
 
 
@@ -155,6 +158,38 @@ def add_lead(lead: dict) -> bool:
 
     print(f"Added lead: {company} - {role} (id={lead_id[:8]}...)")
     return True
+
+
+def ensure_headers() -> list:
+    """Make the live sheet's header row match HEADERS, adding any missing columns.
+
+    This is an idempotent, additive migration. New columns in HEADERS are only
+    ever appended at the end, so the existing sheet headers are a prefix of
+    HEADERS and this simply fills in the trailing new cells (e.g. demo_url,
+    demo_status). It must be run once after HEADERS gains a column, otherwise
+    get_all_records(expected_headers=HEADERS) raises because the sheet's real
+    header row is missing that column.
+
+    Returns the list of header names that were written (empty if already in sync).
+    """
+    worksheet = get_worksheet(os.getenv("GOOGLE_SHEET_ID"))
+    current = worksheet.row_values(1)
+
+    added = []
+    for idx, header in enumerate(HEADERS):
+        # Cell is missing entirely, or holds a stale/different value.
+        if idx >= len(current) or current[idx] != header:
+            worksheet.update_cell(1, idx + 1, header)
+            if idx >= len(current) or not current[idx]:
+                added.append(header)
+
+    # A header-row change can invalidate the dedup cache's assumptions; drop it.
+    if added:
+        reset_dedup_cache()
+        print(f"ensure_headers: added columns {added}")
+    else:
+        print("ensure_headers: header row already in sync.")
+    return added
 
 
 def get_leads(status: str = None) -> list:

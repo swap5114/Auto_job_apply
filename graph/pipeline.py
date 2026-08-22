@@ -9,6 +9,7 @@ LangGraph's native interrupt() for human-in-the-loop approval.
 """
 
 import os
+import sys
 import sqlite3
 from typing import TypedDict, Optional, Any, Dict, List
 from langgraph.graph import StateGraph, START, END
@@ -17,6 +18,14 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "storage")
 DB_PATH = os.path.join(DB_DIR, "checkpoints.sqlite")
+
+# Force UTF-8 stdout/stderr so emoji status logs don't crash under redirected
+# output on Windows (cp1252). Idempotent; harmless on non-Windows.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # State schema
@@ -40,6 +49,11 @@ class PipelineState(TypedDict, total=False):
     listing_url: Optional[str]
     domain: Optional[str]
     company_research: Optional[Dict[str, Any]]  # Added for research_company node
+    # Auto-built demo project (Option 2).
+    demo_url: Optional[str]       # live deployed URL, "" if none
+    demo_status: Optional[str]    # deployed | build_failed | skipped | ""
+    include_demo: bool            # set by review: include the live link in outreach?
+    skip_demo_build: bool         # per-run cost cap: skip building a demo for this lead
 
 # ---------------------------------------------------------------------------
 # Node definitions
@@ -157,40 +171,117 @@ def tailor_resume_node(state: PipelineState) -> Dict[str, Any]:
         print(f"  ❌ tailor_resume_node failed for {company}: {e}")
         return {"status": "tailor_failed"}
 
-def review_node(state: PipelineState) -> Dict[str, Any]:
-    """Interrupt execution for human review checkpoint.
+def build_demo_node(state: PipelineState) -> Dict[str, Any]:
+    """Generate, sandbox-verify, and deploy a demo project for the lead.
 
-    Pauses graph execution natively via interrupt(). When resumed via
-    Command(resume=...), receives user decision ('approved', 'rejected', or edit dict).
+    Runs BEFORE the review interrupt so the human reviews a real, already-live
+    demo. Gated by DEMO_BUILD_ENABLED: when disabled (the default), this is a
+    cheap no-op passthrough (demo_status='skipped', no cost). One lead's failed
+    build never kills the batch — everything degrades to build_failed/skipped and
+    still flows to review with include_demo defaulted to False.
     """
+    from skills.build_demo import get_config, build_and_deploy_demo
+
+    company = state.get("company") or state.get("x_handle") or state.get("lead_id", "")
+    cfg = get_config()
+
+    # Cost gate: skip entirely (no LLM/sandbox/deploy spend) when disabled OR
+    # when this lead is over the per-run cap (feeder sets skip_demo_build).
+    if not cfg.enabled:
+        print(f"  ⏭️  build_demo_node: DEMO_BUILD_ENABLED=false — skipping for {company}")
+        return {"demo_status": "skipped", "demo_url": "", "include_demo": False}
+    if state.get("skip_demo_build"):
+        print(f"  ⏭️  build_demo_node: per-run demo cap reached — skipping for {company}")
+        return {"demo_status": "skipped", "demo_url": "", "include_demo": False}
+
+    lead = {
+        "id": state.get("lead_id", ""),
+        "company": state.get("company", ""),
+        "role": state.get("role", ""),
+        "jd_text": state.get("jd_text", ""),
+        "domain": state.get("domain", ""),
+        "x_handle": state.get("x_handle", ""),
+        "company_research": state.get("company_research"),
+    }
+
+    try:
+        result = build_and_deploy_demo(lead)
+        status = result.get("demo_status", "build_failed")
+        url = result.get("demo_url", "")
+        print(f"  🏗️  build_demo_node: {company} -> {status} {url}")
+        return {"demo_status": status, "demo_url": url, "include_demo": False}
+    except Exception as e:
+        # build_and_deploy_demo already swallows ordinary failures; this is a
+        # last-resort guard so an unexpected error can't kill the batch.
+        print(f"  ❌ build_demo_node failed for {company}: {e}")
+        return {"demo_status": "build_failed", "demo_url": "", "include_demo": False}
+
+
+def review_node(state: PipelineState) -> Dict[str, Any]:
+    """Human review checkpoint — now positioned AFTER demo build/deploy.
+
+    The reviewer sees the live demo (if any) and decides whether the outreach
+    goes out WITH or WITHOUT the demo link. This is the human-review-before-send
+    gate: no email is sent before it.
+
+    Decision (via Command(resume=...)) may be a string or a dict:
+      * "approved"                     -> send, WITH link iff demo_status==deployed
+      * "approved_no_demo"/"reject_demo" -> send, WITHOUT the demo link
+      * "rejected"/"abort"             -> do NOT send (safety veto)
+      * dict: {"action": <one of above>, "outreach_draft": <optional manual draft>}
+        (a provided outreach_draft is carried through as a manual override)
+
+    Sets include_demo (only ever True when a demo actually deployed) and status
+    ("approved" authorizes send; anything else routes to END).
+    """
+    demo_status = state.get("demo_status") or ""
+    demo_deployed = demo_status == "deployed"
+
     decision = interrupt({
         "lead_id": state.get("lead_id"),
         "company": state.get("company"),
         "role": state.get("role"),
         "resume_version": state.get("resume_version"),
-        "outreach_draft": state.get("outreach_draft"),
+        "demo_url": state.get("demo_url") or "",
+        "demo_status": demo_status,
+        "outreach_draft": state.get("outreach_draft"),  # None in main flow (draft is next)
         "is_followup": state.get("is_followup", False),
         "followup_count": state.get("followup_count", 0),
     })
 
+    return _interpret_review_decision(decision, demo_deployed)
+
+
+def _interpret_review_decision(decision: Any, demo_deployed: bool) -> Dict[str, Any]:
+    """Pure mapping of a review decision -> state update (testable without a graph).
+
+    Actions:
+      * approved            -> send; include_demo iff the demo actually deployed
+      * approved_no_demo / reject_demo / skip_demo / without_demo -> send, no link
+      * rejected / abort / cancel -> do NOT send (status != approved)
+    A dict decision may also carry a manual "outreach_draft" override.
+    """
+    action = "approved"
+    manual_draft = None
     if isinstance(decision, dict):
-        status_str = decision.get("status", "approved")
-        new_draft = decision.get("outreach_draft", state.get("outreach_draft"))
-        return {
-            "review_decision": status_str,
-            "status": status_str,
-            "outreach_draft": new_draft,
-        }
-    elif decision == "rejected":
-        return {
-            "review_decision": "rejected",
-            "status": "rejected",
-        }
-    else:
-        return {
-            "review_decision": "approved",
-            "status": "approved",
-        }
+        action = (decision.get("action") or decision.get("status") or "approved").lower()
+        manual_draft = decision.get("outreach_draft")
+    elif isinstance(decision, str):
+        action = decision.lower()
+
+    if action in ("rejected", "reject", "abort", "cancel"):
+        result: Dict[str, Any] = {"review_decision": "rejected", "status": "rejected",
+                                  "include_demo": False}
+    elif action in ("approved_no_demo", "reject_demo", "skip_demo", "without_demo"):
+        result = {"review_decision": "approved_no_demo", "status": "approved",
+                  "include_demo": False}
+    else:  # "approved" and any approve/edit variant
+        result = {"review_decision": "approved", "status": "approved",
+                  "include_demo": bool(demo_deployed)}
+
+    if manual_draft:
+        result["outreach_draft"] = manual_draft
+    return result
 
 def send_node(state: PipelineState) -> Dict[str, Any]:
     """Send email or create Gmail draft for approved leads.
@@ -299,6 +390,13 @@ def draft_node(state: PipelineState) -> Dict[str, Any]:
     is_followup = state.get("is_followup", False)
     followup_count = state.get("followup_count", 0)
     company_research = state.get("company_research")
+    incoming_status = state.get("status")
+
+    # Manual-draft override: reviewer supplied an edited draft at the (earlier)
+    # review gate. Use it verbatim and keep the send authorized.
+    if incoming_status == "approved" and (state.get("outreach_draft") or "").strip():
+        print(f"  ✍️  draft_node: using reviewer-supplied draft for {company}")
+        return {"outreach_draft": state["outreach_draft"], "status": "approved"}
 
     if not resume_version:
         print(f"  ⚠️  draft_node: no resume_version for {company}, skipping")
@@ -340,30 +438,41 @@ Previous message sent:
 {previous_draft}
 """
 
-    # Add company research context if available (especially the demo project idea)
+    # Demo inclusion is gated by the review decision AND a real live deployment.
+    # Zero fabrication: only ever reference a demo when one is actually live.
+    demo_url = state.get("demo_url") or ""
+    demo_status = state.get("demo_status") or ""
+    include_demo = bool(state.get("include_demo")) and demo_status == "deployed" and bool(demo_url)
+
     research_context = ""
     if company_research:
-        demo_project = company_research.get("demo_project", {})
-        if demo_project:
+        if include_demo:
+            demo_project = company_research.get("demo_project", {}) or {}
             research_context = f"""
 
-IMPORTANT - DEMO PROJECT TO MENTION:
-The candidate has built/is building a demo project specifically for this company:
+IMPORTANT - LIVE DEMO TO REFERENCE (this is the key differentiator):
+The candidate built a working demo specifically for this company, and it is LIVE at:
+{demo_url}
 - Title: {demo_project.get('title', 'N/A')}
-- Description: {demo_project.get('description', 'N/A')}
-- Deliverable: {demo_project.get('deliverable', 'N/A')}
+- What it does: {demo_project.get('description', 'N/A')}
 
-Reference this demo in the outreach! It's the key differentiator. Mention that the candidate 
-built something specifically relevant to their product/problem and offer to share it.
-
-Full company research data:
-{json.dumps(company_research, indent=2)}
+Weave in ONE natural sentence that references this demo and includes the live link
+({demo_url}) so they can click it. Include the URL exactly once. Stay within the length limit.
 """
         else:
+            # No demo included → personalize from research, but NEVER claim a demo
+            # or link was built (it either wasn't, or the reviewer excluded it).
+            safe_research = {
+                k: company_research.get(k)
+                for k in ("overview", "industry", "stage", "tech_signals",
+                          "talking_points", "fit_summary")
+                if company_research.get(k)
+            }
             research_context = f"""
 
-Company research data (use this to personalize the outreach):
-{json.dumps(company_research, indent=2)}
+Company research (use ONLY to personalize the message; do NOT claim the candidate
+built any demo, project, or shareable link):
+{json.dumps(safe_research, indent=2)}
 """
 
     user_message = f"""{format_instruction}{followup_context}{research_context}
@@ -388,9 +497,12 @@ Candidate's tailored resume for this lead (JSON):
             max_tokens=1024,
         )
         print(f"  ✍️  draft_node: {'follow-up' if is_followup else 'outreach'} drafted for {company}")
+        # Preserve an already-approved status (main flow: review precedes draft),
+        # otherwise mark pending_review (follow-up flow: draft precedes review).
+        final_status = "approved" if incoming_status == "approved" else "pending_review"
         return {
             "outreach_draft": draft,
-            "status": "pending_review",
+            "status": final_status,
         }
     except Exception as e:
         print(f"  ❌ draft_node failed for {company}: {e}")
@@ -401,9 +513,19 @@ Candidate's tailored resume for this lead (JSON):
 # ---------------------------------------------------------------------------
 
 def route_after_review(state: PipelineState) -> str:
-    """Route after review: approved → send, rejected → END."""
+    """Route after review (follow-up graph): approved → send, else → END."""
     if state.get("status") == "approved":
         return "send"
+    return END
+
+def route_after_review_to_draft(state: PipelineState) -> str:
+    """Route after review (main graph): approved → draft (then send), else → END.
+
+    The review gate now precedes drafting, so an authorized send flows into
+    draft (which honors include_demo) and onward to send. A veto ends the run.
+    """
+    if state.get("status") == "approved":
+        return "draft"
     return END
 
 def route_after_followup_check(state: PipelineState) -> str:
@@ -431,26 +553,26 @@ def build_pipeline_graph(checkpointer=None):
     builder.add_node("find_email", find_email_node)
     builder.add_node("research_company", research_company_node)
     builder.add_node("tailor_resume", tailor_resume_node)
+    builder.add_node("build_demo", build_demo_node)
     builder.add_node("draft", draft_node)
     builder.add_node("review", review_node)
     builder.add_node("send", send_node)
     builder.add_node("followup_check", followup_check_node)
 
-    # Main flow: START → find_email → research → tailor → draft → review → [send | END]
+    # Main flow (review repositioned AFTER build_demo, BEFORE draft):
+    # START → find_email → research → tailor → build_demo → review → [draft → send | END]
     builder.add_edge(START, "find_email")
     builder.add_edge("find_email", "research_company")
     builder.add_edge("research_company", "tailor_resume")
-    builder.add_edge("tailor_resume", "draft")
-    builder.add_edge("draft", "review")
+    builder.add_edge("tailor_resume", "build_demo")
+    builder.add_edge("build_demo", "review")
 
-    # After review: route to send (approved) or END (rejected)
-    builder.add_conditional_edges("review", route_after_review, ["send", END])
-
-    # After send: done
+    # After review: approved → draft (which honors include_demo) → send; veto → END
+    builder.add_conditional_edges("review", route_after_review_to_draft, ["draft", END])
+    builder.add_edge("draft", "send")
     builder.add_edge("send", END)
 
-    # Follow-up cycle: followup_check → draft (if needed) → review → send
-    # The followup_check node is entered via a separate graph invocation
+    # Follow-up cycle: followup_check → draft (if needed) → ... (entered via followup graph)
     builder.add_conditional_edges("followup_check", route_after_followup_check, ["draft", END])
 
     return builder.compile(checkpointer=checkpointer, interrupt_before=["review"])

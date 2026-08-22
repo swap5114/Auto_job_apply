@@ -24,6 +24,7 @@ This is a personal learning project, not a product. It's built and driven by me;
 | 10 | Wire everything into an actual LangGraph graph | ✅ Done, verified end-to-end |
 | 10b | Cron trigger (APScheduler, replaces the Vellum plan) | ✅ Done, verified end-to-end |
 | 11 | Deploy to a VM | ⬜ Not started |
+| 12 | Auto-built demo projects (Option 2: generate → sandbox-verify → deploy; review gates demo inclusion) | ⚠️ Built + unit-tested via mocks; real Vercel path needs a `VERCEL_TOKEN` to verify live |
 
 A cross-cutting piece not in the original phase numbering: `skills/relevance_filter.py` + `config/search_criteria.json`, a keyword filter applied by every scraper before a lead is even written to the Sheet.
 
@@ -169,6 +170,7 @@ skills/
   relevance_filter.py    Strict dual-keyword filter (role + tech stack) applied before every add_lead()
   find_contact_email.py  Apollo.io org enrichment (primary) + Hunter.io Domain Search (fallback)
   research_company.py    LLM-based company research from job description
+  build_demo.py          Phase 12: generate demo app → Vercel Sandbox build-verify → deploy to live URL
   tailor_resume.py       Claude/Gemini-powered resume tailoring + PDF/MD/JSON generation
   draft_outreach.py      Claude/Gemini-powered outreach drafting (email or X-DM)
   send_via_gmail.py      Gmail API send (drafts-first, then approved-send)
@@ -198,7 +200,9 @@ tests/
 
 ## Leads schema (Google Sheet columns)
 
-`id, source, company, role, jd_text, contact_name, contact_email, x_handle, status, resume_version, outreach_draft, sent_at, last_checked, followup_count, listing_url, posted_date, domain`
+`id, source, company, role, jd_text, contact_name, contact_email, x_handle, status, resume_version, outreach_draft, sent_at, last_checked, followup_count, listing_url, posted_date, domain, review_decision, demo_idea, company_info, demo_url, demo_status`
+
+- `demo_url` / `demo_status` (`deployed` | `build_failed` | `skipped` | empty) are written by the auto-built demo feature (Phase 12). `storage/sheet_client.ensure_headers()` performs the additive column migration on the live sheet.
 
 - `source` is one of `arbeitnow`, `jobicy`, `careers_page`, `company_list`, or `x`.
 - A lead needs either (`company` **and** `role`) or a non-empty `x_handle` — X leads legitimately have neither of the first two.
@@ -229,7 +233,65 @@ tests/
 
 **`track_followups.py` + `check_followups.py`** — monitors sent leads for replies. `track_followups.py` updates `last_checked` timestamp and `followup_count`. `check_followups.py` identifies stale leads (no reply after N days) and re-queues them through `draft_outreach.py` via the graph's cyclic edge.
 
+**`build_demo.py`** (Phase 12) — turns `research_company.py`'s `demo_project` idea into a real, self-contained Vite+React app, verifies it `npm install && npm run build`s cleanly inside a **Vercel Sandbox** (Firecracker microVM), auto-patches build errors and retries (LLM fix loop, capped by `DEMO_MAX_RETRIES`), then deploys it to a live Vercel URL via the Deployments API and polls to `READY`. `build_and_deploy_demo(lead)` returns `{demo_url, demo_status}` and never raises for an ordinary failure — a broken build degrades to `build_failed` so the lead still flows to review WITHOUT a link (zero fabrication). Generated apps are constrained to be secret-free with no runtime network calls (they become **public URLs**). Off by default (`DEMO_BUILD_ENABLED=false`). CLI: `--check`, `--gen <lead_id>`, `<lead_id>`, `--batch`.
+
 **`llm_client.py`** — unified LLM client supporting Claude (via Anthropic API) and Gemini (via Google GenAI REST API). Switched via `MODEL_BACKEND` env var. Claude preferred for production; Gemini (`models/gemini-flash-lite-latest`) for testing when Claude unavailable. Includes **automatic retry with exponential backoff** for transient provider errors (503 overload, 429 rate limit, 5xx, timeouts) — configurable via `LLM_MAX_RETRIES` (default 5) and `LLM_BACKOFF_BASE`/`LLM_BACKOFF_MAX` env vars.
+
+---
+
+## Auto-built demo projects (Phase 12, Option 2)
+
+The strongest cold-outreach hook is a working demo the company can click. This feature closes the loop end-to-end: it takes the per-lead `demo_project` idea `research_company.py` already generates, **builds** it into a real app, **verifies** it compiles in a sandbox, **deploys** it to a live URL, and lets the human decide at review whether the outreach goes out WITH or WITHOUT that link.
+
+**Repositioned review gate.** The human review interrupt now sits *after* a successful deploy, so you review a real, live demo — and your decision gates demo inclusion:
+
+```mermaid
+flowchart TD
+    FE[find_email] --> RC[research_company\ndemo_project idea]
+    RC --> TR[tailor_resume]
+    TR --> BD[build_demo\ngenerate → sandbox-verify → deploy]
+    BD --> RV{{review interrupt\nshows live demo URL}}
+    RV -->|approve| DW[draft WITH live link] --> SEND[send]
+    RV -->|send-plain| DP[draft WITHOUT link] --> SEND
+    RV -->|reject| STOP([END — not sent])
+```
+
+- **approve** → outreach drafted WITH the live link (only if a demo actually deployed).
+- **send-plain** → outreach drafted WITHOUT any demo/link claim, still sent.
+- **reject** → nothing is sent (the safety veto is preserved).
+- If the build was skipped or failed, review still runs (shown as "no demo available"), forced to no-link — a demo is *never* referenced unless `demo_status == deployed` (zero fabrication).
+- Follow-ups do **not** rebuild demos (the follow-up graph skips `build_demo`).
+
+**Review commands** (`orchestrator/review_cli.py`):
+
+```bash
+python -m orchestrator.review_cli digest                 # shows the live demo URL per lead
+python -m orchestrator.review_cli approve    <lead_id>   # send WITH demo link (if live)
+python -m orchestrator.review_cli send-plain <lead_id>   # send WITHOUT the demo link
+python -m orchestrator.review_cli edit       <lead_id>   # manual draft, then send
+python -m orchestrator.review_cli reject     <lead_id>   # do NOT send
+```
+
+**Config** (all in `config/.env`; feature is OFF unless enabled):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `DEMO_BUILD_ENABLED` | `false` | Master switch. When false, `build_demo` is a zero-cost no-op. |
+| `VERCEL_TOKEN` | — | Vercel access token (required to sandbox-build and deploy). |
+| `VERCEL_OIDC_TOKEN` | — | Optional OIDC token for Sandbox auth (else `VERCEL_TOKEN`). |
+| `VERCEL_TEAM_ID` | — | Optional team scope for the Deployments API. |
+| `DEMO_CODEGEN_BACKEND` | (llm_client default) | `claude` \| `gemini` \| `ollama` for demo codegen. |
+| `DEMO_MAX_RETRIES` | `2` | generate→build→fix attempts (the main cost lever). |
+| `DEMO_MAX_PER_RUN` | `5` | Max demos actually built per feed/batch run (cost cap). |
+| `DEMO_PROJECT_PREFIX` | `demo-` | Prefix for the per-lead Vercel project name. |
+
+Run `python -m skills.build_demo --check` to verify config + sheet schema.
+
+**Cost.** The dominant variable cost is codegen tokens; `DEMO_MAX_RETRIES` and `DEMO_MAX_PER_RUN` bound it, and the enable gate keeps it at $0 until you opt in. Vercel Sandbox + Hobby deploys sit inside the free tier at this volume. A short sandbox build (Vite+React) is minutes of active CPU, well under the Hobby monthly allotment.
+
+**Security.** Deployed demos are **public URLs**, so generated apps are constrained to be self-contained, secret-free, and make no runtime external calls; a narrow secret scanner rejects any output carrying a real credential before it can be built or deployed.
+
+**Considered alternative — the v0 Platform API.** Vercel's v0 (`api.v0.dev`) generates *and* deploys an app from a prompt in one call, which would collapse build+deploy. We kept our own codegen path for control over stack and prompt discipline (and because it reuses the existing `llm_client`), but v0 is a clean fallback if self-generated apps prove flaky to build.
 
 ---
 
@@ -237,7 +299,7 @@ tests/
 
 These hold regardless of how much automation gets added later — never relaxed as a "v1 simplification":
 
-- **Human review gate before any send.** No auto-send-once-confident shortcut, ever.
+- **Human review gate before any send.** No auto-send-once-confident shortcut, ever. (With Phase 12 this gate sits *after* demo deployment and also decides demo inclusion — but it still fully gates the send, including a reject/veto path.)
 - **Every skill logs or raises loudly on failure.** Never silently skip a lead.
 - **Zero fabrication** anywhere resume or outreach content touches the candidate's actual history. Stress-tested against a genuinely mismatched JD (a role requiring Ruby on Rails and German B2+, neither of which the candidate has) — both `tailor_resume` and `draft_outreach` correctly declined to fabricate or paper over the gap.
 - **Out of scope for v1:** ATS auto-fill, LinkedIn scraping/automation, a web dashboard (the Sheet *is* the dashboard).

@@ -24,6 +24,7 @@ STRICT RULES -- violating any of these is a critical failure:
 7. Confident and direct, not desperate, not stiff -- write like someone pitching an idea they actually believe in, to a peer, not petitioning an authority.
 8. End with a clear, low-friction call to action (e.g. open to a quick chat, happy to answer questions) -- never pushy or presumptuous.
 9. Sign off with the candidate's name and one relevant link from their resume contact info (GitHub or portfolio) when it fits naturally.
+10. Demo link: ONLY if the user message explicitly provides a LIVE DEMO URL, reference the demo in one natural sentence and include that exact link once. If no live demo URL is provided, do NOT claim any demo, project, or shareable link exists -- that would be a fabrication.
 
 FORMAT: The user message tells you which of two formats to use:
 - EMAIL format: first line "Subject: <subject line>", then a blank line, then the body (under 150 words, per rule 4). Address the given contact name if it's a real name, otherwise a generic greeting.
@@ -59,7 +60,17 @@ def draft_outreach_message(tailored_resume: dict, lead: dict) -> str:
             "greeting like 'Hi there' or 'Hi {company} team'."
         )
 
-    user_message = f"""{format_instruction}
+    # Only surface a demo link when a real deployment exists (zero fabrication).
+    demo_url = (lead.get("demo_url") or "").strip()
+    demo_status = (lead.get("demo_status") or "").strip()
+    demo_context = ""
+    if demo_status == "deployed" and demo_url:
+        demo_context = (
+            f"\n\nLIVE DEMO URL — the candidate built a working demo for this company; "
+            f"reference it in one sentence and include this exact link once: {demo_url}\n"
+        )
+
+    user_message = f"""{format_instruction}{demo_context}
 
 Lead details:
 Source: {source}

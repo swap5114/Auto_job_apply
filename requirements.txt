@@ -12,6 +12,11 @@ google-api-python-client
 google-auth-oauthlib
 google-genai
 
+# Auto-built demo projects (Option 2): Vercel Sandbox build-verify + deploy.
+# Provides vercel.sandbox (Firecracker microVM build checks) and
+# vercel.deployments (deploy-from-files + poll to READY).
+vercel>=0.10.0
+
 # API server
 fastapi
 uvicorn[standard]
