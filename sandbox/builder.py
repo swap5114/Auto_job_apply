@@ -198,6 +198,12 @@ def run_command(
 
     This is like SSH-ing into the container and running a command.
     The Docker SDK equivalent of: docker exec <container_id> bash -c "<command>"
+
+    Note on timeout: the Docker SDK's exec_run() has no native timeout param —
+    it blocks until the command finishes. We enforce the timeout *inside* the
+    container instead, using the coreutils `timeout` command. If the wrapped
+    command runs longer than `timeout` seconds, it's killed and exit_code
+    comes back as 124 (the standard `timeout` "I killed it" exit code).
     """
     client = _get_docker_client()
 
@@ -211,10 +217,15 @@ def run_command(
             f"Container {container_id[:12]} is not running (status: {container.status})"
         )
 
+    # Wrap the command with `timeout <n>s` so a hung/looping process can't
+    # block the build forever. -k 5 sends SIGKILL 5s after SIGTERM if the
+    # process ignores the polite signal.
+    guarded_command = f"timeout -k 5 {timeout}s {command}"
+
     # Execute the command
     # We wrap in bash -c so shell features (pipes, &&, etc.) work
     exec_result = container.exec_run(
-        cmd=["bash", "-c", command],
+        cmd=["bash", "-c", guarded_command],
         workdir=workdir or CONTAINER_WORKSPACE,
         demux=True,  # Separate stdout and stderr
     )
@@ -224,7 +235,77 @@ def run_command(
     stderr = (exec_result.output[1] or b"").decode("utf-8", errors="replace")
     exit_code = exec_result.exit_code
 
+    if exit_code == 124:
+        stderr += f"\n[sandbox] Command timed out after {timeout}s and was killed."
+
     return exit_code, stdout, stderr
+
+def write_file_to_container(container_id: str, filename: str, content: str, dest_dir: str = CONTAINER_WORKSPACE) -> None:
+    """Write a text file into a running container without shell-escaping risk.
+
+    Args:
+        container_id: The container to write into.
+        filename: Name of the file (e.g. "prompt.txt"), no path separators.
+        content: Text content to write.
+        dest_dir: Directory inside the container to write into (default /workspace).
+
+    Why not just `bash -c "echo '...' > file"`?
+    Because prompts can contain quotes, `$variables`, backticks, and newlines
+    that break shell string embedding. Docker's put_archive() sends raw bytes
+    as a tar stream, so the content never passes through a shell parser.
+    """
+    client = _get_docker_client()
+    try:
+        container = client.containers.get(container_id)
+    except NotFound:
+        raise RuntimeError(f"Container {container_id[:12]} not found.")
+
+    data = content.encode("utf-8")
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w") as tar:
+        info = tarfile.TarInfo(name=filename)
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    stream.seek(0)
+
+    container.put_archive(dest_dir, stream)
+
+
+def read_file_from_container(container_id: str, path: str) -> Optional[str]:
+    """Read a text file's contents from a running container.
+
+    Args:
+        container_id: The container to read from.
+        path: Full path inside the container (e.g. "/workspace/.build_status.json").
+
+    Returns:
+        The file's text content, or None if the file doesn't exist.
+
+    This is how the orchestrator checks for state files Kiro writes
+    (.needs_secrets.json, .build_status.json) without guessing from
+    free-text chat output.
+    """
+    client = _get_docker_client()
+    try:
+        container = client.containers.get(container_id)
+    except NotFound:
+        raise RuntimeError(f"Container {container_id[:12]} not found.")
+
+    try:
+        bits, _stat = container.get_archive(path)
+    except NotFound:
+        return None  # File doesn't exist yet — not an error, just "not there"
+
+    stream = io.BytesIO()
+    for chunk in bits:
+        stream.write(chunk)
+    stream.seek(0)
+
+    with tarfile.open(fileobj=stream) as tar:
+        member = tar.getmembers()[0]  # get_archive on a single file returns one tar member
+        extracted = tar.extractfile(member)
+        return extracted.read().decode("utf-8", errors="replace") if extracted else None
+
 
 def get_container_status(container_id: str) -> str:
     """Get the current status of a container.
@@ -309,6 +390,27 @@ def copy_files_from_container(
 
     with tarfile.open(fileobj=stream) as tar:
         tar.extractall(path=dest_path)
+
+    # get_archive() on a directory wraps its contents in a top-level folder
+    # named after the source dir's basename (e.g. copying "/workspace" yields
+    # <dest_path>/workspace/<files>, not <dest_path>/<files> directly). If
+    # that's what happened, flatten it so callers get exactly what they asked
+    # for. Copying a single *file* doesn't have this wrapper, so leave that
+    # case alone.
+    basename = os.path.basename(src_path.rstrip("/"))
+    wrapped_dir = os.path.join(dest_path, basename)
+    if os.path.isdir(wrapped_dir):
+        for item in os.listdir(wrapped_dir):
+            src_item = os.path.join(wrapped_dir, item)
+            dst_item = os.path.join(dest_path, item)
+            if os.path.exists(dst_item):
+                if os.path.isdir(dst_item):
+                    import shutil
+                    shutil.rmtree(dst_item)
+                else:
+                    os.remove(dst_item)
+            os.rename(src_item, dst_item)
+        os.rmdir(wrapped_dir)
 
     print(f"  ✅ Files copied to: {dest_path}")
     return dest_path
