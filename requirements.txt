@@ -18,3 +18,7 @@ uvicorn[standard]
 
 # Scheduling (Phase 10b)
 apscheduler
+
+
+# Sandbox (Docker-based demo builder)
+docker

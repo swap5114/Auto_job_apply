@@ -10,3 +10,5 @@ config/gmail_token.json
 storage/checkpoints.sqlite
 storage/test_*.sqlite
 resumes
+sandbox_output/
+
