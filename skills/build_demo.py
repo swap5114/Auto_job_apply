@@ -136,31 +136,47 @@ def get_config() -> DemoConfig:
 # ---------------------------------------------------------------------------
 
 
-DEMO_CODEGEN_SYSTEM_PROMPT = """You generate a COMPLETE, minimal, self-contained single-page web app that demonstrates a specific demo-project idea for a company. The app will be built and deployed to a PUBLIC URL and shown to a hiring manager, so it must look polished but stay tiny.
+DEMO_CODEGEN_SYSTEM_PROMPT = """You generate a COMPLETE, self-contained single-page web app that demonstrates a specific demo-project idea for a company. The app will be built and deployed to a PUBLIC URL and shown to a hiring manager, so it must look polished and impressive.
 
-STACK (do not deviate):
+STACK:
 - Vite + React (this is what the deploy target auto-detects and builds).
-- Plain CSS. No UI component libraries, no Tailwind, no backend, no database.
+- You MAY use these additional npm packages if the demo benefits from them:
+  * Styling: tailwindcss, postcss, autoprefixer (configure in postcss.config.js + tailwind.config.js)
+  * Charts: recharts, chart.js, react-chartjs-2
+  * Animation: framer-motion
+  * Utilities: date-fns, lodash-es, clsx
+- Do NOT add packages beyond the above whitelist. If the demo doesn't need them, don't include them.
 
 HARD RULES — violating any of these is a critical failure:
-1. SELF-CONTAINED: no runtime calls to external APIs, network requests, fetch(), websockets, or third-party scripts. All data must be hard-coded / mocked inline in the source.
+1. SELF-CONTAINED: the app must work with NO real external services at runtime.
+   - NO real API calls, NO real WebSocket connections, NO real database.
+   - SIMULATING real-time data is ENCOURAGED: use setInterval, requestAnimationFrame, or
+     randomized state updates to create the appearance of live streaming data. This is impressive.
+   - All data must be generated/mocked client-side.
 2. NO SECRETS: never include API keys, tokens, passwords, private keys, connection strings, or environment variables of any kind. The app must need zero env vars to run.
 3. NO PII: do not invent real people's personal data. Use the company name and the demo concept only.
-4. MUST BUILD with `npm install && npm run build` using ONLY these exact pinned dependencies (do not add others):
+4. MUST BUILD cleanly with `npm install && npm run build`. Pin these base dependencies:
    - "react": "18.3.1"
    - "react-dom": "18.3.1"
-   devDependencies:
+   devDependencies (always include):
    - "vite": "5.4.10"
    - "@vitejs/plugin-react": "4.3.3"
-5. Keep it to a single page that clearly presents the demo concept. Small but real — working interactivity is fine as long as it's purely client-side (React state only).
+   Add optional deps from the whitelist above ONLY if you actually use them in the code.
+5. The app should be visually impressive — use modern styling (Tailwind or well-crafted CSS), smooth animations, and realistic mock data that demonstrates the concept clearly.
 
-You MUST output these files, and only these files:
+FILE STRUCTURE:
+Output AT MINIMUM these files:
 - package.json        (type: module; scripts: dev="vite", build="vite build", preview="vite preview")
-- vite.config.js      (uses @vitejs/plugin-react)
+- vite.config.js      (uses @vitejs/plugin-react; add tailwind plugin if using Tailwind)
 - index.html          (root, references /src/main.jsx)
 - src/main.jsx        (mounts <App/> into #root)
-- src/App.jsx         (the demo UI)
-- src/styles.css      (clean, modern, minimal styling)
+- src/App.jsx         (the demo UI — can import sub-components from src/)
+
+You MAY add more files as needed:
+- src/components/*.jsx  (sub-components if the demo is complex)
+- src/styles.css or src/index.css (if not using Tailwind, or for Tailwind's @tailwind directives)
+- tailwind.config.js, postcss.config.js (if using Tailwind)
+- src/data.js or src/mockData.js (for mock data generators)
 
 OUTPUT FORMAT — emit each file EXACTLY like this, with no prose, no markdown, no commentary before/after:
 <<<FILE package.json>>>
@@ -427,16 +443,17 @@ def build_in_sandbox(files: Dict[str, str]) -> dict:
         return {"ok": False, "logs": f"sandbox error: {e}", "image": ""}
 
 
-DEMO_FIX_SYSTEM_PROMPT = """You are fixing a small Vite + React demo app that FAILED to `npm install && npm run build`. You are given the current files and the build error log. Return the COMPLETE corrected file set that will build cleanly.
+DEMO_FIX_SYSTEM_PROMPT = """You are fixing a Vite + React demo app that FAILED to `npm install && npm run build`. You are given the current files and the build error log. Return the COMPLETE corrected file set that will build cleanly.
 
 Keep ALL the original hard rules:
-- Vite + React only; plain CSS; no backend/database.
-- SELF-CONTAINED: no runtime network calls, no fetch(), no third-party scripts.
+- Vite + React; client-side only; no real backend/database/external API at runtime.
+- SELF-CONTAINED: all data mocked/simulated client-side. Simulated real-time updates (setInterval, RAF) are fine.
 - NO SECRETS and NO environment variables of any kind.
-- Use ONLY these pinned deps: react 18.3.1, react-dom 18.3.1 (deps); vite 5.4.10, @vitejs/plugin-react 4.3.3 (devDeps). Do not add others.
-- The app must be a single page and build to static output.
+- Base deps always: react 18.3.1, react-dom 18.3.1 (deps); vite 5.4.10, @vitejs/plugin-react 4.3.3 (devDeps).
+- Allowed extra npm packages (ONLY these): tailwindcss, postcss, autoprefixer, recharts, chart.js, react-chartjs-2, framer-motion, date-fns, lodash-es, clsx. Do not add anything else.
+- The app must build to static output suitable for Vercel static hosting.
 
-Fix the actual cause shown in the error log (missing file/import, bad JSX, wrong config, mismatched entry path in index.html, etc.). Prefer the smallest change that makes it build. Re-output EVERY file needed for the app (not just the changed one), so the set is complete on its own.
+Fix the actual cause shown in the error log (missing file/import, bad JSX, wrong config, mismatched entry path in index.html, missing dependency, Tailwind misconfiguration, etc.). Prefer the smallest change that makes it build. Re-output EVERY file needed for the app (not just the changed one), so the set is complete on its own.
 
 OUTPUT FORMAT — emit each file EXACTLY like this, no prose, no markdown fences:
 <<<FILE path>>>

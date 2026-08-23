@@ -29,6 +29,14 @@ Given a company name, domain, role, and job description, produce:
    - Can be shared as a live link, video, or GitHub repo
    - Uses tech mentioned in the JD when possible
 
+IMPORTANT — BUILD CONSTRAINTS (the demo will be auto-deployed as a static single-page app):
+The demo is auto-built and deployed as a CLIENT-SIDE ONLY Vite+React app on static hosting (no server, no backend, no database at runtime). Design ideas that are impressive WITHIN these constraints:
+- GOOD: simulated real-time dashboards (setInterval/RAF with mock data), interactive visualizations, client-side algorithms, animated UIs, drag-and-drop builders, code playgrounds, state management demos
+- GOOD: use Tailwind CSS, charting libraries (recharts, chart.js), animation libraries (framer-motion), D3, etc. — any npm package that runs client-side
+- BAD: anything requiring a real WebSocket server, a real database, a real API backend, or server-side rendering at runtime
+- If the JD mentions backend tech (Python, Go, databases), design a FRONTEND demo that VISUALIZES or SIMULATES what those systems do — e.g. a simulated order-book UI for a trading platform, a mock API dashboard, a pipeline visualizer
+- All data must be generated/mocked client-side. Simulating real-time feeds (rapid state updates, streaming mock data) is ENCOURAGED — it looks impressive
+
 STRICT RULES:
 1. Demo ideas must be CONCRETE and SPECIFIC to THIS company — not generic like "build a dashboard" or "create an API". Reference their actual product or problem.
 2. Base claims on the JD text and widely-known facts. If uncertain about facts (funding, headcount), say "likely" or "appears to be", never state as certain.
