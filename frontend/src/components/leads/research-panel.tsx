@@ -53,7 +53,7 @@ function generateResearch(lead: {
       condition: jd.includes("ai") || jd.includes("llm") || jd.includes("ml"),
       title: `AI Feature Demo for ${name}`,
       description: `Build a small AI-powered tool that solves a problem related to ${name}'s product. For example, an intelligent data classifier, a smart search feature, or an automated content generator.`,
-      tech: ["Python", "FastAPI", "OpenAI API", "React"],
+      tech: ["Python", "FastAPI", "Google Gemini API", "React"],
       deliverable: "Live demo link + GitHub repo",
       why: "Shows hands-on AI/ML experience directly relevant to their core product"
     },

@@ -34,6 +34,7 @@ STRICT RULES:
 2. Base claims on the JD text and widely-known facts. If uncertain about facts (funding, headcount), say "likely" or "appears to be", never state as certain.
 3. Tech-stack signals must come from the JD — don't guess technologies not mentioned.
 4. The demo should solve a real problem the company faces or showcase a feature relevant to their product.
+5. If the demo idea would benefit from an LLM/AI API call, prefer Google Gemini (it has a genuinely free tier) over OpenAI or Anthropic in tech_stack — never suggest a paid-only API when a free equivalent covers the same need. Only include an LLM API in tech_stack at all if the demo's core value genuinely depends on one; don't add "OpenAI API" or similar just because the company is AI-adjacent.
 
 Return ONLY valid JSON in exactly this shape (no markdown, no prose):
 {

@@ -50,7 +50,6 @@ from sandbox.config import (
     BUILD_STATUS_FILENAME,
     DEFAULT_MAX_ATTEMPTS,
     KIRO_TURN_TIMEOUT,
-    HOST_OUTPUT_DIR,
 )
 
 
@@ -149,14 +148,15 @@ DELIVERABLE: {deliverable}
 Instructions:
 1. Build the project directly inside /workspace (don't create a subfolder unless the stack requires it, e.g. `npx create-vite`).
 2. Keep it small and focused — this is a 2-3 day demo, not a production system. Favor a working, simple version over an ambitious, broken one.
-3. If at any point you need a secret you don't have (an API key, a database URL, etc.):
+3. If this project needs an LLM/AI API call: use Google Gemini (it has a genuinely free tier) — request GEMINI_API_KEY, NEVER OPENAI_API_KEY or ANTHROPIC_API_KEY, unless the spec above explicitly names a different provider by name. Before reaching for any AI API at all, check whether the demo's core value can be shown just as well with mocked/sample AI-style responses (e.g. a few realistic canned outputs) — if so, do that instead and skip requesting a key entirely. Only request a real LLM API key when the demo genuinely can't demonstrate its point without a live call.
+4. If at any point you need a secret you don't have (an API key, a database URL, etc.) for a reason OTHER than the LLM-provider case above:
    - Do NOT invent, guess, or use a placeholder value that looks real.
    - Write a file named {NEEDS_SECRETS_FILENAME} into /workspace with this exact JSON shape:
      {{"needed": [{{"name": "ENV_VAR_NAME", "why": "one sentence on what it's for"}}]}}
    - Then STOP. Don't attempt further work on that part until you're told to continue.
    - If a secret later appears in /workspace/.secrets.env, read it, wire it into the project's own .env file, and continue.
-4. Once you believe the project is complete, ACTUALLY RUN its build and/or start command yourself (e.g. `npm run build`, `python -m py_compile`, etc.) using your own tools. Don't just claim it works — verify it by running it and checking the real exit code.
-5. When you're done (whether it worked or not), write a file named {BUILD_STATUS_FILENAME} into /workspace with this exact JSON shape:
+5. Once you believe the project is complete, ACTUALLY RUN its build and/or start command yourself (e.g. `npm run build`, `python -m py_compile`, etc.) using your own tools. Don't just claim it works — verify it by running it and checking the real exit code.
+6. When you're done (whether it worked or not), write a file named {BUILD_STATUS_FILENAME} into /workspace with this exact JSON shape:
    {{"status": "success" or "failed", "summary": "1-2 sentences on what you built or why it failed", "build_command": "the command you ran to build it", "start_command": "the command a user would run to start it", "entry_point": "main file or URL path, if relevant"}}
 
 Only write ONE of {NEEDS_SECRETS_FILENAME} or {BUILD_STATUS_FILENAME} per turn — whichever matches where you are right now."""
@@ -273,7 +273,7 @@ def provide_secrets_and_resume(state: BuildState, secrets: dict[str, str]) -> Bu
 
     Args:
         state: A BuildState currently in stage == "needs_secrets".
-        secrets: Mapping of env var name -> value, e.g. {"OPENAI_API_KEY": "sk-..."}.
+        secrets: Mapping of env var name -> value, e.g. {"GEMINI_API_KEY": "AIza..."}.
 
     The secrets are written to /workspace/.secrets.env (NOT the container's
     process environment) so Kiro discovers them by reading a file, exactly as
@@ -384,87 +384,31 @@ def export_build_output(state: BuildState, dest_path: Optional[str] = None) -> O
 
 # tech_stack keywords that indicate a demo needs its own backend process
 # (as opposed to a purely static site Vercel alone can serve). Checked
-# case-insensitively against the demo_project's tech_stack list. This is
-# ONLY consulted when Kiro's own build_status.json is unavailable (result
-# is None) — see the docstring below for why it must not be trusted over
-# the actual build output.
+# case-insensitively against the demo_project's tech_stack list.
 _BACKEND_TECH_KEYWORDS = (
     "fastapi", "flask", "django", "express", "node.js", "nodejs", "backend",
     "api server", "rest api", "websocket", "socket.io", "graphql server",
 )
 
-# Frameworks Vercel deploys natively, including their server-side pieces
-# (API routes, server actions, edge/serverless functions). A demo built
-# with one of these needs ONLY a Vercel deploy — routing it to Render as
-# well would either fail outright (Render's generic Node/Python runtime
-# doesn't know how to run a Next.js app) or just be redundant.
-_VERCEL_NATIVE_FRAMEWORKS = ("next.js", "next", "nuxt", "sveltekit", "remix", "astro")
 
-
-def _uses_vercel_native_framework(project_dir: Optional[str]) -> bool:
-    """Check package.json dependencies directly for a framework Vercel runs
-    natively (including its server-side pieces — API routes, server
-    actions, edge functions). This is the ground-truth check: unlike
-    parsing Kiro's prose summary for a framework name, a package.json
-    dependency either is or isn't there.
-    """
-    if not project_dir:
-        return False
-    package_json_path = os.path.join(project_dir, "package.json")
-    if not os.path.isfile(package_json_path):
-        return False
-    try:
-        with open(package_json_path, "r", encoding="utf-8") as f:
-            pkg = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return False
-    deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
-    return any(fw in deps for fw in ("next", "nuxt", "@sveltejs/kit", "@remix-run/react", "astro"))
-
-
-def needs_backend_deploy(demo_project: dict, result: Optional[dict], project_dir: Optional[str] = None) -> bool:
+def needs_backend_deploy(demo_project: dict, result: Optional[dict]) -> bool:
     """Decide whether a demo needs a separate backend deploy (Render) on top
     of the frontend deploy (Vercel).
 
-    Checked in order of trust:
-      1. package.json dependencies (via _uses_vercel_native_framework) — if
-         the project actually depends on Next.js/Nuxt/SvelteKit/etc., this
-         is "no" unconditionally. Vercel serves that framework's own
-         API routes/server functions itself; routing it to Render as well
-         would fail, since Render's generic Node/Python runtime doesn't
-         know how to run e.g. a Next.js app the way `next start` expects.
-         This is a ground-truth check against real project files, not a
-         guess from prose.
-      2. Kiro's own build_status.json (`build_command`/`start_command`) —
-         reflects what was ACTUALLY built and verified, which can differ
-         from the original demo_project spec. research_company.py's
-         suggested tech_stack is aspirational (an LLM's upfront guess at
-         what a good demo would use); Kiro frequently simplifies during
-         the actual build — e.g. dropping a suggested WebSocket/Pinecone
-         architecture in favor of a simpler self-contained Next.js app.
-         Trusting the spec over the real build was the root cause of a
-         real failure: a demo whose spec mentioned "WebSockets" but was
-         actually built as a plain Next.js app got incorrectly routed to
-         Render, which then failed since there was no separate backend
-         process to deploy there.
-      3. The demo_project's tech_stack list — ONLY as a last-resort
-         fallback when result is missing entirely (e.g. an infra error
-         before Kiro could report a verified status) AND no project_dir
-         is available to check directly.
+    Two signals are checked, in order of trust:
+      1. Kiro's own build_status.json `start_command` — if it looks like it
+         starts a persistent server process (uvicorn/node/flask run/etc.),
+         that's the most reliable signal since it reflects what was
+         actually built, not just what was suggested upfront.
+      2. The demo_project's tech_stack list — a fallback for when the
+         start_command is missing or ambiguous (e.g. "open index.html").
     """
-    if _uses_vercel_native_framework(project_dir):
-        return False
+    start_command = (result or {}).get("start_command", "") or ""
+    start_command_lower = start_command.lower()
+    server_indicators = ("uvicorn", "flask run", "node ", "npm start", "npm run start", "gunicorn", "django")
+    if any(ind in start_command_lower for ind in server_indicators):
+        return True
 
-    if result is not None:
-        # We have real build output — trust it over the pre-build spec.
-        build_command = result.get("build_command", "") or ""
-        start_command = result.get("start_command", "") or ""
-        commands_lower = f"{build_command} {start_command}".lower()
-        server_indicators = ("uvicorn", "flask run", "node ", "npm start", "npm run start", "gunicorn", "django")
-        return any(ind in commands_lower for ind in server_indicators)
-
-    # No build_status.json at all — fall back to the aspirational spec,
-    # since it's the only signal available.
     tech_stack = " ".join(demo_project.get("tech_stack", [])).lower()
     return any(kw in tech_stack for kw in _BACKEND_TECH_KEYWORDS)
 
@@ -532,7 +476,7 @@ def deploy_build(state: BuildState, demo_project: dict, company: str = "") -> No
         state.deploy_error = f"Vercel deploy failed: {e}"
         return
 
-    if needs_backend_deploy(demo_project, state.result, project_dir=state.project_dir):
+    if needs_backend_deploy(demo_project, state.result):
         try:
             state.deploy_stage = "deploying_render"
             render_result = render_deploy.deploy_to_render(
@@ -553,84 +497,6 @@ def deploy_build(state: BuildState, demo_project: dict, company: str = "") -> No
             return
 
     state.deploy_stage = "deployed"
-
-
-def retry_deploy(state: BuildState, demo_project: dict, company: str = "") -> None:
-    """Re-run the deploy phase for a build that already succeeded in the
-    sandbox but whose deploy_stage ended in "deploy_failed".
-
-    Does NOT re-run the sandbox build itself (state.stage stays "success",
-    state.result is untouched) — only export/GitHub/Vercel/Render. This is
-    safe to call multiple times:
-      - export_build_output() re-copies from the container if it's still
-        running (needs_secrets builds keep it alive; success/failed builds
-        already stopped theirs, so this only matters if retry runs before
-        any container cleanup — see the guard below).
-      - github_deploy.deploy_to_github() now pushes to the existing repo
-        (force-push) instead of failing on "name already exists" if a
-        prior attempt got that far.
-      - vercel_deploy / render_deploy already reuse-by-name on a 409/500
-        collision rather than failing (see _create_or_get_project /
-        _create_service).
-
-    Raises ValueError if state.stage isn't "success" — retrying a build
-    that never passed the sandbox step doesn't mean anything; that's what
-    the original "Try Again" (full rebuild) button is for.
-    """
-    if state.stage != "success":
-        raise ValueError(f"Cannot retry deploy for a build in stage '{state.stage}' (must be 'success').")
-
-    state.deploy_error = None
-
-    # The container was already stopped in the normal finish path (see
-    # api/main.py's _finish_build_and_deploy). If project_dir was never
-    # successfully set (e.g. finalize_success's export itself failed), we
-    # have nothing to retry from — export can't run again with no container
-    # and no on-disk copy to work from.
-    if not state.project_dir or not os.path.isdir(state.project_dir):
-        recovered = _try_recover_stranded_export(state)
-        if not recovered:
-            state.deploy_stage = "deploy_failed"
-            state.deploy_error = "No exported project files available to retry from (original export failed or was cleaned up)."
-            return
-
-    deploy_build(state, demo_project, company)
-
-
-def _try_recover_stranded_export(state: BuildState) -> bool:
-    """Best-effort recovery for a specific failure mode: the export's
-    tarfile.extractall() succeeded (real files exist on disk), but the
-    flatten step that follows it raised partway through — leaving
-    state.project_dir unset even though the files are genuinely there,
-    just still nested one level deeper under a "workspace" subfolder.
-
-    This shouldn't happen going forward (builder.py's flatten step is now
-    resilient to the same failure — see _move_with_retry), but a build that
-    hit this before that fix shipped would otherwise be permanently stuck
-    with no way to retry, despite its files being intact on disk. Rather
-    than requiring a from-scratch rebuild, look for that exact shape
-    (sandbox_output/<container_short_id>/workspace/) and re-run the flatten
-    logic directly.
-
-    Returns True if a usable project_dir was found/repaired and set on
-    state, False if there's genuinely nothing to recover.
-    """
-    if not state.container_id:
-        return False
-
-    # container_id may be a full 64-char ID; builder.py names export dirs
-    # after container.short_id (12 chars) — check both in case either was
-    # what got recorded historically.
-    basename = os.path.basename(CONTAINER_WORKSPACE.rstrip("/"))
-    candidates = [state.container_id[:12], state.container_id]
-    for candidate in candidates:
-        candidate_dir = os.path.join(HOST_OUTPUT_DIR, candidate)
-        if os.path.isdir(os.path.join(candidate_dir, basename)):
-            print(f"  Recovering stranded export at {candidate_dir} (re-flattening)...")
-            builder.flatten_wrapped_export(candidate_dir, basename)
-            state.project_dir = candidate_dir
-            return True
-    return False
 
 
 # ---------------------------------------------------------------------------
