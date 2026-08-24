@@ -182,7 +182,7 @@ function SecretsForm({
   );
 }
 
-function ResultCard({ result, error }: { result: DemoBuildStatus["result"]; error: string | null }) {
+export function ResultCard({ result, error }: { result: DemoBuildStatus["result"]; error: string | null }) {
   const failed = !result || result.status === "failed";
 
   return (
@@ -221,7 +221,16 @@ function ResultCard({ result, error }: { result: DemoBuildStatus["result"]; erro
  * succeeded" and "the deploy background thread has actually started" —
  * treated the same as "exporting" so there's no flash of an empty state.
  */
-function DeployStatusCard({ status }: { status: DemoBuildStatus }) {
+export function DeployStatusCard({
+  status,
+  onRetryDeploy,
+  retrying,
+}: {
+  status: DemoBuildStatus;
+  /** Optional — when provided, a "Retry Deploy" button renders on failure. */
+  onRetryDeploy?: () => void;
+  retrying?: boolean;
+}) {
   const deployStage = status.deploy_stage ?? "exporting";
 
   if (deployStage === "deploy_failed") {
@@ -243,6 +252,16 @@ function DeployStatusCard({ status }: { status: DemoBuildStatus }) {
           >
             <Github className="h-3 w-3" /> Code was pushed to GitHub
           </a>
+        )}
+        {onRetryDeploy && (
+          <Button size="sm" variant="outline" className="mt-3 w-full" onClick={onRetryDeploy} disabled={retrying}>
+            {retrying ? (
+              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
+            )}
+            Retry Deploy
+          </Button>
         )}
       </div>
     );
@@ -342,6 +361,7 @@ export function DemoBuilder({
   const [status, setStatus] = useState<DemoBuildStatus | null>(null);
   const [starting, setStarting] = useState(false);
   const [submittingSecrets, setSubmittingSecrets] = useState(false);
+  const [retryingDeploy, setRetryingDeploy] = useState(false);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // On mount, check whether a build was already started for this lead (from
@@ -476,6 +496,23 @@ export function DemoBuilder({
     setStage("idle");
   }
 
+  async function handleRetryDeploy() {
+    if (!buildId) return;
+    setRetryingDeploy(true);
+    try {
+      const s = await api.leads.retryDeploy(leadId, buildId);
+      setStatus(s);
+      setStage(s.stage);
+      setActiveBuildId(leadId, buildId); // deploy is active again — make it recoverable
+      schedulePoll(buildId);
+      toast.success("Retrying deploy…");
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to retry deploy");
+    } finally {
+      setRetryingDeploy(false);
+    }
+  }
+
   function copyBuildId() {
     if (!buildId) return;
     navigator.clipboard.writeText(buildId);
@@ -579,7 +616,7 @@ export function DemoBuilder({
                 <ResultCard result={status?.result ?? null} error={status?.error ?? null} />
 
                 {stage === "success" && status && (
-                  <DeployStatusCard status={status} />
+                  <DeployStatusCard status={status} onRetryDeploy={handleRetryDeploy} retrying={retryingDeploy} />
                 )}
 
                 <Button variant="outline" size="sm" className="w-full" onClick={handleRetry}>

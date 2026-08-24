@@ -50,6 +50,7 @@ from sandbox.config import (
     BUILD_STATUS_FILENAME,
     DEFAULT_MAX_ATTEMPTS,
     KIRO_TURN_TIMEOUT,
+    HOST_OUTPUT_DIR,
 )
 
 
@@ -552,6 +553,84 @@ def deploy_build(state: BuildState, demo_project: dict, company: str = "") -> No
             return
 
     state.deploy_stage = "deployed"
+
+
+def retry_deploy(state: BuildState, demo_project: dict, company: str = "") -> None:
+    """Re-run the deploy phase for a build that already succeeded in the
+    sandbox but whose deploy_stage ended in "deploy_failed".
+
+    Does NOT re-run the sandbox build itself (state.stage stays "success",
+    state.result is untouched) — only export/GitHub/Vercel/Render. This is
+    safe to call multiple times:
+      - export_build_output() re-copies from the container if it's still
+        running (needs_secrets builds keep it alive; success/failed builds
+        already stopped theirs, so this only matters if retry runs before
+        any container cleanup — see the guard below).
+      - github_deploy.deploy_to_github() now pushes to the existing repo
+        (force-push) instead of failing on "name already exists" if a
+        prior attempt got that far.
+      - vercel_deploy / render_deploy already reuse-by-name on a 409/500
+        collision rather than failing (see _create_or_get_project /
+        _create_service).
+
+    Raises ValueError if state.stage isn't "success" — retrying a build
+    that never passed the sandbox step doesn't mean anything; that's what
+    the original "Try Again" (full rebuild) button is for.
+    """
+    if state.stage != "success":
+        raise ValueError(f"Cannot retry deploy for a build in stage '{state.stage}' (must be 'success').")
+
+    state.deploy_error = None
+
+    # The container was already stopped in the normal finish path (see
+    # api/main.py's _finish_build_and_deploy). If project_dir was never
+    # successfully set (e.g. finalize_success's export itself failed), we
+    # have nothing to retry from — export can't run again with no container
+    # and no on-disk copy to work from.
+    if not state.project_dir or not os.path.isdir(state.project_dir):
+        recovered = _try_recover_stranded_export(state)
+        if not recovered:
+            state.deploy_stage = "deploy_failed"
+            state.deploy_error = "No exported project files available to retry from (original export failed or was cleaned up)."
+            return
+
+    deploy_build(state, demo_project, company)
+
+
+def _try_recover_stranded_export(state: BuildState) -> bool:
+    """Best-effort recovery for a specific failure mode: the export's
+    tarfile.extractall() succeeded (real files exist on disk), but the
+    flatten step that follows it raised partway through — leaving
+    state.project_dir unset even though the files are genuinely there,
+    just still nested one level deeper under a "workspace" subfolder.
+
+    This shouldn't happen going forward (builder.py's flatten step is now
+    resilient to the same failure — see _move_with_retry), but a build that
+    hit this before that fix shipped would otherwise be permanently stuck
+    with no way to retry, despite its files being intact on disk. Rather
+    than requiring a from-scratch rebuild, look for that exact shape
+    (sandbox_output/<container_short_id>/workspace/) and re-run the flatten
+    logic directly.
+
+    Returns True if a usable project_dir was found/repaired and set on
+    state, False if there's genuinely nothing to recover.
+    """
+    if not state.container_id:
+        return False
+
+    # container_id may be a full 64-char ID; builder.py names export dirs
+    # after container.short_id (12 chars) — check both in case either was
+    # what got recorded historically.
+    basename = os.path.basename(CONTAINER_WORKSPACE.rstrip("/"))
+    candidates = [state.container_id[:12], state.container_id]
+    for candidate in candidates:
+        candidate_dir = os.path.join(HOST_OUTPUT_DIR, candidate)
+        if os.path.isdir(os.path.join(candidate_dir, basename)):
+            print(f"  Recovering stranded export at {candidate_dir} (re-flattening)...")
+            builder.flatten_wrapped_export(candidate_dir, basename)
+            state.project_dir = candidate_dir
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------

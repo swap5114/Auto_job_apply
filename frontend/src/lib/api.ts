@@ -237,6 +237,14 @@ export const api = {
       request<{ status: string; build_id: string }>(`/leads/${id}/build-demo/${buildId}/cancel`, {
         method: "POST",
       }),
+
+    retryDeploy: (id: string, buildId: string) =>
+      request<DemoBuildStatus>(`/leads/${id}/build-demo/${buildId}/retry-deploy`, {
+        method: "POST",
+      }),
+
+    getBuild: (id: string, buildId: string) =>
+      request<DemoBuildStatus>(`/leads/${id}/build-demo/${buildId}`),
   },
 
   builds: {

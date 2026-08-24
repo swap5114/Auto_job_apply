@@ -730,6 +730,82 @@ def build_demo_cancel(lead_id: str, build_id: str):
     return {"status": "cancelled", "build_id": build_id}
 
 
+def _retry_deploy_bg(build_id: str):
+    """Background worker for retrying just the deploy phase (export was
+    already done and the container already stopped by the original run —
+    see orchestrator.retry_deploy's docstring for what's safe to re-run).
+    """
+    from sandbox import orchestrator
+
+    entry = _get_build_entry(build_id)
+    state = entry["state"]
+    with entry["lock"]:
+        entry["running"] = True
+    try:
+        orchestrator.retry_deploy(state, entry.get("demo_project", {}), entry.get("company", ""))
+    except Exception as e:
+        state.deploy_stage = "deploy_failed"
+        state.deploy_error = f"Unexpected error during retry: {e}"
+    finally:
+        with entry["lock"]:
+            entry["running"] = False
+
+
+@app.post("/api/leads/{lead_id}/build-demo/{build_id}/retry-deploy", response_model=DemoBuildStatusResponse)
+def build_demo_retry_deploy(lead_id: str, build_id: str):
+    """Retry the deploy phase (GitHub push -> Vercel -> Render) for a build
+    that already succeeded in the sandbox but failed to deploy.
+
+    Does not re-run the sandbox build itself — only export/GitHub/Vercel/
+    Render. Use POST .../build-demo (a fresh build) instead if the sandbox
+    build itself failed (stage == "failed"); this endpoint 409s in that case.
+    """
+    entry = _get_build_entry(build_id)
+    if not entry or entry["lead_id"] != lead_id:
+        raise HTTPException(status_code=404, detail=f"Build {build_id} not found for lead {lead_id}")
+
+    state = entry["state"]
+    with entry["lock"]:
+        already_running = entry["running"]
+    if already_running:
+        raise HTTPException(status_code=409, detail="Build is already in progress")
+    if state.stage != "success":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot retry deploy — sandbox build is in stage '{state.stage}', not 'success'. Start a new build instead.",
+        )
+
+    with entry["lock"]:
+        entry["running"] = True
+
+    threading.Thread(target=_retry_deploy_bg, args=(build_id,), daemon=True).start()
+
+    return DemoBuildStatusResponse(
+        build_id=state.build_id,
+        lead_id=lead_id,
+        running=True,
+        stage=state.stage,
+        attempt=state.attempt,
+        max_attempts=state.max_attempts,
+        deploy_stage=state.deploy_stage,
+    )
+
+
+@app.get("/api/leads/{lead_id}/build-demo/{build_id}", response_model=DemoBuildStatusResponse)
+def get_build_demo(lead_id: str, build_id: str):
+    """Fetch a build's full current status by ID, independent of any
+    research call. This is what the Builds page uses when you click into a
+    build — it needs the deploy result (repo_url, frontend_url, etc.), not
+    a freshly-generated (and likely DIFFERENT) demo_project idea from
+    re-running research_company() against the lead.
+
+    Functionally identical to the .../status endpoint (kept separate mainly
+    for a clearer URL when the caller isn't actively polling, just looking
+    up a specific build once).
+    """
+    return build_demo_status(lead_id, build_id)
+
+
 @app.get("/api/builds", response_model=list[DemoBuildSummary])
 def list_builds():
     """List all demo builds from this server session, most recent first.

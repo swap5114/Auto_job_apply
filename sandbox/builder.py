@@ -22,6 +22,7 @@ Think of it like renting a fresh Linux VM for each build, except it starts in se
 import os
 import sys
 import time
+import shutil
 import tarfile
 import io
 from typing import Optional
@@ -396,24 +397,89 @@ def copy_files_from_container(
     # <dest_path>/workspace/<files>, not <dest_path>/<files> directly). If
     # that's what happened, flatten it so callers get exactly what they asked
     # for. Copying a single *file* doesn't have this wrapper, so leave that
-    # case alone.
+    # case alone. Extracted into its own function — see flatten_wrapped_export
+    # — so orchestrator.py can also call it directly to recover an export
+    # that got stranded mid-flatten by an older version of this code.
     basename = os.path.basename(src_path.rstrip("/"))
-    wrapped_dir = os.path.join(dest_path, basename)
-    if os.path.isdir(wrapped_dir):
-        for item in os.listdir(wrapped_dir):
-            src_item = os.path.join(wrapped_dir, item)
-            dst_item = os.path.join(dest_path, item)
-            if os.path.exists(dst_item):
-                if os.path.isdir(dst_item):
-                    import shutil
-                    shutil.rmtree(dst_item)
-                else:
-                    os.remove(dst_item)
-            os.rename(src_item, dst_item)
-        os.rmdir(wrapped_dir)
+    flatten_wrapped_export(dest_path, basename)
 
     print(f"  ✅ Files copied to: {dest_path}")
     return dest_path
+
+
+def flatten_wrapped_export(dest_path: str, wrapper_name: str) -> bool:
+    """Move everything out of dest_path/wrapper_name/ up into dest_path/
+    itself, then remove the now-empty wrapper directory.
+
+    Deliberately resilient to individual-item failures (one os.rename()
+    raising, then aborting the whole loop) rather than letting a single bad
+    item lose the entire export. Root cause seen in practice: this project
+    lives inside a OneDrive-synced folder, and OneDrive's real-time sync can
+    transiently lock a file the instant it's written by tarfile.extractall(),
+    right before the rename tries to move it — a race, not a permanent
+    problem. Before this fix, that one transient failure aborted the flatten
+    loop entirely, leaving hundreds of already-extracted real files stranded
+    under dest_path/<wrapper_name>/ instead of at dest_path/ directly — with
+    the caller (orchestrator.finalize_success) left believing nothing had
+    been exported at all, even though the files were sitting right there.
+
+    Returns True if wrapper_name existed and flattening was attempted (even
+    if some items had to be left behind), False if there was no wrapper
+    directory to flatten in the first place.
+    """
+    wrapped_dir = os.path.join(dest_path, wrapper_name)
+    if not os.path.isdir(wrapped_dir):
+        return False
+
+    failed_items = []
+    for item in os.listdir(wrapped_dir):
+        src_item = os.path.join(wrapped_dir, item)
+        dst_item = os.path.join(dest_path, item)
+        try:
+            if os.path.exists(dst_item):
+                if os.path.isdir(dst_item):
+                    shutil.rmtree(dst_item)
+                else:
+                    os.remove(dst_item)
+            _move_with_retry(src_item, dst_item)
+        except OSError as e:
+            # Don't let one locked/transiently-busy item lose the rest of
+            # the export. Leave it under wrapped_dir and note it — the
+            # caller still gets a usable dest_path with everything else
+            # correctly flattened.
+            print(f"  ⚠️  Could not move '{item}' out of {wrapper_name}/ ({e}); leaving it in place.")
+            failed_items.append(item)
+
+    # Only remove the wrapper dir if everything moved out of it — if some
+    # items are still inside, keep it so those files aren't lost.
+    if not failed_items:
+        os.rmdir(wrapped_dir)
+    else:
+        print(f"  ⚠️  {wrapper_name}/ left in place at {wrapped_dir} — {len(failed_items)} item(s) retained: {failed_items}")
+
+    return True
+
+
+def _move_with_retry(src: str, dst: str, attempts: int = 5, delay: float = 0.3) -> None:
+    """os.rename() with a few retries on a locked/busy file.
+
+    Specifically targets the OneDrive-sync race described above: a fresh
+    file can be transiently locked for sync scanning for a fraction of a
+    second right after being written. A short retry loop is enough to ride
+    that out without giving up on real, permanent failures (permissions,
+    disk full, etc. still raise after exhausting attempts).
+    """
+    last_error: Optional[OSError] = None
+    for attempt in range(attempts):
+        try:
+            os.rename(src, dst)
+            return
+        except OSError as e:
+            last_error = e
+            if attempt < attempts - 1:
+                time.sleep(delay)
+    if last_error:
+        raise last_error
 
 def cleanup_all_sandbox_containers() -> int:
     """Remove ALL sandbox containers (running or stopped).
