@@ -128,6 +128,71 @@ export interface RunPipelineOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Demo builder (sandbox/orchestrator.py via api/main.py build-demo routes)
+// ---------------------------------------------------------------------------
+
+export type DemoBuildStage =
+  | "pending"
+  | "building"
+  | "needs_secrets"
+  | "success"
+  | "failed";
+
+export interface NeededSecret {
+  name: string;
+  why: string;
+}
+
+export interface DemoBuildResult {
+  status: "success" | "failed";
+  summary: string;
+  build_command?: string;
+  start_command?: string;
+  entry_point?: string;
+}
+
+export type DemoDeployStage =
+  | "exporting"
+  | "pushing_github"
+  | "deploying_vercel"
+  | "deploying_render"
+  | "deployed"
+  | "deploy_failed";
+
+export interface DemoBuildStatus {
+  build_id: string;
+  lead_id: string;
+  running: boolean;
+  stage: DemoBuildStage;
+  attempt: number;
+  max_attempts: number;
+  needs_secrets: { needed: NeededSecret[] } | null;
+  result: DemoBuildResult | null;
+  error: string | null;
+  logs_tail: string;
+  deploy_stage: DemoDeployStage | null;
+  deploy_error: string | null;
+  repo_url: string | null;
+  frontend_url: string | null;
+  backend_url: string | null;
+}
+
+export interface DemoBuildSummary {
+  build_id: string;
+  lead_id: string;
+  company: string;
+  demo_title: string;
+  running: boolean;
+  stage: DemoBuildStage;
+  deploy_stage: DemoDeployStage | null;
+  attempt: number;
+  max_attempts: number;
+  started_at: string;
+  frontend_url: string | null;
+  backend_url: string | null;
+}
+
+// ---------------------------------------------------------------------------
 // Leads
 // ---------------------------------------------------------------------------
 
@@ -152,6 +217,30 @@ export const api = {
 
     research: (id: string) =>
       request<CompanyResearch>(`/leads/${id}/research`, { method: "POST" }),
+
+    buildDemo: (id: string, demo_project: DemoProject, max_attempts?: number) =>
+      request<DemoBuildStatus>(`/leads/${id}/build-demo`, {
+        method: "POST",
+        body: JSON.stringify({ demo_project, max_attempts }),
+      }),
+
+    buildDemoStatus: (id: string, buildId: string) =>
+      request<DemoBuildStatus>(`/leads/${id}/build-demo/${buildId}/status`),
+
+    provideBuildSecrets: (id: string, buildId: string, secrets: Record<string, string>) =>
+      request<DemoBuildStatus>(`/leads/${id}/build-demo/${buildId}/secrets`, {
+        method: "POST",
+        body: JSON.stringify({ secrets }),
+      }),
+
+    cancelBuild: (id: string, buildId: string) =>
+      request<{ status: string; build_id: string }>(`/leads/${id}/build-demo/${buildId}/cancel`, {
+        method: "POST",
+      }),
+  },
+
+  builds: {
+    list: () => request<DemoBuildSummary[]>("/builds"),
   },
 
   stats: {

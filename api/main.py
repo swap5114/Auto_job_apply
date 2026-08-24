@@ -1,16 +1,32 @@
 """FastAPI backend — bridges the frontend dashboard to the existing Python pipeline.
 
 Run with:
-    uvicorn api.main:app --reload --port 8000
+    uvicorn api.main:app --reload --port 8000 --reload-dir api --reload-dir graph --reload-dir orchestrator --reload-dir skills --reload-dir storage --reload-dir sandbox
 
 Or from project root:
-    python -m uvicorn api.main:app --reload --port 8000
+    python -m uvicorn api.main:app --reload --port 8000 --reload-dir api --reload-dir graph --reload-dir orchestrator --reload-dir skills --reload-dir storage --reload-dir sandbox
+
+IMPORTANT: don't run plain `--reload` with no --reload-dir. With no explicit
+dirs, uvicorn/watchfiles watches the *entire* project root recursively. Its
+default ignore list only skips dot-prefixed dirs like .venv/.git — it does
+NOT skip this project's `venv/`, `sandbox_output/`, or `resumes/` folders.
+sandbox/orchestrator.py's export_build_output() dumps hundreds of files into
+sandbox_output/<container_id>/ when a demo build finishes, which watchfiles
+sees as a mass file-change and triggers a full server restart — wiping the
+in-memory `_demo_builds` registry mid-poll. That's what causes "build
+succeeded in the UI, then a 404 Build not found" a few seconds later.
+
+Note: sandbox/ itself is in the reload-dir list above (it has real source
+files worth reloading on), but this still watches sandbox/ recursively,
+which technically includes nothing build-related since builds write to
+sandbox_output/ (a sibling dir, not under sandbox/) -- so that's fine.
 """
 
 import os
 import sys
 import json
 import time
+import uuid
 import threading
 from datetime import datetime, timezone
 from typing import Optional
@@ -159,6 +175,65 @@ class PipelineConfigUpdateRequest(BaseModel):
     followup_days: Optional[int] = None
     max_followups: Optional[int] = None
     gmail_direct_send: Optional[bool] = None
+
+
+class DemoProjectBuildRequest(BaseModel):
+    """The demo_project spec the frontend already has in memory from a prior
+    /research call — the client sends it back so we don't need to persist
+    research results server-side just to start a build from them.
+    """
+    title: str
+    description: str = ""
+    tech_stack: list[str] = []
+    deliverable: str = ""
+    time_estimate: str = "2-3 days"
+    why_impressive: str = ""
+
+
+class BuildDemoRequest(BaseModel):
+    demo_project: DemoProjectBuildRequest
+    max_attempts: Optional[int] = None
+
+
+class ProvideSecretsRequest(BaseModel):
+    secrets: dict[str, str]
+
+
+class DemoBuildStatusResponse(BaseModel):
+    build_id: str
+    lead_id: str
+    running: bool
+    stage: str
+    attempt: int
+    max_attempts: int
+    needs_secrets: Optional[dict] = None
+    result: Optional[dict] = None
+    error: Optional[str] = None
+    logs_tail: str = ""
+    # Task 8: deploy phase, only meaningful once stage == "success"
+    deploy_stage: Optional[str] = None
+    deploy_error: Optional[str] = None
+    repo_url: Optional[str] = None
+    frontend_url: Optional[str] = None
+    backend_url: Optional[str] = None
+
+
+class DemoBuildSummary(BaseModel):
+    """Lightweight summary for the Builds list page — omits the full log
+    transcript so listing many builds stays cheap.
+    """
+    build_id: str
+    lead_id: str
+    company: str
+    demo_title: str
+    running: bool
+    stage: str
+    deploy_stage: Optional[str] = None
+    attempt: int
+    max_attempts: int
+    started_at: str
+    frontend_url: Optional[str] = None
+    backend_url: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +479,289 @@ def research_lead(lead_id: str):
             status_code=500,
             detail=f"Research generation failed: {str(e)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Routes: Demo Builder (sandbox/orchestrator.py)
+# ---------------------------------------------------------------------------
+# Follows the same shape as the _pipeline_run_state pattern above (shared
+# dict + lock + background daemon thread + polling endpoint), but keyed by
+# build_id since multiple demo builds can run concurrently for different
+# leads, unlike the single global pipeline run.
+
+# build_id -> {"state": BuildState, "lead_id": str, "lock": threading.Lock()}
+# Each build gets its own lock so polling one build's status never blocks on
+# another build's in-progress work.
+_demo_builds: dict[str, dict] = {}
+_demo_builds_registry_lock = threading.Lock()  # protects the _demo_builds dict itself
+
+
+def _register_build(
+    build_id: str, lead_id: str, state, company: str = "", demo_title: str = "",
+    demo_project: Optional[dict] = None,
+) -> None:
+    with _demo_builds_registry_lock:
+        _demo_builds[build_id] = {
+            "state": state,
+            "lead_id": lead_id,
+            "lock": threading.Lock(),
+            "running": True,
+            "company": company,
+            "demo_title": demo_title,
+            # Kept around so the resume-after-secrets path (which runs much
+            # later, in a separate request) can chain into deploy_build()
+            # with the same spec the build was originally started with.
+            "demo_project": demo_project or {},
+            "started_at": _now_iso(),
+        }
+
+
+def _get_build_entry(build_id: str) -> Optional[dict]:
+    with _demo_builds_registry_lock:
+        return _demo_builds.get(build_id)
+
+
+def _finish_build_and_deploy(entry: dict, demo_project: dict, company: str) -> None:
+    """Shared tail end for both _run_build_bg and _resume_build_bg.
+
+    IMPORTANT ORDERING (this is the bug fix from Task 8 planning): the
+    project must be exported from the container BEFORE the container is
+    stopped. The previous version called stop_build() immediately on
+    success, which destroys the container — by the time a deploy step tried
+    to read files from it, there would be nothing left to export. The fix:
+    finalize_success() (export) always runs first, stop_build() second,
+    and only then does deploy_build() push to GitHub/Vercel/Render — none
+    of which need the container anymore since they work off the exported
+    directory on the host filesystem.
+
+    A build that ends in needs_secrets deliberately leaves its container
+    running (see orchestrator.start_build's docstring) — this function
+    no-ops for that case, since there's nothing to finalize or deploy yet.
+    """
+    from sandbox import orchestrator
+
+    state = entry["state"]
+
+    if state.stage == "success":
+        orchestrator.finalize_success(state)  # export BEFORE teardown
+
+    if state.stage in ("success", "failed"):
+        orchestrator.stop_build(state)  # container no longer needed either way
+
+    if state.stage == "success" and state.project_dir:
+        orchestrator.deploy_build(state, demo_project, company)
+
+
+def _run_build_bg(build_id: str, demo_project: dict, company: str, max_attempts: int):
+    """Background worker: runs the (blocking) build loop, then marks it done.
+
+    Any exception here is caught and stored on the state object rather than
+    left to crash a daemon thread silently — otherwise a bug would leave the
+    build stuck at "running": True forever from the API's point of view.
+    """
+    from sandbox import orchestrator
+
+    entry = _get_build_entry(build_id)
+    state = entry["state"]
+    try:
+        orchestrator.start_build(
+            demo_project=demo_project,
+            company=company,
+            max_attempts=max_attempts,
+            state=state,  # mutate the SAME object callers are already polling
+        )
+        _finish_build_and_deploy(entry, demo_project, company)
+    except Exception as e:
+        state.stage = "failed"
+        state.error = f"Unexpected orchestrator error: {e}"
+    finally:
+        with entry["lock"]:
+            entry["running"] = False
+
+
+def _resume_build_bg(build_id: str, secrets: dict, demo_project: dict, company: str):
+    """Background worker for resuming a paused (needs_secrets) build."""
+    from sandbox import orchestrator
+
+    entry = _get_build_entry(build_id)
+    state = entry["state"]
+    with entry["lock"]:
+        entry["running"] = True
+    try:
+        orchestrator.provide_secrets_and_resume(state, secrets)
+        _finish_build_and_deploy(entry, demo_project, company)
+    except Exception as e:
+        state.stage = "failed"
+        state.error = f"Unexpected orchestrator error during resume: {e}"
+    finally:
+        with entry["lock"]:
+            entry["running"] = False
+
+
+@app.post("/api/leads/{lead_id}/build-demo", response_model=DemoBuildStatusResponse)
+def build_demo(lead_id: str, body: BuildDemoRequest):
+    """Start building a demo project in a sandbox container (non-blocking).
+
+    Returns immediately with build_id="..." and stage="pending"; poll
+    GET /api/leads/{lead_id}/build-demo/{build_id}/status for progress.
+    """
+    from sandbox.orchestrator import BuildState
+    from sandbox.config import DEFAULT_MAX_ATTEMPTS
+
+    leads = _get_all_leads_cached()
+    lead = next((l for l in leads if str(l.get("id", "")) == lead_id), None)
+    if not lead:
+        raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
+
+    max_attempts = body.max_attempts or DEFAULT_MAX_ATTEMPTS
+    state = BuildState(build_id=str(uuid.uuid4())[:8], max_attempts=max_attempts)
+    company = str(lead.get("company", "")) or str(lead.get("x_handle", ""))
+    demo_project_dict = body.demo_project.model_dump()
+    _register_build(
+        state.build_id, lead_id, state,
+        company=company, demo_title=body.demo_project.title, demo_project=demo_project_dict,
+    )
+    threading.Thread(
+        target=_run_build_bg,
+        args=(state.build_id, demo_project_dict, company, max_attempts),
+        daemon=True,
+    ).start()
+
+    return DemoBuildStatusResponse(
+        build_id=state.build_id,
+        lead_id=lead_id,
+        running=True,
+        stage=state.stage,
+        attempt=state.attempt,
+        max_attempts=state.max_attempts,
+    )
+
+
+@app.get("/api/leads/{lead_id}/build-demo/{build_id}/status", response_model=DemoBuildStatusResponse)
+def build_demo_status(lead_id: str, build_id: str):
+    """Poll the live status of a demo build."""
+    entry = _get_build_entry(build_id)
+    if not entry or entry["lead_id"] != lead_id:
+        raise HTTPException(status_code=404, detail=f"Build {build_id} not found for lead {lead_id}")
+
+    state = entry["state"]
+    with entry["lock"]:
+        running = entry["running"]
+
+    # The transcript can carry several KB of stdout per attempt — expose only
+    # a short tail from the most recent attempt for the "live logs" view,
+    # rather than shipping the whole transcript on every poll.
+    logs_tail = ""
+    if state.transcript:
+        last = state.transcript[-1]
+        logs_tail = (last.get("stdout", "") or "")[-1500:]
+
+    return DemoBuildStatusResponse(
+        build_id=state.build_id,
+        lead_id=lead_id,
+        running=running,
+        stage=state.stage,
+        attempt=state.attempt,
+        max_attempts=state.max_attempts,
+        needs_secrets=state.needs_secrets,
+        result=state.result,
+        error=state.error,
+        logs_tail=logs_tail,
+        deploy_stage=state.deploy_stage,
+        deploy_error=state.deploy_error,
+        repo_url=state.repo_url,
+        frontend_url=state.frontend_url,
+        backend_url=state.backend_url,
+    )
+
+
+@app.post("/api/leads/{lead_id}/build-demo/{build_id}/secrets", response_model=DemoBuildStatusResponse)
+def build_demo_provide_secrets(lead_id: str, build_id: str, body: ProvideSecretsRequest):
+    """Provide requested secrets and resume a paused build (non-blocking)."""
+    entry = _get_build_entry(build_id)
+    if not entry or entry["lead_id"] != lead_id:
+        raise HTTPException(status_code=404, detail=f"Build {build_id} not found for lead {lead_id}")
+
+    state = entry["state"]
+    with entry["lock"]:
+        already_running = entry["running"]
+    if already_running:
+        raise HTTPException(status_code=409, detail="Build is already in progress")
+    if state.stage != "needs_secrets":
+        raise HTTPException(status_code=409, detail=f"Build is in stage '{state.stage}', not waiting on secrets")
+
+    with entry["lock"]:
+        entry["running"] = True
+
+    threading.Thread(
+        target=_resume_build_bg,
+        args=(build_id, body.secrets, entry.get("demo_project", {}), entry.get("company", "")),
+        daemon=True,
+    ).start()
+
+    return DemoBuildStatusResponse(
+        build_id=state.build_id,
+        lead_id=lead_id,
+        running=True,
+        stage=state.stage,
+        attempt=state.attempt,
+        max_attempts=state.max_attempts,
+        needs_secrets=state.needs_secrets,
+    )
+
+
+@app.post("/api/leads/{lead_id}/build-demo/{build_id}/cancel")
+def build_demo_cancel(lead_id: str, build_id: str):
+    """Stop a build and destroy its sandbox container."""
+    from sandbox import orchestrator
+
+    entry = _get_build_entry(build_id)
+    if not entry or entry["lead_id"] != lead_id:
+        raise HTTPException(status_code=404, detail=f"Build {build_id} not found for lead {lead_id}")
+
+    state = entry["state"]
+    orchestrator.stop_build(state)
+    state.stage = "failed"
+    state.result = state.result or {"status": "failed", "summary": "Cancelled by user."}
+
+    with _demo_builds_registry_lock:
+        _demo_builds.pop(build_id, None)
+
+    return {"status": "cancelled", "build_id": build_id}
+
+
+@app.get("/api/builds", response_model=list[DemoBuildSummary])
+def list_builds():
+    """List all demo builds from this server session, most recent first.
+
+    Builds live only in memory (see _demo_builds above) — this list resets
+    if the API process restarts, same as the pipeline run-state does.
+    """
+    with _demo_builds_registry_lock:
+        entries = list(_demo_builds.items())
+
+    summaries = []
+    for build_id, entry in entries:
+        state = entry["state"]
+        with entry["lock"]:
+            running = entry["running"]
+        summaries.append(DemoBuildSummary(
+            build_id=build_id,
+            lead_id=entry["lead_id"],
+            company=entry.get("company", ""),
+            demo_title=entry.get("demo_title", ""),
+            running=running,
+            stage=state.stage,
+            deploy_stage=state.deploy_stage,
+            attempt=state.attempt,
+            max_attempts=state.max_attempts,
+            started_at=entry.get("started_at", ""),
+            frontend_url=state.frontend_url,
+            backend_url=state.backend_url,
+        ))
+
+    summaries.sort(key=lambda s: s.started_at, reverse=True)
+    return summaries
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { FileText, ChevronRight, Sparkles, Loader2, RefreshCw, Search } from "lucide-react";
 import { toast } from "sonner";
@@ -53,6 +54,17 @@ const filters = [
 ];
 
 export default function LeadsPage() {
+  return (
+    <Suspense>
+      <LeadsPageInner />
+    </Suspense>
+  );
+}
+
+function LeadsPageInner() {
+  const searchParams = useSearchParams();
+  const deepLinkLeadId = searchParams.get("lead");
+
   const [leads, setLeads] = useState<Lead[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -78,6 +90,15 @@ export default function LeadsPage() {
   useEffect(() => {
     load();
   }, []);
+
+  // Deep-link from the Builds page (?lead=<id>) — open that lead's detail
+  // sheet (on the Research tab) once its data has loaded.
+  useEffect(() => {
+    if (!deepLinkLeadId || leads.length === 0) return;
+    const match = leads.find((l) => l.id === deepLinkLeadId);
+    if (match) openLead(match);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepLinkLeadId, leads]);
 
   const filteredLeads = useMemo(() => {
     if (filter === "all") return leads;
@@ -269,7 +290,7 @@ export default function LeadsPage() {
                 </SheetDescription>
               </SheetHeader>
 
-              <Tabs defaultValue="overview" className="mt-6">
+              <Tabs defaultValue={selectedLead.id === deepLinkLeadId ? "research" : "overview"} className="mt-6">
                 <TabsList className="w-full">
                   <TabsTrigger value="overview" className="flex-1">Overview</TabsTrigger>
                   <TabsTrigger value="jd" className="flex-1">Job</TabsTrigger>

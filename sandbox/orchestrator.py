@@ -63,6 +63,16 @@ class BuildState:
 
     This is the object the API layer (Task 3) will poll/store — it's a plain
     dataclass so it's trivial to serialize to JSON for a status endpoint.
+
+    Two phases are tracked separately:
+      - `stage` covers the sandbox build itself: pending | building |
+        needs_secrets | success | failed. This is unchanged from Task 2/3.
+      - `deploy_stage` (Task 8) covers what happens AFTER `stage == success`:
+        exporting files, pushing to GitHub, deploying to Vercel/Render. Kept
+        separate rather than overloading `stage`, since "the sandbox build
+        succeeded" and "the deploy pipeline is still running" are genuinely
+        different facts — a client should be able to tell them apart instead
+        of just seeing "success" and wondering why there's no live URL yet.
     """
     build_id: str
     container_id: Optional[str] = None
@@ -74,6 +84,14 @@ class BuildState:
     error: Optional[str] = None             # set on unexpected/infra errors (not build failures)
     transcript: list = field(default_factory=list)  # list of {attempt, stdout, stderr, exit_code}
 
+    # --- Task 8: deploy phase (only meaningful once stage == "success") ---
+    project_dir: Optional[str] = None       # exported project files on the host, set before container teardown
+    deploy_stage: Optional[str] = None      # None | exporting | pushing_github | deploying_vercel | deploying_render | deployed | deploy_failed
+    deploy_error: Optional[str] = None
+    repo_url: Optional[str] = None
+    frontend_url: Optional[str] = None
+    backend_url: Optional[str] = None
+
     def to_dict(self) -> dict:
         return {
             "build_id": self.build_id,
@@ -84,6 +102,12 @@ class BuildState:
             "needs_secrets": self.needs_secrets,
             "result": self.result,
             "error": self.error,
+            "project_dir": self.project_dir,
+            "deploy_stage": self.deploy_stage,
+            "deploy_error": self.deploy_error,
+            "repo_url": self.repo_url,
+            "frontend_url": self.frontend_url,
+            "backend_url": self.backend_url,
             # Transcript can get long — callers that just want status usually
             # don't need every stdout blob, so it's included but trimmable.
             "transcript": self.transcript,
@@ -206,9 +230,20 @@ def start_build(
     company: str = "",
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     kiro_api_key: Optional[str] = None,
+    state: Optional[BuildState] = None,
 ) -> BuildState:
     """Start a new build and drive it forward until it succeeds, fails,
     needs secrets, or runs out of attempts.
+
+    Args:
+        state: An existing BuildState to populate and mutate in place, rather
+            than creating a fresh one internally. This matters for callers
+            (like an API layer) that need to register the state object
+            *before* calling this — since it's a blocking, potentially
+            multi-minute call — so that other threads polling that same
+            object see live progress instead of a static placeholder that
+            only gets swapped out once this function finally returns.
+            If omitted, a new BuildState is created (used by the CLI tests).
 
     IMPORTANT: if the build pauses on `needs_secrets`, the container is left
     RUNNING (not stopped) so `provide_secrets_and_resume()` can continue the
@@ -216,7 +251,8 @@ def start_build(
     `stop_build(state)` once it's truly done with the container (success,
     failed, or abandoned).
     """
-    state = BuildState(build_id=str(uuid.uuid4())[:8], max_attempts=max_attempts)
+    if state is None:
+        state = BuildState(build_id=str(uuid.uuid4())[:8], max_attempts=max_attempts)
 
     try:
         state.container_id = builder.start_container(kiro_api_key=kiro_api_key)
@@ -339,6 +375,183 @@ def export_build_output(state: BuildState, dest_path: Optional[str] = None) -> O
     if not state.container_id:
         return None
     return builder.copy_files_from_container(state.container_id, dest_path=dest_path)
+
+
+# ---------------------------------------------------------------------------
+# Deploy phase (Task 8) — export -> GitHub -> Vercel (+ Render if full-stack)
+# ---------------------------------------------------------------------------
+
+# tech_stack keywords that indicate a demo needs its own backend process
+# (as opposed to a purely static site Vercel alone can serve). Checked
+# case-insensitively against the demo_project's tech_stack list. This is
+# ONLY consulted when Kiro's own build_status.json is unavailable (result
+# is None) — see the docstring below for why it must not be trusted over
+# the actual build output.
+_BACKEND_TECH_KEYWORDS = (
+    "fastapi", "flask", "django", "express", "node.js", "nodejs", "backend",
+    "api server", "rest api", "websocket", "socket.io", "graphql server",
+)
+
+# Frameworks Vercel deploys natively, including their server-side pieces
+# (API routes, server actions, edge/serverless functions). A demo built
+# with one of these needs ONLY a Vercel deploy — routing it to Render as
+# well would either fail outright (Render's generic Node/Python runtime
+# doesn't know how to run a Next.js app) or just be redundant.
+_VERCEL_NATIVE_FRAMEWORKS = ("next.js", "next", "nuxt", "sveltekit", "remix", "astro")
+
+
+def _uses_vercel_native_framework(project_dir: Optional[str]) -> bool:
+    """Check package.json dependencies directly for a framework Vercel runs
+    natively (including its server-side pieces — API routes, server
+    actions, edge functions). This is the ground-truth check: unlike
+    parsing Kiro's prose summary for a framework name, a package.json
+    dependency either is or isn't there.
+    """
+    if not project_dir:
+        return False
+    package_json_path = os.path.join(project_dir, "package.json")
+    if not os.path.isfile(package_json_path):
+        return False
+    try:
+        with open(package_json_path, "r", encoding="utf-8") as f:
+            pkg = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return False
+    deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+    return any(fw in deps for fw in ("next", "nuxt", "@sveltejs/kit", "@remix-run/react", "astro"))
+
+
+def needs_backend_deploy(demo_project: dict, result: Optional[dict], project_dir: Optional[str] = None) -> bool:
+    """Decide whether a demo needs a separate backend deploy (Render) on top
+    of the frontend deploy (Vercel).
+
+    Checked in order of trust:
+      1. package.json dependencies (via _uses_vercel_native_framework) — if
+         the project actually depends on Next.js/Nuxt/SvelteKit/etc., this
+         is "no" unconditionally. Vercel serves that framework's own
+         API routes/server functions itself; routing it to Render as well
+         would fail, since Render's generic Node/Python runtime doesn't
+         know how to run e.g. a Next.js app the way `next start` expects.
+         This is a ground-truth check against real project files, not a
+         guess from prose.
+      2. Kiro's own build_status.json (`build_command`/`start_command`) —
+         reflects what was ACTUALLY built and verified, which can differ
+         from the original demo_project spec. research_company.py's
+         suggested tech_stack is aspirational (an LLM's upfront guess at
+         what a good demo would use); Kiro frequently simplifies during
+         the actual build — e.g. dropping a suggested WebSocket/Pinecone
+         architecture in favor of a simpler self-contained Next.js app.
+         Trusting the spec over the real build was the root cause of a
+         real failure: a demo whose spec mentioned "WebSockets" but was
+         actually built as a plain Next.js app got incorrectly routed to
+         Render, which then failed since there was no separate backend
+         process to deploy there.
+      3. The demo_project's tech_stack list — ONLY as a last-resort
+         fallback when result is missing entirely (e.g. an infra error
+         before Kiro could report a verified status) AND no project_dir
+         is available to check directly.
+    """
+    if _uses_vercel_native_framework(project_dir):
+        return False
+
+    if result is not None:
+        # We have real build output — trust it over the pre-build spec.
+        build_command = result.get("build_command", "") or ""
+        start_command = result.get("start_command", "") or ""
+        commands_lower = f"{build_command} {start_command}".lower()
+        server_indicators = ("uvicorn", "flask run", "node ", "npm start", "npm run start", "gunicorn", "django")
+        return any(ind in commands_lower for ind in server_indicators)
+
+    # No build_status.json at all — fall back to the aspirational spec,
+    # since it's the only signal available.
+    tech_stack = " ".join(demo_project.get("tech_stack", [])).lower()
+    return any(kw in tech_stack for kw in _BACKEND_TECH_KEYWORDS)
+
+
+def finalize_success(state: BuildState) -> None:
+    """Export the built project's files BEFORE tearing down the container.
+
+    This must run while stage == "success" and BEFORE stop_build() — once
+    the container is destroyed, export_build_output() has nothing to copy
+    from. Sets state.project_dir on success; leaves it None (with
+    state.deploy_error set) if the export itself fails, so a build can
+    still be reported as a successful *sandbox verification* even if the
+    deploy phase never gets to run.
+    """
+    if state.stage != "success":
+        return
+    try:
+        state.deploy_stage = "exporting"
+        state.project_dir = export_build_output(state)
+    except Exception as e:
+        state.deploy_stage = "deploy_failed"
+        state.deploy_error = f"Failed to export build output: {e}"
+
+
+def deploy_build(state: BuildState, demo_project: dict, company: str = "") -> None:
+    """Push the exported project to GitHub, then deploy it (Vercel for the
+    frontend, and Render too if needs_backend_deploy() says this demo needs
+    a persistent backend process).
+
+    Mutates `state` in place — same live-object pattern as _advance() uses
+    for the build phase, so a caller polling `state` sees deploy progress
+    as it happens rather than only a final snapshot.
+
+    Requires state.project_dir to already be set (call finalize_success()
+    first). No-ops with deploy_stage="deploy_failed" if it isn't.
+    """
+    if not state.project_dir:
+        state.deploy_stage = "deploy_failed"
+        state.deploy_error = state.deploy_error or "No exported project directory to deploy from."
+        return
+
+    from sandbox import github_deploy, vercel_deploy, render_deploy
+
+    try:
+        state.deploy_stage = "pushing_github"
+        repo_result = github_deploy.deploy_to_github(
+            state.project_dir, demo_project, company=company, build_id=state.build_id,
+        )
+        state.repo_url = repo_result.repo_url
+    except Exception as e:
+        state.deploy_stage = "deploy_failed"
+        state.deploy_error = f"GitHub push failed: {e}"
+        return
+
+    try:
+        state.deploy_stage = "deploying_vercel"
+        vercel_result = vercel_deploy.deploy_to_vercel(owner=repo_result.owner, repo=repo_result.repo_name)
+        if vercel_result.ready_state != "READY":
+            state.deploy_stage = "deploy_failed"
+            state.deploy_error = f"Vercel deploy did not succeed: {vercel_result.error}"
+            return
+        state.frontend_url = vercel_result.url
+    except Exception as e:
+        state.deploy_stage = "deploy_failed"
+        state.deploy_error = f"Vercel deploy failed: {e}"
+        return
+
+    if needs_backend_deploy(demo_project, state.result, project_dir=state.project_dir):
+        try:
+            state.deploy_stage = "deploying_render"
+            render_result = render_deploy.deploy_to_render(
+                repo_url=repo_result.repo_url,
+                service_name=repo_result.repo_name,
+                tech_stack=demo_project.get("tech_stack", []),
+                build_command=(state.result or {}).get("build_command"),
+                start_command=(state.result or {}).get("start_command"),
+            )
+            if render_result.status != "live":
+                state.deploy_stage = "deploy_failed"
+                state.deploy_error = f"Render deploy did not succeed: {render_result.error}"
+                return
+            state.backend_url = render_result.url
+        except Exception as e:
+            state.deploy_stage = "deploy_failed"
+            state.deploy_error = f"Render deploy failed: {e}"
+            return
+
+    state.deploy_stage = "deployed"
 
 
 # ---------------------------------------------------------------------------

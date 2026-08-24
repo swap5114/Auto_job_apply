@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button";
 import { staggerContainer, fadeInUp } from "@/lib/motion";
 import { api, type CompanyResearch } from "@/lib/api";
 import { toast } from "sonner";
+import { DemoBuilder } from "@/components/leads/demo-builder";
 
 /**
  * Generates contextual research from a lead's own data. Used as the demo
@@ -137,21 +138,36 @@ export function ResearchPanel({
     }
   }
 
+  // Rendered unconditionally, ABOVE the idle/loading early returns below.
+  // Why: DemoBuilder checks localStorage on mount to recover a build that
+  // may already be running for this lead (e.g. started on a previous open
+  // of this Sheet). If DemoBuilder only mounted once research reached
+  // "done" — as it did before this fix — reopening a lead whose build was
+  // started earlier would show the idle "Run Research" prompt with no way
+  // to see the still-running build until the user re-ran research (getting
+  // a brand-new, unrelated demo idea back from the LLM in the process).
+  // Rendering it here means recovery happens the moment the Research tab
+  // opens, independent of whether research has been (re-)run in this mount.
+  const demoBuilder = <DemoBuilder leadId={lead.id} demoProject={research?.demo_project} />;
+
   if (state === "idle") {
     return (
-      <div className="flex flex-col items-center justify-center rounded-xl border border-dashed py-12 text-center">
-        <div className="relative mb-4 flex h-12 w-12 items-center justify-center rounded-full accent-gradient">
-          <Sparkles className="h-5 w-5 text-white" />
+      <div className="space-y-4">
+        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed py-12 text-center">
+          <div className="relative mb-4 flex h-12 w-12 items-center justify-center rounded-full accent-gradient">
+            <Sparkles className="h-5 w-5 text-white" />
+          </div>
+          <h4 className="font-display text-lg text-foreground">Research this company</h4>
+          <p className="mt-1 max-w-xs text-sm text-muted-foreground">
+            Generate AI-powered insights, tech-stack signals, and tailored
+            talking points for your outreach.
+          </p>
+          <Button size="sm" className="mt-4" onClick={runResearch}>
+            <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+            Run Research
+          </Button>
         </div>
-        <h4 className="font-display text-lg text-foreground">Research this company</h4>
-        <p className="mt-1 max-w-xs text-sm text-muted-foreground">
-          Generate AI-powered insights, tech-stack signals, and tailored
-          talking points for your outreach.
-        </p>
-        <Button size="sm" className="mt-4" onClick={runResearch}>
-          <Sparkles className="mr-1.5 h-3.5 w-3.5" />
-          Run Research
-        </Button>
+        {demoBuilder}
       </div>
     );
   }
@@ -171,6 +187,7 @@ export function ResearchPanel({
             transition={{ duration: 1.2, repeat: Infinity, delay: i * 0.15 }}
           />
         ))}
+        {demoBuilder}
       </div>
     );
   }
@@ -286,6 +303,8 @@ export function ResearchPanel({
               </p>
             </div>
           </div>
+
+          {demoBuilder}
         </motion.div>
       )}
 

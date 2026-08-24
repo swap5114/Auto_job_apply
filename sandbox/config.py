@@ -82,3 +82,66 @@ DEFAULT_MAX_ATTEMPTS = int(os.getenv("DEMO_MAX_RETRIES", "2"))
 # several minutes (npm installs, etc.) so this is longer than a plain shell
 # command's default COMMAND_TIMEOUT.
 KIRO_TURN_TIMEOUT = int(os.getenv("KIRO_TURN_TIMEOUT", "900"))  # 15 min
+
+# ---------------------------------------------------------------------------
+# GitHub deploy (Task 4)
+# ---------------------------------------------------------------------------
+
+# Prefix for auto-created demo repo names, e.g. "demo-acme-corp-a1b2c3d4".
+# Overridable via DEMO_PROJECT_PREFIX in config/.env (already present there
+# from earlier planning).
+DEMO_REPO_PREFIX = os.getenv("DEMO_PROJECT_PREFIX", "demo-")
+
+# Whether created repos are public or private. Public is simpler for sharing
+# a live Vercel-deployed link in outreach; flip to True if you'd rather keep
+# demo code private and only share the deployed URL.
+DEMO_REPO_PRIVATE = os.getenv("DEMO_REPO_PRIVATE", "false").lower() == "true"
+
+# Internal convention files that must NEVER be pushed to a demo's public
+# GitHub repo — most importantly .secrets.env, which holds real user-provided
+# API keys. These are stripped from the exported project directory before
+# `git init` ever runs, and also gitignored as a second line of defense.
+INTERNAL_FILES_TO_STRIP = [
+    ".secrets.env",
+    BUILD_STATUS_FILENAME,
+    NEEDS_SECRETS_FILENAME,
+    "_prompt.txt",
+]
+
+# Timeout (seconds) for git/gh subprocess calls on the host machine.
+GIT_COMMAND_TIMEOUT = 120
+
+# ---------------------------------------------------------------------------
+# Vercel deploy (Task 5)
+# ---------------------------------------------------------------------------
+
+VERCEL_API_BASE = "https://api.vercel.com"
+
+# How long to poll a deployment for READY/ERROR before giving up.
+VERCEL_DEPLOY_POLL_TIMEOUT = int(os.getenv("VERCEL_DEPLOY_POLL_TIMEOUT", "180"))  # 3 min
+VERCEL_DEPLOY_POLL_INTERVAL = 5  # seconds between status checks
+
+# Timeout for individual Vercel API HTTP calls.
+VERCEL_HTTP_TIMEOUT = 30
+
+# ---------------------------------------------------------------------------
+# Render deploy (Task 6) — backend hosting for full-stack demos
+# ---------------------------------------------------------------------------
+
+RENDER_API_BASE = "https://api.render.com/v1"
+
+# Region for created services. "oregon" is Render's default/cheapest region
+# and was used during verification — kept as the default for consistency.
+RENDER_DEFAULT_REGION = os.getenv("RENDER_REGION", "oregon")
+
+# How long to poll a deploy for live/failed before giving up. Render's free
+# tier build+deploy for a small app took ~45s during verification; allow
+# generous headroom for slower installs (Node with many deps, etc.).
+RENDER_DEPLOY_POLL_TIMEOUT = int(os.getenv("RENDER_DEPLOY_POLL_TIMEOUT", "300"))  # 5 min
+RENDER_DEPLOY_POLL_INTERVAL = 10  # seconds between status checks
+
+RENDER_HTTP_TIMEOUT = 30
+
+# Terminal deploy statuses (from Render's own deploy status enum) that mean
+# "stop polling" — either success or a form of failure/cancellation.
+RENDER_TERMINAL_STATUSES = ("live", "build_failed", "update_failed", "canceled", "deactivated")

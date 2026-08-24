@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import json
+from typing import Optional
 from dotenv import load_dotenv
 from xhtml2pdf import pisa
 import html as html_lib
@@ -335,6 +336,32 @@ def backfill_pdfs():
         print(f"Backfilled PDF: resumes/{base_filename}.pdf")
 
 
+def tailor_resume_for_lead(lead: dict, base_resume: Optional[dict] = None) -> dict:
+    """Tailors and saves a resume for a single lead dict.
+
+    Returns {"resume_version": str|None, "coverage": float|None}. This is the
+    primary entry point used by the pipeline graph; run() is the standalone
+    batch driver that iterates leads from the Sheet and calls this.
+    """
+    company = lead.get("company") or lead.get("x_handle") or "Unknown"
+    role = lead.get("role") or ""
+    jd_text = lead.get("jd_text") or ""
+
+    if not jd_text.strip():
+        print(f"tailor_resume_for_lead: no jd_text for {company} -- skipping.")
+        return {"resume_version": None, "coverage": None}
+
+    if base_resume is None:
+        base_resume = load_base_resume()
+
+    tailored = tailor_resume(base_resume, company, role, jd_text)
+    filename = save_resume(tailored, company)
+    coverage = keyword_coverage(jd_text, tailored)
+    print(f"Tailored resume for {company} -> resumes/{filename}.json / .md "
+          f"(ATS keyword coverage: {coverage}%)")
+    return {"resume_version": filename, "coverage": coverage}
+
+
 def run():
     from skills.llm_client import MODEL_BACKEND, ANTHROPIC_API_KEY
 
@@ -352,25 +379,23 @@ def run():
 
     for lead in targets:
         company = lead.get("company") or lead.get("x_handle") or "Unknown"
-        role = lead.get("role") or ""
-        jd_text = lead.get("jd_text") or ""
 
-        if not jd_text.strip():
+        if not (lead.get("jd_text") or "").strip():
             print(f"Skipping {company} ({lead['id']}) -- no jd_text to tailor against.")
             continue
 
         try:
-            tailored = tailor_resume(base_resume, company, role, jd_text)
+            result = tailor_resume_for_lead(lead, base_resume=base_resume)
         except Exception as e:
             print(f"Failed to tailor resume for {company}: {e}")
             continue
 
-        filename = save_resume(tailored, company)
-        coverage = keyword_coverage(jd_text, tailored)
+        filename = result.get("resume_version")
+        if not filename:
+            continue
+
         update_lead(lead["id"], {"resume_version": filename})
         tailored_count += 1
-        print(f"Tailored resume for {company} -> resumes/{filename}.json / .md "
-              f"(ATS keyword coverage: {coverage}%)")
 
     print(f"\ntailor_resume: {tailored_count} resumes tailored.")
 

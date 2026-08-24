@@ -12,6 +12,7 @@ import {
   Zap,
   Play,
   Loader2,
+  Hammer,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { api, type Stats } from "@/lib/api";
@@ -62,6 +63,7 @@ export function TopBar() {
     { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard, badge: null as number | null },
     { name: "Leads", href: "/leads", icon: FileText, badge: leadsBadge },
     { name: "Review", href: "/review", icon: CheckCircle2, badge: reviewBadge },
+    { name: "Builds", href: "/builds", icon: Hammer, badge: null as number | null },
     { name: "Settings", href: "/settings", icon: Settings, badge: null as number | null },
   ];
 
