@@ -1,0 +1,32 @@
+# Worker service -- FastAPI app serving as the Cloud Tasks push-target,
+# deployed to Cloud Run. Phase 0 placeholder body (see worker/main.py);
+# Phase 4 wires in the real LangGraph task-processing logic.
+#
+# Build from the repo root, same reasoning as docker/Dockerfile.api:
+#   docker build -f docker/Dockerfile.worker -t autoapply-worker .
+
+FROM python:3.13-slim AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENV PORT=8080
+EXPOSE 8080
+
+RUN useradd --create-home --shell /bin/bash appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
+CMD ["sh", "-c", "uvicorn worker.main:app --host 0.0.0.0 --port ${PORT}"]

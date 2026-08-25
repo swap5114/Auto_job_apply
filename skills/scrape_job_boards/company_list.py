@@ -7,7 +7,8 @@ import requests
 from dotenv import load_dotenv
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
-from storage.sheet_client import add_lead
+from db import repository as repo
+from db.current_user import get_current_user_id
 from skills.relevance_filter import matches_criteria
 from skills.find_contact_email import guess_domain_from_company
 
@@ -197,6 +198,7 @@ def run(csv_path: str):
         print("FIRECRAWL_API_KEY not set in config/.env -- skipping company_list scrape.")
         return
 
+    user_id = get_current_user_id()
     companies = read_companies(csv_path)
 
     added = 0
@@ -265,7 +267,7 @@ def run(csv_path: str):
                     filtered_out += 1
                     continue
 
-                if add_lead(lead):
+                if repo.try_add_lead(user_id, lead):
                     added += 1
                     company_added += 1
                 else:

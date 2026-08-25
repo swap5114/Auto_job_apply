@@ -6,7 +6,8 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from storage.sheet_client import get_leads, update_lead
+from db import repository as repo
+from db.current_user import get_current_user_id
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "config", ".env"))
 
@@ -331,7 +332,8 @@ def run():
     if not APOLLO_API_KEY:
         print("APOLLO_API_KEY not set -- running with Hunter only (no fallback).")
 
-    leads = get_leads()
+    user_id = get_current_user_id()
+    leads = repo.get_leads(user_id)
     targets = [lead for lead in leads if not (lead.get("contact_email") or "").strip()]
 
     found = 0
@@ -348,7 +350,7 @@ def run():
             # already have a (e.g. scraper-provided) name.
             if name and not (lead.get("contact_name") or "").strip():
                 fields["contact_name"] = name
-            update_lead(lead["id"], fields)
+            repo.update_lead(user_id, lead["id"], fields)
             found += 1
             label = lead.get("company") or lead.get("x_handle") or lead["id"]
             who = f" ({name})" if name else ""

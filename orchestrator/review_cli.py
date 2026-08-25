@@ -6,12 +6,8 @@ from typing import List, Dict, Any, Optional
 
 from langgraph.types import Command
 from graph.pipeline import build_pipeline_graph, get_checkpointer_connection, DB_PATH
-
-try:
-    from storage.sheet_client import update_lead
-    SHEET_CLIENT_AVAILABLE = True
-except Exception:
-    SHEET_CLIENT_AVAILABLE = False
+from db import repository as repo
+from db.current_user import get_current_user_id
 
 
 def get_all_thread_ids(db_path: str = DB_PATH) -> List[str]:
@@ -101,11 +97,18 @@ def approve_lead(lead_id: str, db_path: str = DB_PATH) -> bool:
     graph.invoke(Command(resume="approved"), config)
     print(f"✅ [APPROVED] Lead '{lead_id}' approved successfully.")
 
-    if SHEET_CLIENT_AVAILABLE:
-        try:
-            update_lead(lead_id, {"status": "approved", "review_decision": "approved"})
-        except Exception as e:
-            print(f"⚠️ Warning: Could not update Google Sheet status for lead '{lead_id}': {e}")
+    # The LangGraph checkpoint (above) is what actually drives the review
+    # flow forward, but the leads table is the system of record for anything
+    # querying/listing leads (the API, the dashboard). Syncing it here keeps
+    # both in agreement. A failure here is loud (printed), not silent --
+    # per the project's "never silently skip" rule -- but doesn't roll back
+    # the already-resumed graph decision, since that resume already happened
+    # and can't be un-done from here.
+    try:
+        user_id = get_current_user_id()
+        repo.update_lead(user_id, lead_id, {"status": "approved", "review_decision": "approved"})
+    except Exception as e:
+        print(f"⚠️ Warning: graph approved '{lead_id}' but failed to sync leads table status: {e}")
 
     return True
 
@@ -146,11 +149,13 @@ def edit_lead(lead_id: str, new_draft: Optional[str] = None, db_path: str = DB_P
     graph.invoke(Command(resume=decision), config)
     print(f"✏️ [EDITED & APPROVED] Lead '{lead_id}' updated with new draft and approved.")
 
-    if SHEET_CLIENT_AVAILABLE:
-        try:
-            update_lead(lead_id, {"status": "approved", "outreach_draft": new_draft, "review_decision": "edited"})
-        except Exception as e:
-            print(f"⚠️ Warning: Could not update Google Sheet status for lead '{lead_id}': {e}")
+    try:
+        user_id = get_current_user_id()
+        repo.update_lead(user_id, lead_id, {
+            "status": "approved", "outreach_draft": new_draft, "review_decision": "edited",
+        })
+    except Exception as e:
+        print(f"⚠️ Warning: graph edited '{lead_id}' but failed to sync leads table status: {e}")
 
     return True
 
@@ -169,11 +174,11 @@ def reject_lead(lead_id: str, db_path: str = DB_PATH) -> bool:
     graph.invoke(Command(resume="rejected"), config)
     print(f"❌ [REJECTED] Lead '{lead_id}' rejected.")
 
-    if SHEET_CLIENT_AVAILABLE:
-        try:
-            update_lead(lead_id, {"status": "rejected", "review_decision": "rejected"})
-        except Exception as e:
-            print(f"⚠️ Warning: Could not update Google Sheet status for lead '{lead_id}': {e}")
+    try:
+        user_id = get_current_user_id()
+        repo.update_lead(user_id, lead_id, {"status": "rejected", "review_decision": "rejected"})
+    except Exception as e:
+        print(f"⚠️ Warning: graph rejected '{lead_id}' but failed to sync leads table status: {e}")
 
     return True
 

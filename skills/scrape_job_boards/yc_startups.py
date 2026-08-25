@@ -19,7 +19,8 @@ import requests
 from datetime import datetime, timedelta
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
-from storage.sheet_client import add_lead
+from db import repository as repo
+from db.current_user import get_current_user_id
 
 # YC OSS API endpoints (no auth required, updated daily)
 YC_API_BASE = "https://yc-oss.github.io/api"
@@ -186,6 +187,7 @@ def company_to_lead(company: dict) -> dict:
 
 def run(max_leads: int = 20):
     """Main entry point: scrape YC startups that are hiring + recently funded."""
+    user_id = get_current_user_id()
     print(f"\n{'='*60}")
     print("YC Startups Scraper")
     print(f"{'='*60}")
@@ -250,9 +252,9 @@ def run(max_leads: int = 20):
             filtered_out += 1
             continue
         
-        # Add to sheet
+        # Add to Postgres
         try:
-            was_added = add_lead(lead)
+            was_added = repo.try_add_lead(user_id, lead)
             if was_added:
                 print(f"  ✅ {name} ({batch}) — added")
                 added += 1

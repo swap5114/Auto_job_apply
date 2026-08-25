@@ -1,0 +1,60 @@
+# Local development / CI stack. Mirrors the production shape (Cloud SQL
+# Postgres + Cloud Run api/worker) closely enough that code written and
+# tested here behaves the same once deployed -- only the connection details
+# change (DATABASE_URL points at Cloud SQL via the Serverless VPC connector
+# in prod, at the "db" service here).
+#
+# Usage:
+#   docker compose up -d db          # just Postgres, for running tests/migrations from the host
+#   docker compose up --build        # full stack: db + api + worker
+#   docker compose down -v           # tear down, including the postgres volume
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: autoapply-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: autoapply
+      POSTGRES_PASSWORD: autoapply
+      POSTGRES_DB: autoapply
+    ports:
+      - "5432:5432"
+    volumes:
+      - autoapply-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autoapply -d autoapply"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: autoapply-api
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://autoapply:autoapply@db:5432/autoapply
+    env_file:
+      - config/.env
+    ports:
+      - "8000:8000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: autoapply-worker
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://autoapply:autoapply@db:5432/autoapply
+    env_file:
+      - config/.env
+
+volumes:
+  autoapply-db-data:

@@ -89,11 +89,11 @@ def run_sourcing_pipeline(
     if sources is None:
         sources = ["arbeitnow", "jobicy", "yc"]
 
-    # Reset the dedup cache so this run reflects the current sheet state, then it
-    # stays in memory for the whole run (1 sheet read total instead of 1-per-lead).
-    from storage.sheet_client import reset_dedup_cache
-    reset_dedup_cache()
-
+    # No dedup-cache reset needed here anymore: storage/sheet_client.py's
+    # in-memory dedup cache (a workaround for Google Sheets' read-quota
+    # limits) doesn't exist in the Postgres path. db.repository.add_lead
+    # dedups via a real per-tenant unique constraint on every call, so
+    # there's no cache to go stale across runs.
     cb = progress_callback
     results = []
 

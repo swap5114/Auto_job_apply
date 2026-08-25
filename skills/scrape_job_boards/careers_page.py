@@ -6,7 +6,8 @@ import requests
 from dotenv import load_dotenv
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
-from storage.sheet_client import add_lead
+from db import repository as repo
+from db.current_user import get_current_user_id
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", "config", ".env"))
 
@@ -51,6 +52,7 @@ def run():
         print("FIRECRAWL_API_KEY not set in config/.env -- skipping careers_page scrape.")
         return
 
+    user_id = get_current_user_id()
     added = 0
     skipped = 0
 
@@ -70,7 +72,7 @@ def run():
             "posted_date": "",
         }
 
-        if add_lead(lead):
+        if repo.try_add_lead(user_id, lead):
             added += 1
         else:
             skipped += 1

@@ -22,7 +22,8 @@ from email.mime.application import MIMEApplication
 from dotenv import load_dotenv
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from storage.sheet_client import get_leads, update_lead
+from db import repository as repo
+from db.current_user import get_current_user_id
 
 RESUMES_DIR = os.path.join(os.path.dirname(__file__), "..", "resumes")
 
@@ -219,7 +220,7 @@ def send_email(service, to: str, subject: str, body: str, attachment_path: str =
 # Main skill logic
 # ---------------------------------------------------------------------------
 
-def process_approved_lead(service, lead: dict) -> str:
+def process_approved_lead(service, lead: dict, user_id: str) -> str:
     """Process a single approved lead: create draft or send.
 
     Returns one of: "sent", "draft_created", "skipped_no_email",
@@ -250,14 +251,14 @@ def process_approved_lead(service, lead: dict) -> str:
         if is_direct_send():
             result = send_email(service, contact_email, subject, body, attachment)
             msg_id = result.get("id", "?")
-            update_lead(lead_id, {"status": "sent", "sent_at": _now_iso()})
+            repo.update_lead(user_id, lead_id, {"status": "sent", "sent_at": _now_iso()})
             attach_note = " (+resume)" if attachment else ""
             print(f"  ✅ SENT to {contact_email} ({company}){attach_note} — msg_id: {msg_id}")
             return "sent"
         else:
             result = create_draft(service, contact_email, subject, body, attachment)
             draft_id = result.get("id", "?")
-            update_lead(lead_id, {"status": "draft_created", "sent_at": _now_iso()})
+            repo.update_lead(user_id, lead_id, {"status": "draft_created", "sent_at": _now_iso()})
             attach_note = " (+resume)" if attachment else ""
             print(f"  📝 DRAFT created for {contact_email} ({company}){attach_note} — draft_id: {draft_id}")
             return "draft_created"
@@ -310,7 +311,8 @@ def run() -> dict:
     if direct_send:
         statuses.append("draft_created")
 
-    all_leads = get_leads()
+    user_id = get_current_user_id()
+    all_leads = repo.get_leads(user_id)
     seen = set()
     leads = []
     for lead in all_leads:
@@ -327,7 +329,7 @@ def run() -> dict:
         return summary
 
     for lead in leads:
-        outcome = process_approved_lead(service, lead)
+        outcome = process_approved_lead(service, lead, user_id)
         summary[outcome] = summary.get(outcome, 0) + 1
 
     print(

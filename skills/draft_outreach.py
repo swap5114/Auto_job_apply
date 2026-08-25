@@ -5,7 +5,8 @@ import json
 from dotenv import load_dotenv
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from storage.sheet_client import get_leads, update_lead
+from db import repository as repo
+from db.current_user import get_current_user_id
 from skills.llm_client import llm_generate
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "config", ".env"))
@@ -94,7 +95,8 @@ def run():
         print("MODEL_BACKEND=claude but ANTHROPIC_API_KEY not set -- skipping draft_outreach.")
         return
 
-    leads = get_leads()
+    user_id = get_current_user_id()
+    leads = repo.get_leads(user_id)
     targets = [
         lead for lead in leads
         if (lead.get("resume_version") or "").strip() and not (lead.get("outreach_draft") or "").strip()
@@ -119,7 +121,7 @@ def run():
             print(f"Failed to draft outreach for {label}: {e}")
             continue
 
-        update_lead(lead["id"], {"outreach_draft": draft, "status": "pending_review"})
+        repo.update_lead(user_id, lead["id"], {"outreach_draft": draft, "status": "pending_review"})
         drafted += 1
         print(f"\nDrafted outreach for {label} [status -> pending_review]:\n{'-' * 60}\n{draft}\n{'-' * 60}")
 

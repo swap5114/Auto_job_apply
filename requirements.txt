@@ -1,5 +1,4 @@
-gspread #used for interacting with google sheets
-google-auth # used to maintain session between bot and sheet
+google-auth # transitive dep of google-auth-oauthlib / google-api-python-client (Gmail OAuth)
 python-dotenv
 requests
 beautifulsoup4
@@ -15,6 +14,7 @@ google-genai
 # API server
 fastapi
 uvicorn[standard]
+python-multipart # required by UploadFile (api/main.py's /api/pipeline/upload-csv)
 
 # Scheduling (Phase 10b)
 apscheduler
@@ -22,3 +22,12 @@ apscheduler
 
 # Sandbox (Docker-based demo builder)
 docker
+
+# --- Phase 0: Production Foundation (Postgres multi-tenant backend) ---
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+alembic==1.14.0
+
+# Testing
+pytest==8.3.4
+pytest-postgresql==6.1.1

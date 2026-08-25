@@ -40,6 +40,9 @@ from pydantic import BaseModel
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
+from db import repository as repo
+from db.current_user import get_current_user_id
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -240,37 +243,28 @@ class DemoBuildSummary(BaseModel):
 # Helper functions
 # ---------------------------------------------------------------------------
 
-def _get_sheet_client():
-    """Lazy import of sheet_client to avoid import errors if creds are missing."""
-    try:
-        from storage.sheet_client import get_leads, update_lead, add_lead
-        return get_leads, update_lead, add_lead
-    except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Google Sheets connection unavailable: {str(e)}"
-        )
-
-
 # --- Short-lived leads cache -------------------------------------------------
-# Reading the whole Sheet is slow and rate-limited. A single page load fires
-# several read endpoints (stats + leads + review filters), each of which would
-# otherwise hit the Sheet independently. This TTL cache collapses those into
-# one Sheet read, which is the main fix for slow page loads.
+# A single dashboard page load fires several read endpoints (stats + leads +
+# review filters) in quick succession. This TTL cache collapses those into
+# one Postgres read instead of N. Less critical than it was for Sheets (no
+# hard read-quota to worry about with Postgres), but still avoids redundant
+# round-trips within the same page load.
 _LEADS_TTL = 8  # seconds
 _leads_cache: dict = {"data": None, "ts": 0.0}
 _leads_cache_lock = threading.Lock()
 
 
 def _get_all_leads_cached(force: bool = False) -> list[dict]:
-    """Return all leads, served from an in-memory cache when fresh."""
+    """Return all leads for the current (single) user, served from an
+    in-memory cache when fresh.
+    """
     now = time.monotonic()
     with _leads_cache_lock:
         if not force and _leads_cache["data"] is not None and (now - _leads_cache["ts"]) < _LEADS_TTL:
             return _leads_cache["data"]
 
-    get_leads, _, _ = _get_sheet_client()
-    data = get_leads()
+    user_id = get_current_user_id()
+    data = repo.get_leads(user_id)
     with _leads_cache_lock:
         _leads_cache["data"] = data
         _leads_cache["ts"] = time.monotonic()
@@ -278,7 +272,7 @@ def _get_all_leads_cached(force: bool = False) -> list[dict]:
 
 
 def _invalidate_leads_cache():
-    """Drop the cached leads so the next read re-fetches from the Sheet."""
+    """Drop the cached leads so the next read re-fetches from Postgres."""
     with _leads_cache_lock:
         _leads_cache["data"] = None
         _leads_cache["ts"] = 0.0
@@ -309,6 +303,47 @@ def _read_env_value(key: str, default: str = "") -> str:
 # Routes: Leads
 # ---------------------------------------------------------------------------
 
+def _lead_to_response(lead: dict) -> LeadResponse:
+    """Build a LeadResponse from a db.repository lead dict.
+
+    repo.get_leads()/get_lead() return typed values straight from Postgres
+    (None for unset text columns, a real int for followup_count, real
+    datetime objects for sent_at/last_checked -- not the all-strings shape
+    storage/sheet_client.py used to return, since Sheets has no native
+    types). LeadResponse's fields are all plain str (kept as-is so the
+    existing frontend, which is written against that all-strings shape,
+    keeps working unchanged) -- so every field is normalized to a string
+    here, with None/missing coerced to "" and datetimes to ISO text.
+    """
+    def s(value) -> str:
+        if value is None:
+            return ""
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        return str(value)
+
+    return LeadResponse(
+        id=s(lead.get("id")),
+        source=s(lead.get("source")),
+        company=s(lead.get("company")),
+        role=s(lead.get("role")),
+        jd_text=s(lead.get("jd_text")),
+        contact_name=s(lead.get("contact_name")),
+        contact_email=s(lead.get("contact_email")),
+        x_handle=s(lead.get("x_handle")),
+        status=s(lead.get("status")),
+        resume_version=s(lead.get("resume_version")),
+        outreach_draft=s(lead.get("outreach_draft")),
+        sent_at=s(lead.get("sent_at")),
+        last_checked=s(lead.get("last_checked")),
+        followup_count=s(lead.get("followup_count")),
+        listing_url=s(lead.get("listing_url")),
+        posted_date=s(lead.get("posted_date")),
+        domain=s(lead.get("domain")),
+        review_decision=s(lead.get("review_decision")),
+    )
+
+
 @app.get("/api/leads", response_model=list[LeadResponse])
 def list_leads(status: Optional[str] = Query(None, description="Filter by status")):
     """List all leads, optionally filtered by status (served from TTL cache)."""
@@ -316,31 +351,7 @@ def list_leads(status: Optional[str] = Query(None, description="Filter by status
     if status:
         leads = [l for l in leads if str(l.get("status", "")).strip() == status]
 
-    # Normalize all fields to strings
-    result = []
-    for lead in leads:
-        result.append(LeadResponse(
-            id=str(lead.get("id", "")),
-            source=str(lead.get("source", "")),
-            company=str(lead.get("company", "")),
-            role=str(lead.get("role", "")),
-            jd_text=str(lead.get("jd_text", "")),
-            contact_name=str(lead.get("contact_name", "")),
-            contact_email=str(lead.get("contact_email", "")),
-            x_handle=str(lead.get("x_handle", "")),
-            status=str(lead.get("status", "")),
-            resume_version=str(lead.get("resume_version", "")),
-            outreach_draft=str(lead.get("outreach_draft", "")),
-            sent_at=str(lead.get("sent_at", "")),
-            last_checked=str(lead.get("last_checked", "")),
-            followup_count=str(lead.get("followup_count", "")),
-            listing_url=str(lead.get("listing_url", "")),
-            posted_date=str(lead.get("posted_date", "")),
-            domain=str(lead.get("domain", "")),
-            review_decision=str(lead.get("review_decision", "")),
-        ))
-
-    return result
+    return [_lead_to_response(lead) for lead in leads]
 
 
 @app.get("/api/leads/{lead_id}", response_model=LeadResponse)
@@ -352,86 +363,81 @@ def get_lead(lead_id: str):
     if not lead:
         raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
 
-    return LeadResponse(
-        id=str(lead.get("id", "")),
-        source=str(lead.get("source", "")),
-        company=str(lead.get("company", "")),
-        role=str(lead.get("role", "")),
-        jd_text=str(lead.get("jd_text", "")),
-        contact_name=str(lead.get("contact_name", "")),
-        contact_email=str(lead.get("contact_email", "")),
-        x_handle=str(lead.get("x_handle", "")),
-        status=str(lead.get("status", "")),
-        resume_version=str(lead.get("resume_version", "")),
-        outreach_draft=str(lead.get("outreach_draft", "")),
-        sent_at=str(lead.get("sent_at", "")),
-        last_checked=str(lead.get("last_checked", "")),
-        followup_count=str(lead.get("followup_count", "")),
-        listing_url=str(lead.get("listing_url", "")),
-        posted_date=str(lead.get("posted_date", "")),
-        domain=str(lead.get("domain", "")),
-        review_decision=str(lead.get("review_decision", "")),
-    )
+    return _lead_to_response(lead)
 
 
 @app.post("/api/leads/{lead_id}/approve")
 def approve_lead(lead_id: str):
     """Approve a lead.
 
-    Tries to resume the LangGraph review checkpoint first; if the lead isn't
-    currently paused in the graph, falls back to updating the Sheet directly
-    so the dashboard button always works.
+    Tries to resume the LangGraph review checkpoint first (this is what
+    actually drives the pipeline forward into send_node); if the lead
+    isn't currently paused in the graph (e.g. it was added directly, never
+    fed through feed_graph), falls back to a plain Postgres status update
+    so the dashboard button still works either way.
     """
+    user_id = get_current_user_id()
+
     try:
         from orchestrator.review_cli import approve_lead as _approve
         if _approve(lead_id):
             _invalidate_leads_cache()
             return {"status": "approved", "lead_id": lead_id, "via": "graph"}
     except Exception as e:
-        print(f"  approve via graph failed ({e}), falling back to sheet update")
+        print(f"  approve via graph failed ({e}), falling back to direct update")
 
-    _, update_lead, _ = _get_sheet_client()
-    update_lead(lead_id, {"status": "approved", "review_decision": "approved"})
+    try:
+        repo.update_lead(user_id, lead_id, {"status": "approved", "review_decision": "approved"})
+    except repo.NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
     _invalidate_leads_cache()
-    return {"status": "approved", "lead_id": lead_id, "via": "sheet"}
+    return {"status": "approved", "lead_id": lead_id, "via": "direct"}
 
 
 @app.post("/api/leads/{lead_id}/reject")
 def reject_lead(lead_id: str):
-    """Reject a lead (graph resume, or Sheet fallback)."""
+    """Reject a lead (graph resume, or direct Postgres update fallback)."""
+    user_id = get_current_user_id()
+
     try:
         from orchestrator.review_cli import reject_lead as _reject
         if _reject(lead_id):
             _invalidate_leads_cache()
             return {"status": "rejected", "lead_id": lead_id, "via": "graph"}
     except Exception as e:
-        print(f"  reject via graph failed ({e}), falling back to sheet update")
+        print(f"  reject via graph failed ({e}), falling back to direct update")
 
-    _, update_lead, _ = _get_sheet_client()
-    update_lead(lead_id, {"status": "rejected", "review_decision": "rejected"})
+    try:
+        repo.update_lead(user_id, lead_id, {"status": "rejected", "review_decision": "rejected"})
+    except repo.NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
     _invalidate_leads_cache()
-    return {"status": "rejected", "lead_id": lead_id, "via": "sheet"}
+    return {"status": "rejected", "lead_id": lead_id, "via": "direct"}
 
 
 @app.post("/api/leads/{lead_id}/edit")
 def edit_lead(lead_id: str, body: EditRequest):
-    """Edit outreach draft and approve the lead (graph resume, or Sheet fallback)."""
+    """Edit outreach draft and approve the lead (graph resume, or direct fallback)."""
+    user_id = get_current_user_id()
+
     try:
         from orchestrator.review_cli import edit_lead as _edit
         if _edit(lead_id, body.outreach_draft):
             _invalidate_leads_cache()
             return {"status": "approved", "lead_id": lead_id, "draft_updated": True, "via": "graph"}
     except Exception as e:
-        print(f"  edit via graph failed ({e}), falling back to sheet update")
+        print(f"  edit via graph failed ({e}), falling back to direct update")
 
-    _, update_lead, _ = _get_sheet_client()
-    update_lead(lead_id, {
-        "status": "approved",
-        "outreach_draft": body.outreach_draft,
-        "review_decision": "edited",
-    })
+    try:
+        repo.update_lead(user_id, lead_id, {
+            "status": "approved",
+            "outreach_draft": body.outreach_draft,
+            "review_decision": "edited",
+        })
+    except repo.NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
     _invalidate_leads_cache()
-    return {"status": "approved", "lead_id": lead_id, "draft_updated": True, "via": "sheet"}
+    return {"status": "approved", "lead_id": lead_id, "draft_updated": True, "via": "direct"}
 
 
 @app.post("/api/leads/{lead_id}/research", response_model=ResearchResponse)
@@ -904,7 +910,7 @@ def _run_pipeline_bg(sources, yc_max_leads, x_max_leads, csv_path):
         with _pipeline_lock:
             _pipeline_run_state["error"] = str(e)
     finally:
-        # New leads were likely written to the Sheet — drop the cache so the
+        # New leads were likely written to Postgres — drop the cache so the
         # next dashboard/leads read reflects them.
         _invalidate_leads_cache()
         with _pipeline_lock:
@@ -1207,3 +1213,39 @@ def scheduler_trigger(job_id: str):
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "autoapply-api"}
+
+
+# ---------------------------------------------------------------------------
+# Health / readiness probes (Phase 0 -- Cloud Run liveness/readiness checks)
+# ---------------------------------------------------------------------------
+#
+# /health is a liveness probe: "is the process up and able to respond at
+# all?" It does no I/O, so it can't be dragged down by a slow/dead dependency
+# -- exactly what Cloud Run needs to decide whether to restart the container.
+#
+# /ready is a readiness probe: "can this instance actually serve traffic?"
+# It checks the one hard dependency that matters -- the Postgres connection
+# -- so Cloud Run (and a load balancer health check) can hold back traffic
+# from an instance that's up but can't reach the database (e.g. during a
+# Cloud SQL failover or before the Serverless VPC connector is attached).
+
+@app.get("/health")
+def liveness():
+    """Liveness probe. Always returns 200 if the process can respond at all."""
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def readiness():
+    """Readiness probe. Returns 200 only if the database is reachable."""
+    from sqlalchemy import text
+    from db.session import get_engine
+
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database not reachable: {e}")
+
+    return {"status": "ready", "db": "ok"}

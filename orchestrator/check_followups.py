@@ -1,7 +1,7 @@
 """Follow-up checker — starts the follow-up graph for sent leads.
 
 This is the cron entry point that:
-1. Reads all 'sent' leads from the Sheet
+1. Reads all 'sent' leads from Postgres
 2. Starts a followup_graph run for each one
 3. The graph checks for replies, drafts follow-ups if needed,
    and pauses at the review interrupt
@@ -15,7 +15,8 @@ import sys
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from storage.sheet_client import get_leads, update_lead
+from db import repository as repo
+from db.current_user import get_current_user_id
 from graph.pipeline import build_followup_graph, get_checkpointer_connection, DB_PATH
 
 
@@ -24,10 +25,11 @@ def check_and_queue_followups(db_path: str = DB_PATH) -> int:
 
     Returns the number of leads that entered the follow-up flow.
     """
+    user_id = get_current_user_id()
     cp = get_checkpointer_connection(db_path)
     graph = build_followup_graph(cp)
 
-    leads = get_leads(status="sent")
+    leads = repo.get_leads(user_id, status="sent")
 
     if not leads:
         print("No sent leads to check for follow-ups.")

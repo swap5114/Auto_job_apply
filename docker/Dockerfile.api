@@ -1,0 +1,38 @@
+# API service -- FastAPI app served by uvicorn, deployed to Cloud Run.
+#
+# Build from the repo root so the full source tree (api/, db/, skills/,
+# orchestrator/, graph/, storage/, config/) is available for import, matching
+# how the app is run locally today:
+#   docker build -f docker/Dockerfile.api -t autoapply-api .
+
+FROM python:3.13-slim AS base
+
+# Prevent Python from writing .pyc files / buffering stdout, standard for
+# containerized Python services so logs show up immediately in Cloud Logging.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# System deps needed to build psycopg2-binary's transitive deps and xhtml2pdf's
+# font handling. Kept minimal -- slim base + only what's required.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Cloud Run sets PORT; default to 8000 for local `docker run`.
+ENV PORT=8000
+EXPOSE 8000
+
+# Run as a non-root user (defense in depth -- least privilege inside the container).
+RUN useradd --create-home --shell /bin/bash appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
+CMD ["sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT}"]

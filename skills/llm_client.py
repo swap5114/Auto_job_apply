@@ -211,17 +211,38 @@ def llm_generate(
 
     if chosen_backend == "claude":
         chosen_model = model or CLAUDE_MODEL
-        return _call_claude(system_prompt, user_message, max_tokens, chosen_model)
+        call = lambda: _call_claude(system_prompt, user_message, max_tokens, chosen_model)
     elif chosen_backend == "ollama":
         chosen_model = model or OLLAMA_MODEL
-        return _call_ollama(system_prompt, user_message, max_tokens, chosen_model)
+        call = lambda: _call_ollama(system_prompt, user_message, max_tokens, chosen_model)
     elif chosen_backend == "gemini":
         chosen_model = model or GEMINI_MODEL
-        return _call_gemini(system_prompt, user_message, max_tokens, chosen_model)
+        call = lambda: _call_gemini(system_prompt, user_message, max_tokens, chosen_model)
     else:
         raise ValueError(
             f"Unknown MODEL_BACKEND '{chosen_backend}'. Must be 'ollama', 'claude', or 'gemini'."
         )
+
+    last_exc: Exception | None = None
+    for attempt in range(LLM_MAX_RETRIES + 1):
+        try:
+            return call()
+        except Exception as exc:
+            last_exc = exc
+            is_last_attempt = attempt == LLM_MAX_RETRIES
+            if is_last_attempt or not _is_transient_error(exc):
+                raise
+            # Exponential backoff with jitter, capped at LLM_BACKOFF_MAX.
+            delay = min(LLM_BACKOFF_BASE * (2 ** attempt), LLM_BACKOFF_MAX)
+            delay += random.uniform(0, delay * 0.1)
+            print(
+                f"  ⚠️  llm_generate: transient error on attempt {attempt + 1}/"
+                f"{LLM_MAX_RETRIES + 1} ({exc}) -- retrying in {delay:.1f}s"
+            )
+            time.sleep(delay)
+
+    # Unreachable, but keeps type checkers happy and documents intent.
+    raise last_exc  # type: ignore[misc]
 
 
 def llm_generate_json(

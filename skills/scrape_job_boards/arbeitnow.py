@@ -5,13 +5,15 @@ from datetime import datetime, timezone
 from bs4 import BeautifulSoup  # type: ignore
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
-from storage.sheet_client import add_lead
+from db import repository as repo
+from db.current_user import get_current_user_id
 from skills.relevance_filter import matches_criteria
 
 URL = "https://www.arbeitnow.com/api/job-board-api"
 
 
 def run():
+    user_id = get_current_user_id()
     added = 0
     skipped = 0
     filtered_out = 0
@@ -46,7 +48,7 @@ def run():
                 filtered_out += 1
                 continue
 
-            if add_lead(lead):
+            if repo.try_add_lead(user_id, lead):
                 added += 1
             else:
                 skipped += 1

@@ -75,9 +75,11 @@ Based on this information, provide company research and suggest a SPECIFIC demo 
 
 def run(lead_id: str):
     """Standalone: research a single lead by id and print the result."""
-    from storage.sheet_client import get_leads
+    from db import repository as repo
+    from db.current_user import get_current_user_id
 
-    leads = get_leads()
+    user_id = get_current_user_id()
+    leads = repo.get_leads(user_id)
     lead = next((l for l in leads if str(l.get("id", "")) == lead_id), None)
     if not lead:
         print(f"No lead found with id {lead_id}")
@@ -117,9 +119,11 @@ def run(lead_id: str):
 
 def run_batch():
     """Research all leads that need it (have company name but no research yet)."""
-    from storage.sheet_client import get_leads, update_lead
-    
-    leads = get_leads()
+    from db import repository as repo
+    from db.current_user import get_current_user_id
+
+    user_id = get_current_user_id()
+    leads = repo.get_leads(user_id)
     
     # Target: leads with company/role but no research done yet
     # We could add a 'company_research' column to track this

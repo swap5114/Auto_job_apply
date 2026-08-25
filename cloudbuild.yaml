@@ -1,0 +1,122 @@
+# Cloud Build CI config -- runs on every PR/push per the plan's testing
+# philosophy: unit + integration tests against an ephemeral Postgres, with
+# externals mocked. Not yet wired to a Cloud Build trigger (that requires a
+# real GCP project + repo connection) -- this file is code-complete and
+# ready to register as a trigger once the project exists:
+#
+#   gcloud builds triggers create github \
+#     --repo-name=<repo> --repo-owner=<owner> \
+#     --branch-pattern="^main$" --build-config=cloudbuild.yaml
+#
+# Steps:
+#   1. Spin up an ephemeral Postgres as a sidecar-style step network so
+#      migration + repository tests run against something real, not mocks.
+#   2. Lint (ruff, if configured; falls back to a no-op if not present yet
+#      so this doesn't block CI before linting is formally adopted).
+#   3. Run alembic upgrade head against the ephemeral Postgres.
+#   4. Run the full pytest suite (repository CRUD, tenant isolation,
+#      migrations) against that same instance.
+#   5. Build + push the api and worker images to Artifact Registry, tagged
+#      with the commit SHA, only on success.
+#
+# Substitutions (_REGION, _REPO) are set per-environment when the trigger is
+# created; sensible defaults are provided here for local `gcloud builds
+# submit --config=cloudbuild.yaml .` testing against a real project.
+
+steps:
+  # Ephemeral Postgres for the test steps below. Cloud Build runs all steps
+  # on the same Docker network by default, so later steps can reach this
+  # container at hostname "pg-test".
+  - id: start-test-postgres
+    name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        docker run -d --name pg-test --network cloudbuild \
+          -e POSTGRES_USER=autoapply -e POSTGRES_PASSWORD=autoapply -e POSTGRES_DB=autoapply \
+          postgres:16-alpine
+        # Wait for readiness before any test step tries to connect.
+        for i in $(seq 1 30); do
+          docker exec pg-test pg_isready -U autoapply -d autoapply && break
+          sleep 2
+        done
+
+  - id: install-deps
+    name: "python:3.13-slim"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        pip install --no-cache-dir -r requirements.txt
+
+  - id: lint
+    name: "python:3.13-slim"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        pip install --no-cache-dir ruff==0.8.4
+        ruff check . || echo "Lint findings present -- not yet gating CI, see steering docs to promote this to a hard failure."
+
+  - id: migrate
+    name: "python:3.13-slim"
+    entrypoint: "bash"
+    env:
+      - "DATABASE_URL=postgresql+psycopg2://autoapply:autoapply@pg-test:5432/autoapply"
+    args:
+      - "-c"
+      - |
+        pip install --no-cache-dir -r requirements.txt
+        python -m alembic upgrade head
+
+  - id: test
+    name: "python:3.13-slim"
+    entrypoint: "bash"
+    env:
+      - "DATABASE_URL=postgresql+psycopg2://autoapply:autoapply@pg-test:5432/autoapply"
+    args:
+      - "-c"
+      - |
+        pip install --no-cache-dir -r requirements.txt
+        pytest tests/ -v
+
+  - id: build-api-image
+    name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "-f"
+      - "docker/Dockerfile.api"
+      - "-t"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/api:${SHORT_SHA}"
+      - "-t"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/api:latest"
+      - "."
+
+  - id: build-worker-image
+    name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "-f"
+      - "docker/Dockerfile.worker"
+      - "-t"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/worker:${SHORT_SHA}"
+      - "-t"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/worker:latest"
+      - "."
+
+images:
+  - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/api:${SHORT_SHA}"
+  - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/api:latest"
+  - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/worker:${SHORT_SHA}"
+  - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/worker:latest"
+
+substitutions:
+  _REGION: "us-central1"
+  _REPO: "staging-autoapply"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: "E2_HIGHCPU_8"
+
+timeout: "1200s"

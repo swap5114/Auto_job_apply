@@ -7,7 +7,8 @@ from xhtml2pdf import pisa
 import html as html_lib
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from storage.sheet_client import get_leads, update_lead
+from db import repository as repo
+from db.current_user import get_current_user_id
 from skills.llm_client import llm_generate_json
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "config", ".env"))
@@ -39,12 +40,31 @@ def slugify(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
 
-def tailor_resume(base_resume: dict, company: str, role: str, jd_text: str) -> dict:
+def tailor_resume(
+    base_resume: dict, company: str, role: str, jd_text: str,
+    company_research: dict | None = None,
+) -> dict:
+    """Tailor base_resume to a specific job. company_research (optional) is
+    the dict returned by skills.research_company.research_company() -- when
+    present, it's given to the model purely as extra context on what the
+    company cares about, to help it choose which already-true bullets to
+    foreground. It never introduces new claims: the STRICT RULES in
+    SYSTEM_PROMPT (no invented bullets/skills/metrics) still govern output.
+    """
+    research_context = ""
+    if company_research:
+        research_context = f"""
+
+Additional context on this company (for prioritizing which existing, true
+resume content to foreground -- this does NOT give you license to invent
+anything new):
+{json.dumps(company_research, indent=2)}"""
+
     user_message = f"""Job description:
 Company: {company}
 Role: {role}
 
-{jd_text}
+{jd_text}{research_context}
 
 Base resume (JSON):
 {json.dumps(base_resume, indent=2)}"""
@@ -54,6 +74,39 @@ Base resume (JSON):
         user_message=user_message,
         max_tokens=4096,
     )
+
+
+def tailor_resume_for_lead(lead: dict) -> dict:
+    """Per-lead entry point used by graph/pipeline.py's tailor_resume_node.
+
+    Wraps tailor_resume() + save_resume() + keyword_coverage() -- the same
+    persistence logic run()'s per-lead loop below uses -- so the LangGraph
+    node and the standalone CLI runner can't silently drift into different
+    tailoring/saving behavior over time.
+
+    Returns {"resume_version": filename, "keyword_coverage": float}.
+    Raises ValueError if there's no jd_text to tailor against (the caller,
+    tailor_resume_node, catches this and reports status="tailor_failed" --
+    per the "never silently skip a lead" rule, this must be loud, not a
+    quiet empty-dict return).
+    """
+    company = lead.get("company") or lead.get("x_handle") or "Unknown"
+    role = lead.get("role") or ""
+    jd_text = lead.get("jd_text") or ""
+    company_research = lead.get("company_research")
+
+    if not jd_text.strip():
+        raise ValueError(f"tailor_resume_for_lead: no jd_text to tailor against for {company}")
+
+    base_resume = load_base_resume()
+    tailored = tailor_resume(base_resume, company, role, jd_text, company_research=company_research)
+    filename = save_resume(tailored, company)
+    coverage = keyword_coverage(jd_text, tailored)
+    print(
+        f"  tailor_resume_for_lead: tailored resume for {company} -> "
+        f"resumes/{filename}.json/.md (ATS keyword coverage: {coverage}%)"
+    )
+    return {"resume_version": filename, "keyword_coverage": coverage}
 
 
 def keyword_coverage(jd_text: str, tailored_resume: dict) -> float:
@@ -344,8 +397,9 @@ def run():
 
     backfill_pdfs()
 
+    user_id = get_current_user_id()
     base_resume = load_base_resume()
-    leads = get_leads()
+    leads = repo.get_leads(user_id)
     targets = [lead for lead in leads if not (lead.get("resume_version") or "").strip()]
 
     tailored_count = 0
@@ -367,7 +421,7 @@ def run():
 
         filename = save_resume(tailored, company)
         coverage = keyword_coverage(jd_text, tailored)
-        update_lead(lead["id"], {"resume_version": filename})
+        repo.update_lead(user_id, lead["id"], {"resume_version": filename})
         tailored_count += 1
         print(f"Tailored resume for {company} -> resumes/{filename}.json / .md "
               f"(ATS keyword coverage: {coverage}%)")

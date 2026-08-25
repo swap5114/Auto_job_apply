@@ -1,8 +1,8 @@
 """Graph feeder — bridges standalone skills with the LangGraph review interrupt.
 
-Reads all leads at status=pending_review from the Google Sheet, starts a
-LangGraph thread for each one (so the graph pauses at the review node), and
-marks the lead as 'in_review' in the Sheet to avoid double-feeding.
+Reads all leads at status=pending_review from Postgres, starts a LangGraph
+thread for each one (so the graph pauses at the review node), and marks the
+lead as 'in_review' to avoid double-feeding.
 
 Usage:
     python -m orchestrator.feed_graph
@@ -17,7 +17,8 @@ import sys
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from storage.sheet_client import get_leads, update_lead
+from db import repository as repo
+from db.current_user import get_current_user_id
 from graph.pipeline import build_pipeline_graph, get_checkpointer_connection, DB_PATH
 
 
@@ -30,10 +31,11 @@ def feed_pending_leads(db_path: str = DB_PATH) -> int:
 
     Returns the number of leads fed into the graph.
     """
+    user_id = get_current_user_id()
     cp = get_checkpointer_connection(db_path)
     graph = build_pipeline_graph(cp)
 
-    leads = get_leads(status="pending_review")
+    leads = repo.get_leads(user_id, status="pending_review")
 
     if not leads:
         print("No leads at status=pending_review. Nothing to feed.")
@@ -74,11 +76,11 @@ def feed_pending_leads(db_path: str = DB_PATH) -> int:
         # Start graph execution — it will hit the review interrupt and pause
         graph.invoke(state, config)
 
-        # Mark lead as in_review in the Sheet so we don't re-feed it
+        # Mark lead as in_review so we don't re-feed it
         try:
-            update_lead(lead_id, {"status": "in_review"})
+            repo.update_lead(user_id, lead_id, {"status": "in_review"})
         except Exception as e:
-            print(f"Warning: fed lead {lead_id} into graph but failed to update Sheet status: {e}")
+            print(f"Warning: fed lead {lead_id} into graph but failed to update status: {e}")
 
         fed += 1
         label = lead.get("company") or lead.get("x_handle") or lead_id
