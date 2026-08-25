@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -42,6 +42,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from db import repository as repo
 from db.current_user import get_current_user_id
+from api.rate_limit import get_client_ip, preview_limiter, resume_upload_limiter
 
 
 @asynccontextmanager
@@ -1219,6 +1220,232 @@ def scheduler_trigger(job_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Anonymous pre-signup hook (Phase 2)
+# ---------------------------------------------------------------------------
+#
+# The whole point of this hook is 30 seconds from "paste a resume" to "see
+# real, relevant jobs" -- with NO auth gate before either endpoint below.
+# That means these are the only genuinely public, unauthenticated surface
+# in this API, and the only place abuse controls (rate limiting, upload
+# validation) matter yet.
+#
+# Deliberately stateless server-side: no anonymous "session" row anywhere.
+# /api/anon/resume does everything in one response (parse -> infer
+# criteria -> match the catalog) and hands back the full parsed_resume +
+# inferred_criteria + matched_jobs. The frontend holds that in memory and
+# sends parsed_resume straight back in the body of /api/anon/preview when
+# a visitor clicks a job -- nothing is looked up by a token server-side.
+# This also makes Phase 3's "anon session converts to a saved account on
+# sign-in" trivial later: the frontend already has everything it needs to
+# POST into a real per-user save endpoint, no session migration required.
+#
+# Only ONE LLM call happens anywhere in the /api/anon/resume path (the
+# resume parse itself, in skills/parse_resume.py) -- criteria inference
+# and catalog matching are both pure Python/SQL, which is what lets the
+# feed render inside the 30-second budget without waiting on a second
+# model round-trip. /api/anon/preview is a second, separate, on-demand
+# LLM call (one tailored resume for one clicked job), which is why it
+# has its own rate limit tracked independently of the upload endpoint.
+
+MAX_RESUME_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
+ALLOWED_RESUME_EXTENSIONS = {".pdf", ".docx", ".txt"}
+
+
+class ParsedResumeResponse(BaseModel):
+    """Mirrors config/base_resume.json's shape -- see
+    skills/parse_resume.py's RESUME_JSON_SHAPE_DESCRIPTION for the
+    authoritative definition this must stay in sync with.
+    """
+    name: str = ""
+    contact: dict = {}
+    summary: str = ""
+    education: list[dict] = []
+    experience: list[dict] = []
+    projects: list[dict] = []
+    skills: dict = {}
+    certifications: list[str] = []
+
+
+class InferredCriteriaResponse(BaseModel):
+    roles: list[str]
+    tech_stack: list[str]
+    seniority: Optional[str] = None
+    locations: list[str]
+    remote_pref: Optional[str] = None
+    inferred_from_resume: bool
+
+
+class MatchedJobResponse(BaseModel):
+    id: str
+    company_name: str
+    title: str
+    location: Optional[str] = None
+    department: Optional[str] = None
+    jd_text: Optional[str] = None
+    apply_url: Optional[str] = None
+    source: str
+
+
+class AnonResumeUploadResponse(BaseModel):
+    parsed_resume: ParsedResumeResponse
+    inferred_criteria: InferredCriteriaResponse
+    matched_jobs: list[MatchedJobResponse]
+
+
+class AnonPreviewRequest(BaseModel):
+    """The frontend sends back exactly what /api/anon/resume gave it --
+    no server-side lookup, per this section's stateless design."""
+    parsed_resume: dict
+    job_id: str
+
+
+class AnonPreviewResponse(BaseModel):
+    job_id: str
+    company_name: str
+    role: str
+    tailored_resume: dict
+    keyword_coverage: float
+
+
+def _build_company_name_map(jobs: list[dict]) -> dict[str, str]:
+    """One-time lookup of company_id -> name for a batch of jobs, so we
+    don't hit Postgres once per job when building the response."""
+    from db.session import get_session
+    from db.models import Company
+    from sqlalchemy import select
+
+    company_ids = {j["company_id"] for j in jobs if j.get("company_id")}
+    if not company_ids:
+        return {}
+
+    with get_session() as session:
+        rows = session.execute(
+            select(Company.id, Company.name).where(Company.id.in_(company_ids))
+        ).all()
+        return {str(row[0]): row[1] for row in rows}
+
+
+@app.post("/api/anon/resume", response_model=AnonResumeUploadResponse)
+async def anon_upload_resume(request: Request, file: UploadFile = File(...)):
+    """Anonymous resume upload: parse -> infer criteria -> match the
+    shared catalog. One LLM call (the parse); everything else is pure
+    Python/SQL, so this responds well within the 30-second budget.
+    """
+    resume_upload_limiter.check(get_client_ip(request))
+
+    filename = file.filename or ""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext and ext not in ALLOWED_RESUME_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Allowed: .pdf, .docx, .txt",
+        )
+
+    content = await file.read()
+    if len(content) > MAX_RESUME_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large (max {MAX_RESUME_UPLOAD_BYTES // (1024 * 1024)}MB)",
+        )
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    from skills.parse_resume import (
+        ResumeParseError,
+        UnsupportedFileTypeError,
+        parse_resume_cached,
+    )
+
+    try:
+        parsed_resume, _raw_text = parse_resume_cached(
+            content, filename, file.content_type or ""
+        )
+    except UnsupportedFileTypeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ResumeParseError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    from skills.infer_criteria import infer_criteria
+    from skills.match_jobs import match_jobs
+
+    inferred_criteria = infer_criteria(parsed_resume)
+
+    all_jobs = repo.get_jobs()  # whole shared catalog -- no user_id, Phase 1's tables
+    company_names = _build_company_name_map(all_jobs)
+    matched = match_jobs(all_jobs, inferred_criteria, limit=50)
+
+    matched_response = [
+        MatchedJobResponse(
+            id=str(job["id"]),
+            company_name=company_names.get(str(job.get("company_id")), "Unknown Company"),
+            title=job.get("title") or "",
+            location=job.get("location"),
+            department=job.get("department"),
+            jd_text=job.get("jd_text"),
+            apply_url=job.get("apply_url"),
+            source=job.get("source") or "",
+        )
+        for job in matched
+    ]
+
+    return AnonResumeUploadResponse(
+        parsed_resume=ParsedResumeResponse(**parsed_resume),
+        inferred_criteria=InferredCriteriaResponse(**inferred_criteria),
+        matched_jobs=matched_response,
+    )
+
+
+@app.post("/api/anon/preview", response_model=AnonPreviewResponse)
+def anon_tailored_preview(request: Request, body: AnonPreviewRequest):
+    """Anonymous tailored-resume preview for one clicked job. A second,
+    separate LLM call from /api/anon/resume -- rate-limited independently.
+    """
+    preview_limiter.check(get_client_ip(request))
+
+    from db.session import get_session
+    from db.models import Company, Job as JobModel
+    from sqlalchemy import select
+
+    # Pull out plain values (not ORM instances) while the session is still
+    # open -- job_row/company_name would otherwise be detached the moment
+    # the `with` block exits, and any attribute access after that raises
+    # (SQLAlchemy can't lazy-refresh a detached instance without a session).
+    with get_session() as session:
+        row = session.execute(
+            select(JobModel.id, JobModel.title, JobModel.jd_text, Company.name)
+            .join(Company, JobModel.company_id == Company.id)
+            .where(JobModel.id == body.job_id)
+        ).first()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Job {body.job_id} not found")
+
+    job_id, job_title, job_jd_text, company_name = row
+
+    from skills.tailor_resume import tailor_resume, keyword_coverage
+
+    try:
+        tailored = tailor_resume(
+            base_resume=body.parsed_resume,
+            company=company_name,
+            role=job_title,
+            jd_text=job_jd_text or "",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Preview generation failed: {e}")
+
+    coverage = keyword_coverage(job_jd_text or "", tailored)
+
+    return AnonPreviewResponse(
+        job_id=str(job_id),
+        company_name=company_name,
+        role=job_title,
+        tailored_resume=tailored,
+        keyword_coverage=coverage,
+    )
 
 
 # ---------------------------------------------------------------------------

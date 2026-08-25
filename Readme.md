@@ -27,6 +27,8 @@ This is a personal learning project, not a product. It's built and driven by me;
 | 10b | Cron trigger (APScheduler, replaces the Vellum plan) | ✅ Done, verified end-to-end |
 | 11 | Deploy to a VM | ⬜ Not started |
 
+**Lean re-plan (multi-tenant SaaS direction):** Phase 0 (Postgres migration, replacing the Sheet above) and Phase 1 (shared job catalog: Greenhouse/Lever/Ashby connectors + YC) are done -- see the storage note at the top and the Skills reference below. Phase 2 (anonymous pre-signup hook: resume upload -> parse -> infer criteria -> matched feed -> tailored preview, all with no auth gate) is also done. See `skills/parse_resume.py`, `skills/infer_criteria.py`, `skills/match_jobs.py`, and `api/main.py`'s `/api/anon/*` routes.
+
 A cross-cutting piece not in the original phase numbering: `skills/relevance_filter.py` + `config/search_criteria.json`, a keyword filter applied by every scraper before a lead is even written to the database.
 
 ---
@@ -143,7 +145,8 @@ Every node follows the same shape: **read leads missing some field → do the wo
 
 ```
 api/
-  main.py                FastAPI backend for dashboard
+  main.py                FastAPI backend for dashboard + the anonymous /api/anon/* hook (Phase 2)
+  rate_limit.py          Per-IP sliding-window rate limiter for the anonymous endpoints
   __init__.py
 db/
   models.py              SQLAlchemy ORM models (Postgres, multi-tenant schema)
@@ -179,6 +182,9 @@ skills/
     ats_tokens.json      Seed list of known Greenhouse/Lever/Ashby company tokens
   scrape_x_leads.py      Sorsa API (primary) + GetX API (fallback) — X hiring-signal leads
   relevance_filter.py    Strict dual-keyword filter (role + tech stack) applied before every add_lead()
+  parse_resume.py        PDF/DOCX/plain-text extraction + LLM structuring for the anonymous upload hook (Phase 2)
+  infer_criteria.py      Pure-function search-criteria inference from a parsed resume (no LLM call)
+  match_jobs.py          Pure-function scored/ranked matching of catalog jobs against inferred criteria (no LLM call)
   find_contact_email.py  Apollo.io org enrichment (primary) + Hunter.io Domain Search (fallback)
   research_company.py    LLM-based company research from job description
   tailor_resume.py       Claude/Gemini-powered resume tailoring + PDF/MD/JSON generation
@@ -206,6 +212,12 @@ tests/
   test_current_user.py   Single-user bootstrap tests
   test_api_leads.py      FastAPI TestClient tests for the leads endpoints
   test_phase7_review.py  LangGraph interrupt testing (fully mocked externals -- see its docstring)
+  test_ats_connectors.py Fixture-based golden tests for the Greenhouse/Lever/Ashby catalog connectors
+  test_ats_common.py     Token prioritization + bounded-concurrency batch execution tests
+  test_parse_resume.py   Resume text extraction (real PDF/DOCX fixtures) + LLM structuring (mocked)
+  test_infer_and_match.py Criteria inference + catalog job matching (pure functions, no LLM)
+  test_rate_limit.py     Per-IP sliding-window rate limiter tests
+  test_anon_endpoints.py End-to-end tests for /api/anon/* against real Postgres (mocked LLM)
 ```
 
 ---
@@ -233,6 +245,8 @@ Every row is scoped to a `user_id` (currently always the single local user from 
 **`greenhouse.py` / `lever.py` / `ashby.py`** — free, no-key public job-board connectors for the three major ATS platforms, and the only skills that write to the SHARED catalog (`companies`/`jobs` in `db/models.py`) rather than per-user leads. Each syncs one company's board per call, deduped on `(company_id, external_id)` so re-running is idempotent (a scheduled refresh never creates duplicates). A dead/mistyped token is reported and skipped, never crashes the batch. `ats_tokens.json` holds a seed list of verified company tokens per provider; `orchestrator/pipeline_runner.run_catalog_refresh()` runs all three together on a schedule. Golden tests with fixture-mocked HTTP responses cover a normal board, an empty board, a 404, malformed JSON, and dedup-on-rerun for each provider (`tests/test_ats_connectors.py`).
 
 **`relevance_filter.py`** — strict dual-keyword matching (V3): requires BOTH a software-specific role keyword ("software engineer", "backend developer", "full stack") AND a tech stack keyword (react, node, python, etc.). Also filters out non-tech roles via `non_tech_exclude_keywords` (operations, business, sales, admin). Whole-word matching prevents substring false positives (e.g., "ai" inside "maintain").
+
+**The anonymous pre-signup hook (Phase 2)** — `parse_resume.py` + `infer_criteria.py` + `match_jobs.py` + `api/main.py`'s `/api/anon/resume` and `/api/anon/preview` routes. A visitor pastes/uploads a resume (PDF via `pypdf`, DOCX via `python-docx`, or plain text) with **no auth gate** and, within seconds, sees a real matched-jobs feed pulled from the shared catalog (Phase 1's Greenhouse/Lever/Ashby/YC data), plus one on-demand tailored-resume preview for a clicked job. Exactly ONE LLM call happens in the upload path — structuring the extracted resume text into JSON (`parse_resume.py`) — cached by a hash of the extracted text so re-uploading the same resume (even in a different file format) never re-spends that call. Criteria inference and catalog matching downstream of that are both pure Python/SQL with zero LLM cost, which is what keeps the feed inside the 30-second budget. `match_jobs.py` is deliberately *scored*, not a hard AND filter like `relevance_filter.py` — a single resume can easily produce an empty `role_keywords` list (new grads, projects-only resumes), and a strict AND would zero out the feed for exactly the visitors this hook exists to hook; a job needs at least one tech-or-role signal to appear at all, then results are ranked by how many signals matched. The whole flow is stateless server-side by design: no anonymous "session" row anywhere — the frontend holds the parsed resume + criteria + feed in memory and round-trips the resume JSON back to `/api/anon/preview` itself, which also sets up Phase 3's anon→account conversion to be a simple POST rather than a session migration. `api/rate_limit.py` protects both routes with an independent per-IP sliding-window cap (10 requests/hour each by default), since this is the only genuinely public, unauthenticated surface in the API.
 
 **`find_contact_email.py`** — multi-strategy email discovery. **Apollo.io is the primary provider:** Organization Enrichment (by domain) identifies the founder/CEO via `org_chart_root_people_ids`, then People Match unlocks a verified email for that person — ideal for personalized cold outreach to YC startups. **Hunter.io is the fallback** when Apollo has no coverage: Domain Search returns generic role inboxes (engineering@, founders@). X leads get a free regex scan of their bio/tweet text first. Company leads with a known `domain` use it directly; otherwise, a domain is *guessed* from the company name (legal-entity suffixes stripped, both smashed-together and hyphenated variants tried). A miss is always printed with which domains were tried, never silently counted.
 
