@@ -614,6 +614,25 @@ def get_jobs(company_id: Optional[str] = None) -> list[dict]:
         return [_to_dict(j) for j in jobs]
 
 
+def get_companies_by_ats_type(ats_type: str) -> list[dict]:
+    """Return every company already in the catalog for one ATS provider.
+
+    Used by the ATS connectors (skills/scrape_job_boards/{greenhouse,lever,
+    ashby}.py) to prioritize a catalog-refresh run: tokens with no
+    matching row here have never been synced (highest priority), and
+    tokens that do have a row are sorted by last_scraped_at so the
+    stalest ones get refreshed first. With thousands of seed tokens and a
+    per-run cap, this is what lets repeated scheduled runs make steady
+    progress across the whole list instead of only ever touching
+    whichever companies sort first alphabetically.
+    """
+    with get_session() as session:
+        companies = session.scalars(
+            select(Company).where(Company.ats_type == ats_type)
+        ).all()
+        return [_to_dict(c) for c in companies]
+
+
 # ---------------------------------------------------------------------------
 # Shared caches: enrichment + research (keyed by domain/job, not user)
 # ---------------------------------------------------------------------------

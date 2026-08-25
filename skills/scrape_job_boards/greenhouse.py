@@ -31,9 +31,19 @@ from bs4 import BeautifulSoup  # type: ignore
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 from db import repository as repo
+from skills.scrape_job_boards.ats_common import prioritize_tokens, run_concurrent
 
 BASE_URL = "https://boards-api.greenhouse.io/v1/boards/{token}/jobs"
 TOKENS_PATH = os.path.join(os.path.dirname(__file__), "ats_tokens.json")
+
+# ats_tokens.json (imported from kalil0321/ats-scrapers, an open dataset --
+# see import_ats_tokens.py) holds thousands of tokens. Syncing all of them
+# unbounded on every run would take hours and risk provider rate limits,
+# so a scheduled/default run caps itself and relies on prioritize_tokens()
+# (never-synced first, then stalest) to make steady progress across the
+# whole seed list over repeated runs. Pass tokens explicitly (e.g. via the
+# CLI) to bypass this cap for a specific company.
+DEFAULT_RUN_LIMIT = 200
 
 
 def _load_seed_tokens() -> list[str]:
@@ -167,21 +177,39 @@ def sync_company(token: str) -> dict:
     return {"token": token, "status": "ok", "added": added, "skipped": skipped, "error": None}
 
 
-def run(tokens: list[str] | None = None) -> dict:
-    """Sync every given (or seed-listed) Greenhouse token into the catalog.
+def run(tokens: list[str] | None = None, limit: int | None = None, max_workers: int = 8) -> dict:
+    """Sync Greenhouse tokens into the catalog.
 
     Each company is synced independently -- one bad/stale token never stops
     the rest of the batch, per the project's "log loudly, never silently
     skip" rule (a failure is printed and counted, never swallowed).
+
+    Args:
+        tokens: explicit tokens to sync. If None, uses every seed-listed
+            token, prioritized (never-synced first, then stalest) and
+            capped at `limit`.
+        limit: max tokens to sync this run when tokens is None. Defaults
+            to DEFAULT_RUN_LIMIT. Pass None explicitly (with tokens=None)
+            for an uncapped run across the entire seed list -- expect
+            this to take a while with thousands of tokens.
+        max_workers: concurrent HTTP fetches (each still writes to
+            Postgres via its own session -- see ats_common.run_concurrent).
     """
-    tokens = tokens if tokens is not None else _load_seed_tokens()
+    if tokens is None:
+        seed_tokens = _load_seed_tokens()
+        known = repo.get_companies_by_ats_type("greenhouse")
+        effective_limit = DEFAULT_RUN_LIMIT if limit is None else limit
+        tokens = prioritize_tokens(seed_tokens, known, effective_limit)
+    else:
+        # Explicit tokens (e.g. from the CLI) always run in full, uncapped.
+        pass
 
     print(f"\n{'=' * 60}")
     print("Greenhouse Catalog Sync")
     print(f"{'=' * 60}")
     print(f"Tokens to sync: {len(tokens)}")
 
-    results = [sync_company(token) for token in tokens]
+    results = run_concurrent(tokens, sync_company, max_workers=max_workers)
 
     ok = sum(1 for r in results if r["status"] == "ok")
     not_found = sum(1 for r in results if r["status"] == "not_found")

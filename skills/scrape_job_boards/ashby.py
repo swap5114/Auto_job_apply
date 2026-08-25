@@ -31,9 +31,13 @@ import requests
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 from db import repository as repo
+from skills.scrape_job_boards.ats_common import prioritize_tokens, run_concurrent
 
 BASE_URL = "https://api.ashbyhq.com/posting-api/job-board/{token}"
 TOKENS_PATH = os.path.join(os.path.dirname(__file__), "ats_tokens.json")
+
+# See greenhouse.py's DEFAULT_RUN_LIMIT comment -- same rationale applies here.
+DEFAULT_RUN_LIMIT = 200
 
 
 def _load_seed_tokens() -> list[str]:
@@ -145,16 +149,22 @@ def sync_company(token: str) -> dict:
     return {"token": token, "status": "ok", "added": added, "skipped": skipped, "error": None}
 
 
-def run(tokens: list[str] | None = None) -> dict:
-    """Sync every given (or seed-listed) Ashby token into the catalog."""
-    tokens = tokens if tokens is not None else _load_seed_tokens()
+def run(tokens: list[str] | None = None, limit: int | None = None, max_workers: int = 8) -> dict:
+    """Sync Ashby tokens into the catalog. See greenhouse.run()'s
+    docstring for the tokens/limit/max_workers contract -- identical here.
+    """
+    if tokens is None:
+        seed_tokens = _load_seed_tokens()
+        known = repo.get_companies_by_ats_type("ashby")
+        effective_limit = DEFAULT_RUN_LIMIT if limit is None else limit
+        tokens = prioritize_tokens(seed_tokens, known, effective_limit)
 
     print(f"\n{'=' * 60}")
     print("Ashby Catalog Sync")
     print(f"{'=' * 60}")
     print(f"Tokens to sync: {len(tokens)}")
 
-    results = [sync_company(token) for token in tokens]
+    results = run_concurrent(tokens, sync_company, max_workers=max_workers)
 
     ok = sum(1 for r in results if r["status"] == "ok")
     not_found = sum(1 for r in results if r["status"] == "not_found")
