@@ -1044,6 +1044,21 @@ def trigger_check_followups():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/pipeline/catalog-refresh")
+def trigger_catalog_refresh(providers: Optional[list[str]] = None):
+    """Sync the shared job catalog (companies/jobs) from Greenhouse, Lever,
+    and Ashby. Unlike the other /api/pipeline/* routes, this writes to the
+    shared catalog, not per-user leads -- see
+    orchestrator.pipeline_runner.run_catalog_refresh's docstring.
+    """
+    try:
+        from orchestrator.pipeline_runner import run_catalog_refresh
+        summary = run_catalog_refresh(providers=providers)
+        return {"status": "success", "summary": summary}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ---------------------------------------------------------------------------
 # Routes: Settings
 # ---------------------------------------------------------------------------

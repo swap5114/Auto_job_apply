@@ -291,6 +291,24 @@ def test_tenant_isolation_gmail_accounts():
 # ---------------------------------------------------------------------------
 
 
+def test_mark_company_scraped_stamps_timestamp():
+    company = repo.get_or_create_company("Stamp Co", ats_type="greenhouse", ats_token="stamp-co")
+    assert company["last_scraped_at"] is None
+
+    repo.mark_company_scraped(company["id"])
+
+    updated = repo.get_or_create_company("Stamp Co", ats_type="greenhouse", ats_token="stamp-co")
+    assert updated["last_scraped_at"] is not None
+
+
+def test_mark_company_scraped_unknown_id_is_a_noop():
+    """A nonexistent company_id must not raise -- callers (the ATS
+    connectors) always pass an id they just created/fetched, so this is
+    purely a defensive no-op, not an expected error path."""
+    import uuid
+    repo.mark_company_scraped(str(uuid.uuid4()))  # should not raise
+
+
 def test_get_or_create_company_dedups_by_ats_token():
     c1 = repo.get_or_create_company("Acme", ats_type="greenhouse", ats_token="acme")
     c2 = repo.get_or_create_company("Acme Inc", ats_type="greenhouse", ats_token="acme")

@@ -173,6 +173,10 @@ skills/
     jobicy.py            Jobicy public remote-job API (free, no key)
     careers_page.py      Firecrawl scrape of a hardcoded (url, company) list
     company_list.py      CSV-driven bulk scraping + Firecrawl career-page auto-discovery
+    greenhouse.py        Greenhouse Job Board API -- writes to the SHARED catalog (companies/jobs), not per-user leads
+    lever.py             Lever Postings API -- writes to the SHARED catalog
+    ashby.py             Ashby Job Postings API -- writes to the SHARED catalog
+    ats_tokens.json      Seed list of known Greenhouse/Lever/Ashby company tokens
   scrape_x_leads.py      Sorsa API (primary) + GetX API (fallback) — X hiring-signal leads
   relevance_filter.py    Strict dual-keyword filter (role + tech stack) applied before every add_lead()
   find_contact_email.py  Apollo.io org enrichment (primary) + Hunter.io Domain Search (fallback)
@@ -225,6 +229,8 @@ Every row is scoped to a `user_id` (currently always the single local user from 
 **Scrapers** (`arbeitnow.py`, `jobicy.py`, `careers_page.py`, `company_list.py`, `scrape_x_leads.py`, `yc_startups.py`) — each pulls raw postings from one source, builds a lead dict, runs it through `relevance_filter.matches_criteria`, and calls `add_lead`. Every one prints a summary line (`added` / `skipped` / `filtered_out`) so a run's outcome is never silent.
 
 **`yc_startups.py`** — scrapes Y Combinator startups that are hiring and recently funded (last 4-6 months). Uses the unofficial YC OSS API (`yc-oss.github.io/api`) which mirrors YC's Algolia index — no API key needed. Filters for recent batches (Winter/Spring/Summer 2026) and prioritizes tech-focused companies (B2B, Developer Tools, Infrastructure, etc.).
+
+**`greenhouse.py` / `lever.py` / `ashby.py`** — free, no-key public job-board connectors for the three major ATS platforms, and the only skills that write to the SHARED catalog (`companies`/`jobs` in `db/models.py`) rather than per-user leads. Each syncs one company's board per call, deduped on `(company_id, external_id)` so re-running is idempotent (a scheduled refresh never creates duplicates). A dead/mistyped token is reported and skipped, never crashes the batch. `ats_tokens.json` holds a seed list of verified company tokens per provider; `orchestrator/pipeline_runner.run_catalog_refresh()` runs all three together on a schedule. Golden tests with fixture-mocked HTTP responses cover a normal board, an empty board, a 404, malformed JSON, and dedup-on-rerun for each provider (`tests/test_ats_connectors.py`).
 
 **`relevance_filter.py`** — strict dual-keyword matching (V3): requires BOTH a software-specific role keyword ("software engineer", "backend developer", "full stack") AND a tech stack keyword (react, node, python, etc.). Also filters out non-tech roles via `non_tech_exclude_keywords` (operations, business, sales, admin). Whole-word matching prevents substring false positives (e.g., "ai" inside "maintain").
 

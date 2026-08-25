@@ -172,14 +172,66 @@ def run_followup_pipeline(progress_callback=None) -> dict:
     return {"pipeline": "followup", "ok": ok, "failed": failed, "steps": results}
 
 
+def run_catalog_refresh(providers: list[str] | None = None, progress_callback=None) -> dict:
+    """Sync the shared job catalog (companies/jobs) from Greenhouse, Lever,
+    and Ashby's public APIs.
+
+    Unlike run_sourcing_pipeline, this writes to the SHARED catalog
+    (db.models.Company/Job -- no user_id), not per-user leads. It's meant
+    to be run on a schedule (Cloud Scheduler in production, per the
+    project's phased GCP plan) independent of any single user's session,
+    since the catalog is read by every user's matched-jobs feed.
+
+    Args:
+        providers: which connectors to run. Defaults to all three.
+        progress_callback: optional fn(step_label, status) for live progress.
+
+    Returns a summary dict with per-provider results.
+    """
+    print("\n" + "=" * 60)
+    print(f"  CATALOG REFRESH START  [{_now()}]")
+    print("=" * 60)
+
+    if providers is None:
+        providers = ["greenhouse", "lever", "ashby"]
+
+    cb = progress_callback
+    results = []
+
+    for provider in providers:
+        if provider == "greenhouse":
+            from skills.scrape_job_boards.greenhouse import run as greenhouse_run
+            results.append(_run_step("catalog:greenhouse", greenhouse_run, callback=cb))
+        elif provider == "lever":
+            from skills.scrape_job_boards.lever import run as lever_run
+            results.append(_run_step("catalog:lever", lever_run, callback=cb))
+        elif provider == "ashby":
+            from skills.scrape_job_boards.ashby import run as ashby_run
+            results.append(_run_step("catalog:ashby", ashby_run, callback=cb))
+        else:
+            print(f"  ⚠️  Unknown catalog provider '{provider}', skipping")
+
+    ok = sum(1 for r in results if r["status"] == "ok")
+    failed = sum(1 for r in results if r["status"] == "error")
+
+    print("\n" + "=" * 60)
+    print(f"  CATALOG REFRESH DONE  [{_now()}]")
+    print(f"  {ok} steps ok, {failed} failed")
+    print("=" * 60 + "\n")
+
+    return {"pipeline": "catalog_refresh", "ok": ok, "failed": failed, "steps": results}
+
+
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "sourcing"
     if which == "sourcing":
         run_sourcing_pipeline()
     elif which == "followups":
         run_followup_pipeline()
+    elif which == "catalog":
+        run_catalog_refresh()
     else:
-        print("Usage: python -m orchestrator.pipeline_runner [sourcing|followups]")
+        print("Usage: python -m orchestrator.pipeline_runner [sourcing|followups|catalog]")
 
 
 if __name__ == "__main__":

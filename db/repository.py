@@ -562,6 +562,19 @@ def get_or_create_company(name: str, domain: Optional[str] = None, ats_type: Opt
         return _to_dict(company)
 
 
+def mark_company_scraped(company_id: str) -> None:
+    """Stamp last_scraped_at=now on a company. Called by each ATS connector
+    after it finishes syncing a company's jobs, so a future catalog-refresh
+    job can tell which companies are stale without re-deriving that from
+    the jobs table's own updated_at timestamps.
+    """
+    with get_session() as session:
+        company = session.get(Company, company_id)
+        if company is not None:
+            company.last_scraped_at = datetime.now(timezone.utc)
+            session.flush()
+
+
 def add_job(company_id: str, source: str, external_id: str, title: str, **kwargs) -> Optional[dict]:
     """Add a job, deduped on (company_id, external_id). Returns None if the
     job already exists (idempotent re-scrape), the dict otherwise.

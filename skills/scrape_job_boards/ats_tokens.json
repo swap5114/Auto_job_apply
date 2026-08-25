@@ -1,0 +1,29 @@
+{
+  "_comment": "Seed list of known ATS board tokens, one per company, verified live against each provider's public API before being added here (see greenhouse.py/lever.py/ashby.py module docstrings for endpoint shapes). Add more over time as you discover new company tokens -- the token is the slug in the company's public careers URL (job-boards.greenhouse.io/{token}, jobs.lever.co/{token}, jobs.ashbyhq.com/{token}).",
+  "greenhouse": [
+    "stripe",
+    "airbnb",
+    "gitlab",
+    "figma",
+    "coinbase",
+    "robinhood",
+    "instacart",
+    "affirm",
+    "asana",
+    "reddit",
+    "cloudflare"
+  ],
+  "lever": [
+    "palantir",
+    "spotify"
+  ],
+  "ashby": [
+    "ramp",
+    "vanta",
+    "render",
+    "hackerone",
+    "notion",
+    "deepgram",
+    "coder"
+  ]
+}
