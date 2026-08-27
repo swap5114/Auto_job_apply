@@ -7,10 +7,16 @@ import { MarketingNav } from "@/components/marketing/marketing-nav";
 import { PillBadge } from "@/components/marketing/pill-badge";
 import { LogoCloud } from "@/components/marketing/logo-cloud";
 import { FeatureCards } from "@/components/marketing/feature-cards";
-import { HeroPreview } from "@/components/marketing/hero-preview";
+import { ResumeUploadWidget } from "@/components/marketing/resume-upload-widget";
 import { Footer } from "@/components/marketing/footer";
+import { useAuth } from "@/lib/auth-context";
 
 export default function LandingPage() {
+  // Signed-in visitors skip straight to the dashboard (Phase 3.5) --
+  // everyone else goes through /signin first.
+  const { user } = useAuth();
+  const primaryHref = user ? "/dashboard" : "/signin";
+
   return (
     <div className="relative min-h-screen">
       <MarketingNav />
@@ -63,7 +69,7 @@ export default function LandingPage() {
                 className="mt-8 flex flex-wrap items-center gap-3"
               >
                 <Link
-                  href="/dashboard"
+                  href={primaryHref}
                   className="inline-flex items-center gap-1.5 rounded-[10px] bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground shadow-button-brand transition-all hover:shadow-button-brand-hover active:shadow-button-brand-active"
                 >
                   Get started
@@ -88,9 +94,9 @@ export default function LandingPage() {
               </motion.p>
             </div>
 
-            {/* Right: product preview */}
+            {/* Right: real product demo -- upload a resume, see real matches */}
             <div className="lg:pl-8">
-              <HeroPreview />
+              <ResumeUploadWidget />
             </div>
           </div>
         </section>
@@ -119,10 +125,10 @@ export default function LandingPage() {
 
           <div className="mt-14 flex justify-center">
             <Link
-              href="/dashboard"
+              href={primaryHref}
               className="inline-flex items-center gap-1.5 rounded-[10px] bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground shadow-button-brand transition-all hover:shadow-button-brand-hover"
             >
-              Open the dashboard
+              {user ? "Open the dashboard" : "Get started"}
               <ChevronRight className="h-4 w-4" />
             </Link>
           </div>

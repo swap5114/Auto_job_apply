@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   LayoutDashboard,
@@ -13,11 +13,15 @@ import {
   Play,
   Loader2,
   Hammer,
+  UserRound,
+  LogOut,
+  Sparkles,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { api, type Stats } from "@/lib/api";
 import { usePipelineStatus } from "@/lib/use-pipeline-status";
 import { RunPipelineDialog } from "@/components/pipeline/run-pipeline-dialog";
+import { useAuth } from "@/lib/auth-context";
 
 export function TopBar() {
   const pathname = usePathname();
@@ -61,11 +65,21 @@ export function TopBar() {
 
   const navigation = [
     { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard, badge: null as number | null },
+    { name: "Matches", href: "/matches", icon: Sparkles, badge: null as number | null },
     { name: "Leads", href: "/leads", icon: FileText, badge: leadsBadge },
     { name: "Review", href: "/review", icon: CheckCircle2, badge: reviewBadge },
     { name: "Builds", href: "/builds", icon: Hammer, badge: null as number | null },
+    { name: "Profile", href: "/profile", icon: UserRound, badge: null as number | null },
     { name: "Settings", href: "/settings", icon: Settings, badge: null as number | null },
   ];
+
+  const { signOut } = useAuth();
+  const router = useRouter();
+
+  async function handleSignOut() {
+    await signOut();
+    router.replace("/");
+  }
 
   return (
     <motion.header
@@ -177,6 +191,14 @@ export function TopBar() {
             {running ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
             <span className="hidden sm:block">{running ? "Running" : "Run"}</span>
           </motion.button>
+
+          <button
+            onClick={handleSignOut}
+            title="Sign out"
+            className="flex h-9 w-9 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+          >
+            <LogOut className="h-4 w-4" />
+          </button>
         </div>
       </motion.div>
 

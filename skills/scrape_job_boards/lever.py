@@ -121,6 +121,7 @@ def sync_company(token: str) -> dict:
 
     added = 0
     skipped = 0
+    seen_external_ids = set()
 
     for job in jobs:
         external_id = job.get("id") or ""
@@ -129,6 +130,8 @@ def sync_company(token: str) -> dict:
             print(f"  ⚠️  lever:{token} -- skipping malformed posting (missing id/text): {job}")
             skipped += 1
             continue
+
+        seen_external_ids.add(external_id)
 
         result = repo.add_job(
             company["id"],
@@ -146,9 +149,17 @@ def sync_company(token: str) -> dict:
         else:
             skipped += 1
 
+    # See greenhouse.py's sync_company for why this runs even when jobs is
+    # an empty list (a real "0 open postings right now" response) but
+    # never on a fetch/parse failure.
+    closed = repo.close_unseen_jobs(company["id"], seen_external_ids)
+
     repo.mark_company_scraped(company["id"])
 
-    print(f"  ✅ lever:{token} ({company_name}) -- {added} new, {skipped} already known")
+    print(
+        f"  ✅ lever:{token} ({company_name}) -- {added} new, {skipped} already known"
+        + (f", {closed} closed" if closed else "")
+    )
     return {"token": token, "status": "ok", "added": added, "skipped": skipped, "error": None}
 
 

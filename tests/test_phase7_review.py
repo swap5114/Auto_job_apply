@@ -24,7 +24,7 @@ import os
 import unittest
 from unittest.mock import patch, MagicMock
 
-from graph.pipeline import build_pipeline_graph, get_checkpointer_connection
+from graph.pipeline import build_pipeline_graph, get_checkpointer_connection, make_thread_id
 from orchestrator.review_cli import (
     get_pending_review_leads,
     approve_lead,
@@ -33,6 +33,7 @@ from orchestrator.review_cli import (
 )
 
 TEST_DB_PATH = os.path.join("storage", "test_phase7_checkpoints.sqlite")
+TEST_USER_ID = "test-user-phase7"
 
 
 class TestPhase7Review(unittest.TestCase):
@@ -152,13 +153,18 @@ class TestPhase7Review(unittest.TestCase):
             },
         ]
 
-        # Start execution for all 3 leads -> each will interrupt at review node
+        # Start execution for all 3 leads -> each will interrupt at review
+        # node. Thread IDs are scoped by user_id (Phase 4.2), matching how
+        # feed_pending_leads/check_and_queue_followups construct them in
+        # production.
         for lead in leads_data:
-            config = {"configurable": {"thread_id": lead["lead_id"]}}
+            lead["user_id"] = TEST_USER_ID
+            thread_id = make_thread_id(TEST_USER_ID, lead["lead_id"])
+            config = {"configurable": {"thread_id": thread_id}}
             graph.invoke(lead, config)
 
         # Verify all 3 are paused at review node
-        pending = get_pending_review_leads(TEST_DB_PATH)
+        pending = get_pending_review_leads(TEST_USER_ID, checkpointer=cp)
         self.assertEqual(len(pending), 3)
         pending_ids = [item["lead_id"] for item in pending]
         self.assertIn("lead_001", pending_ids)
@@ -166,10 +172,11 @@ class TestPhase7Review(unittest.TestCase):
         self.assertIn("lead_003", pending_ids)
 
         # 1. Approve lead_001 -> should reach send_node, which is fully mocked
-        approve_success = approve_lead("lead_001", db_path=TEST_DB_PATH)
+        approve_success = approve_lead("lead_001", user_id=TEST_USER_ID, checkpointer=cp)
         self.assertTrue(approve_success)
 
-        state_001 = graph.get_state({"configurable": {"thread_id": "lead_001"}})
+        thread_001 = make_thread_id(TEST_USER_ID, "lead_001")
+        state_001 = graph.get_state({"configurable": {"thread_id": thread_001}})
         self.assertEqual(state_001.next, ())  # completed
         self.assertEqual(state_001.values.get("review_decision"), "approved")
         # With a mocked contact_email + mocked Gmail send, send_node reaches
@@ -180,26 +187,30 @@ class TestPhase7Review(unittest.TestCase):
 
         # 2. Edit lead_002 -> draft replaced, then approved, then sent (mocked)
         new_draft_002 = "Customized outreach draft for Data Inc AI Specialist"
-        edit_success = edit_lead("lead_002", new_draft=new_draft_002, db_path=TEST_DB_PATH)
+        edit_success = edit_lead(
+            "lead_002", new_draft=new_draft_002, user_id=TEST_USER_ID, checkpointer=cp
+        )
         self.assertTrue(edit_success)
 
-        state_002 = graph.get_state({"configurable": {"thread_id": "lead_002"}})
+        thread_002 = make_thread_id(TEST_USER_ID, "lead_002")
+        state_002 = graph.get_state({"configurable": {"thread_id": thread_002}})
         self.assertEqual(state_002.next, ())  # completed
         self.assertEqual(state_002.values.get("review_decision"), "approved")
         self.assertEqual(state_002.values.get("outreach_draft"), new_draft_002)
         self.assertIn(state_002.values.get("status"), ("sent", "draft_created"))
 
         # 3. Reject lead_003 -> rejected leads skip send_node entirely, go to END
-        reject_success = reject_lead("lead_003", db_path=TEST_DB_PATH)
+        reject_success = reject_lead("lead_003", user_id=TEST_USER_ID, checkpointer=cp)
         self.assertTrue(reject_success)
 
-        state_003 = graph.get_state({"configurable": {"thread_id": "lead_003"}})
+        thread_003 = make_thread_id(TEST_USER_ID, "lead_003")
+        state_003 = graph.get_state({"configurable": {"thread_id": thread_003}})
         self.assertEqual(state_003.next, ())  # completed
         self.assertEqual(state_003.values.get("review_decision"), "rejected")
         self.assertEqual(state_003.values.get("status"), "rejected")
 
         # Verify no pending leads remain
-        remaining_pending = get_pending_review_leads(TEST_DB_PATH)
+        remaining_pending = get_pending_review_leads(TEST_USER_ID, checkpointer=cp)
         self.assertEqual(len(remaining_pending), 0)
 
 

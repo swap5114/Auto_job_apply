@@ -13,15 +13,39 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Must match conftest.py's default -- see that file's comment for why this
+# is a dedicated "autoapply_test" database, never the real dev/prod one.
+# This module is the single most destructive one in the whole test suite
+# (DROP SCHEMA public CASCADE, twice per test run), so getting this default
+# wrong here specifically is the highest-risk version of the mistake.
 DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql+psycopg2://autoapply:autoapply@localhost:5432/autoapply"
+    "DATABASE_URL", "postgresql+psycopg2://autoapply:autoapply@localhost:5432/autoapply_test"
 )
 
 EXPECTED_TABLES = {
     "companies", "jobs", "users", "resumes", "search_criteria", "leads",
     "gmail_accounts", "subscriptions", "usage_counters", "enrichment_cache",
-    "research_cache", "notifications", "alembic_version",
+    "research_cache", "notifications", "pipeline_runs", "alembic_version",
 }
+
+
+def _assert_safe_to_wipe(database_url: str) -> None:
+    """Same guard as tests/conftest.py's -- this module is the most
+    destructive one in the whole suite (DROP SCHEMA public CASCADE, twice
+    per test run) and manages its own DB connection independent of
+    conftest.py's, so it needs its own copy of this check rather than
+    relying on conftest.py's import-time guard alone.
+    """
+    db_name = database_url.rsplit("/", 1)[-1].split("?", 1)[0]
+    if "test" not in db_name.lower():
+        raise RuntimeError(
+            f"Refusing to run migration tests against database '{db_name}' -- "
+            f"this module runs DROP SCHEMA public CASCADE. Point DATABASE_URL "
+            f"at a dedicated test database (e.g. 'autoapply_test')."
+        )
+
+
+_assert_safe_to_wipe(DATABASE_URL)
 
 
 def _run_alembic(*args):

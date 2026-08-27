@@ -341,7 +341,15 @@ Edit `config/schedule.json` to change cron times, timezone, enabled jobs, or the
 
 1. `python -m venv venv` and activate it, then `pip install -r requirements.txt`.
 2. Start Postgres locally: `docker compose up -d db` (see `docker-compose.yml`). Then run migrations: `python -m alembic upgrade head` (reads `DATABASE_URL` from `config/.env`, falling back to the local docker-compose instance if unset).
-3. Copy `config/.env.example` to `config/.env` and fill in:
+3. Create a dedicated test database and run migrations against it too:
+   `docker exec autoapply-db psql -U autoapply -d autoapply -c "CREATE DATABASE autoapply_test;"`,
+   then `DATABASE_URL=postgresql+psycopg2://autoapply:autoapply@localhost:5432/autoapply_test python -m alembic upgrade head`.
+   **Do this before running `pytest` for the first time.** `tests/conftest.py` drops/truncates
+   tables and `tests/test_migrations.py` runs `DROP SCHEMA public CASCADE` — both default to
+   `autoapply_test`, never the real `autoapply` dev database, specifically so a normal `pytest`
+   run can never wipe real local data. A safety check in both files refuses to run if
+   `DATABASE_URL` doesn't point at a database with "test" in its name.
+4. Copy `config/.env.example` to `config/.env` and fill in:
    - **Database:** `DATABASE_URL` (defaults to the local docker-compose Postgres if unset — see `db/session.py`)
    - **Single-user bootstrap:** `LOCAL_USER_FIREBASE_UID`, `LOCAL_USER_EMAIL` (optional — sensible defaults exist; see `db/current_user.py`)
    - **LLM Backend:** Choose one via `MODEL_BACKEND=claude` or `MODEL_BACKEND=gemini`
@@ -350,7 +358,7 @@ Edit `config/schedule.json` to change cron times, timezone, enabled jobs, or the
    - **APIs:** `APOLLO_API_KEY` (email discovery, primary), `HUNTER_API_KEY` (email discovery, fallback), `SORSA_API_KEY` (X scraping, primary), `GETX_API_KEY` (X scraping fallback), `FIRECRAWL_API_KEY` (web scraping)
    - **Gmail (Phase 8):** `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET` (from Google Cloud Console OAuth2 credentials), `gmail_credentials.json`, `gmail_token.json` (auto-generated on first OAuth flow)
    - **Scheduler (Phase 10b):** `ENABLE_SCHEDULER=true` to start the cron scheduler with the API (default off)
-4. `config/base_resume.json` and `config/search_criteria.json` are already checked in — edit them to match your own resume and search preferences.
+5. `config/base_resume.json` and `config/search_criteria.json` are already checked in — edit them to match your own resume and search preferences.
 
 **API Credits Status (as of testing):**
 - Apollo.io: active, org enrichment + people match functional

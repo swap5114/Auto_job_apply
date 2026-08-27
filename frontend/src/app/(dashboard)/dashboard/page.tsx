@@ -1,9 +1,11 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { motion } from "framer-motion";
 import {
   ArrowUpRight,
+  ArrowRight,
   Briefcase,
   Globe,
   Twitter,
@@ -15,6 +17,7 @@ import {
   Clock,
   Loader2,
   RefreshCw,
+  Sparkles,
 } from "lucide-react";
 import { Header } from "@/components/layout/header";
 import { PageTransition } from "@/components/layout/page-transition";
@@ -44,6 +47,73 @@ function Panel({ className = "", children }: { className?: string; children: Rea
     <div className={`rounded-2xl border border-border/70 bg-card shadow-card ${className}`}>
       {children}
     </div>
+  );
+}
+
+/**
+ * First-run welcome moment (shown only while the account has zero leads).
+ * Immediately fetches the caller's matched-jobs count so a brand-new
+ * signed-in user sees a real number within a second or two of landing on
+ * the dashboard, instead of a wall of empty charts -- this is the "wow in
+ * the first 30-60 seconds" moment: real, ranked matches already waiting,
+ * one click away.
+ */
+function WelcomeBanner() {
+  const [matchCount, setMatchCount] = useState<number | null>(null);
+  const [hasCriteria, setHasCriteria] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    Promise.all([
+      api.jobs.matched().catch(() => []),
+      api.profile.getSearchCriteria().then(() => true).catch(() => false),
+    ]).then(([matches, criteria]) => {
+      if (!active) return;
+      setMatchCount(matches.length);
+      setHasCriteria(criteria);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.5 }}
+      className="relative overflow-hidden rounded-2xl border border-border/70 bg-card p-6 shadow-card"
+    >
+      <div className="pointer-events-none absolute -right-16 -top-16 h-56 w-56 rounded-full accent-gradient opacity-[0.08] blur-2xl" />
+      <div className="relative flex flex-col items-start justify-between gap-4 sm:flex-row sm:items-center">
+        <div>
+          <div className="mb-2 inline-flex items-center gap-1.5 rounded-full bg-accent1/10 px-2.5 py-1 text-xs font-medium text-accent1">
+            <Sparkles className="h-3 w-3" />
+            Welcome to AutoApply
+          </div>
+          <h2 className="font-display text-xl text-foreground">
+            {hasCriteria === false
+              ? "Set up your profile to see your matches"
+              : matchCount === null
+                ? "Finding your matches…"
+                : matchCount > 0
+                  ? `${matchCount} role${matchCount === 1 ? "" : "s"} in the catalog match your profile`
+                  : "No matches yet — broaden your search criteria"}
+          </h2>
+          <p className="mt-1.5 max-w-md text-sm text-muted-foreground">
+            {hasCriteria === false
+              ? "Add your target roles and tech stack (or upload a resume) and we'll match you against every job already in the catalog."
+              : "Save the ones worth pursuing, and we'll tailor a resume, draft outreach, or both — you approve everything before it goes out."}
+          </p>
+        </div>
+        <Button asChild size="lg" className="shrink-0">
+          <Link href={hasCriteria === false ? "/profile" : "/matches"}>
+            {hasCriteria === false ? "Set up profile" : "View matches"}
+            <ArrowRight className="ml-1.5 h-4 w-4" />
+          </Link>
+        </Button>
+      </div>
+    </motion.div>
   );
 }
 
@@ -150,6 +220,7 @@ export default function DashboardPage() {
             : statusVerb(l.status),
         meta: l.role || l.source,
         date: l.posted_date || "",
+        channel: l.channel || [],
       }));
   }, [leads]);
 
@@ -185,6 +256,8 @@ export default function DashboardPage() {
         </div>
       ) : (
         <div className="space-y-4 pb-16">
+          {leads.length === 0 && <WelcomeBanner />}
+
           {approvedNoEmailCount > 0 && (
             <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
               {approvedNoEmailCount} approved lead{approvedNoEmailCount > 1 ? "s have" : " has"} no
@@ -345,7 +418,17 @@ export default function DashboardPage() {
                         <span className="absolute left-1 h-2.5 w-2.5 rounded-full bg-accent1 ring-4 ring-card" />
                         <div className="flex-1">
                           <p className="text-sm text-foreground">{a.text}</p>
-                          <p className="text-xs text-muted-foreground">{a.meta}</p>
+                          <div className="flex items-center gap-1.5">
+                            <p className="text-xs text-muted-foreground">{a.meta}</p>
+                            {a.channel.map((ch) => (
+                              <span
+                                key={ch}
+                                className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium capitalize text-muted-foreground"
+                              >
+                                {ch}
+                              </span>
+                            ))}
+                          </div>
                         </div>
                         <span className="whitespace-nowrap text-xs tabular-nums text-muted-foreground">
                           {a.date}

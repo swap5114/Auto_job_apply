@@ -26,6 +26,7 @@ from sqlalchemy import (
     CheckConstraint,
     Column,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -88,11 +89,26 @@ class Job(Base):
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
 
+    # Freshness/still-open tracking (added after launch -- before this, a
+    # job that got filled/pulled from the company's live board just sat in
+    # the catalog forever, matchable, with a dead apply_url). Each ATS
+    # connector's sync_company() stamps last_seen_at = now() on every job
+    # its provider's API STILL returns on a given sync; add_job's dedup
+    # path (existing job, same external_id) does the same stamp on the
+    # re-scrape, not just on first insert. is_open flips to False the
+    # moment a full sync of that company completes and a previously-seen
+    # job's external_id did NOT show up in that sync's response --i.e. the
+    # company's own board is the source of truth, this only reflects what
+    # it just said.
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)
+    is_open = Column(Boolean, nullable=False, default=True)
+
     company = relationship("Company", back_populates="jobs")
 
     __table_args__ = (
         UniqueConstraint("company_id", "external_id", name="uq_jobs_company_external_id"),
         Index("ix_jobs_source", "source"),
+        Index("ix_jobs_is_open", "is_open"),
     )
 
 
@@ -118,6 +134,7 @@ class User(Base):
     subscriptions = relationship("Subscription", back_populates="user", cascade="all, delete-orphan")
     usage_counters = relationship("UsageCounter", back_populates="user", cascade="all, delete-orphan")
     notifications = relationship("Notification", back_populates="user", cascade="all, delete-orphan")
+    pipeline_runs = relationship("PipelineRun", back_populates="user", cascade="all, delete-orphan")
 
 
 class Resume(Base):
@@ -208,6 +225,13 @@ class Lead(Base):
     # the lead's overall pipeline stage.
     review_decision = Column(String, nullable=True)
 
+    # ATS keyword coverage % for the tailored resume (Phase 5.5) --
+    # skills/tailor_resume.py's keyword_coverage(), a rough directional
+    # signal, not a real ATS simulation. "sane," not "enforced" per the
+    # plan's own wording: this is surfaced to the reviewer, never used to
+    # block approval.
+    keyword_coverage = Column(Float, nullable=True)
+
     applied_at = Column(DateTime(timezone=True), nullable=True)
     sent_at = Column(DateTime(timezone=True), nullable=True)
     last_checked = Column(DateTime(timezone=True), nullable=True)
@@ -283,6 +307,38 @@ class UsageCounter(Base):
 
     __table_args__ = (
         UniqueConstraint("user_id", "period", name="uq_usage_counters_user_period"),
+    )
+
+
+class PipelineRun(Base):
+    """Tracks the on-demand "Run Pipeline" background job (Phase 10b's
+    dashboard button, run via orchestrator.pipeline_runner) per user.
+
+    Phase 4 replaces api/main.py's single global `_pipeline_run_state`
+    dict + `_pipeline_lock` (a correctness bug: two different signed-in
+    users triggering a run at the same time collided on one shared dict,
+    and a spurious 409 on the second call) with rows here, one per run,
+    scoped by user_id. This also closes the "why does a run's status
+    disappear on an API restart / wouldn't be shared by a second replica"
+    gap for free, since the row -- not an in-process dict -- is now the
+    system of record /api/pipeline/run-status reads from.
+    """
+    __tablename__ = "pipeline_runs"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String, nullable=False, default="running")  # running | completed | failed
+    current_step = Column(String, nullable=True)
+    steps = Column(JSONB, nullable=False, default=list)  # [{step, status}]
+    summary = Column(JSONB, nullable=True)
+    error = Column(Text, nullable=True)
+    started_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User", back_populates="pipeline_runs")
+
+    __table_args__ = (
+        Index("ix_pipeline_runs_user_started", "user_id", "started_at"),
     )
 
 

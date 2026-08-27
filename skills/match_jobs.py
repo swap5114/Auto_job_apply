@@ -54,6 +54,20 @@ def score_job(job: dict, criteria: dict) -> int:
     return tech_matches + role_matches
 
 
+def matched_signals(job: dict, criteria: dict) -> list[str]:
+    """The actual tech-stack/role keywords (original casing, as given in
+    criteria -- not lowercased) that matched for this one job. Mirrors
+    score_job's exact matching logic (same _contains_keyword whole-word
+    check) so a caller can show *why* a job matched -- e.g. a "Python,
+    FastAPI" chip row on a matched-jobs card -- without the two functions
+    ever silently drifting apart on what counts as a match.
+    """
+    text = _job_text(job)
+    matches = [kw for kw in criteria.get("tech_stack", []) if _contains_keyword(text, kw)]
+    matches += [kw for kw in criteria.get("roles", []) if _contains_keyword(text, kw)]
+    return matches
+
+
 def _is_seniority_mismatch(job: dict, criteria: dict) -> bool:
     """An entry_to_mid candidate's feed shouldn't be dominated by
     Staff/Principal/Director postings -- exclude them. A 'senior'-inferred

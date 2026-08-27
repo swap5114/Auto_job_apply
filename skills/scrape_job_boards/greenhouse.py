@@ -146,6 +146,7 @@ def sync_company(token: str) -> dict:
 
     added = 0
     skipped = 0
+    seen_external_ids = set()
 
     for job in jobs:
         external_id = str(job.get("id") or "")
@@ -154,6 +155,8 @@ def sync_company(token: str) -> dict:
             print(f"  ⚠️  greenhouse:{token} -- skipping malformed job entry (missing id/title): {job}")
             skipped += 1
             continue
+
+        seen_external_ids.add(external_id)
 
         result = repo.add_job(
             company["id"],
@@ -171,9 +174,20 @@ def sync_company(token: str) -> dict:
         else:
             skipped += 1  # already in the catalog from a previous sync
 
+    # This response is the company's full current set of open postings --
+    # anything previously catalogued for this company but absent here has
+    # been filled or pulled. Only run this when the fetch actually
+    # succeeded with a real (possibly empty) jobs list, never on a
+    # malformed/missing entry -- a partial parse failure must never look
+    # like "this company has zero open jobs now."
+    closed = repo.close_unseen_jobs(company["id"], seen_external_ids)
+
     repo.mark_company_scraped(company["id"])
 
-    print(f"  ✅ greenhouse:{token} ({company_name}) -- {added} new, {skipped} already known")
+    print(
+        f"  ✅ greenhouse:{token} ({company_name}) -- {added} new, {skipped} already known"
+        + (f", {closed} closed" if closed else "")
+    )
     return {"token": token, "status": "ok", "added": added, "skipped": skipped, "error": None}
 
 

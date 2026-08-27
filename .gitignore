@@ -7,6 +7,7 @@ __pycache__/
 config/credentials.json
 config/gmail_credentials.json
 config/gmail_token.json
+config/firebase-service-account.json
 storage/checkpoints.sqlite
 storage/test_*.sqlite
 resumes

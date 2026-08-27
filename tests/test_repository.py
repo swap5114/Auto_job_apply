@@ -326,6 +326,81 @@ def test_add_job_dedups_on_company_and_external_id():
     assert len(jobs) == 1
 
 
+def test_add_job_stamps_last_seen_at_and_is_open_on_insert():
+    company = repo.get_or_create_company("Acme", ats_type="greenhouse", ats_token="acme-fresh")
+    job = repo.add_job(company["id"], "greenhouse", "ext-fresh-1", "Backend Engineer")
+    assert job["is_open"] is True
+    assert job["last_seen_at"] is not None
+
+
+def test_add_job_restamps_last_seen_at_on_rescrape():
+    """A job that's still returned by the company's live API on a later
+    sync must get its last_seen_at bumped, and is_open re-confirmed True
+    -- even if it had been marked closed in between (e.g. briefly pulled
+    then relisted)."""
+    company = repo.get_or_create_company("Acme", ats_type="greenhouse", ats_token="acme-restamp")
+    repo.add_job(company["id"], "greenhouse", "ext-restamp-1", "Backend Engineer")
+
+    # Simulate it having been closed by an intervening sync.
+    repo.close_unseen_jobs(company["id"], seen_external_ids=set())
+    closed = repo.get_jobs(company["id"])[0]
+    assert closed["is_open"] is False
+
+    # Now it shows up again on a fresh sync.
+    result = repo.add_job(company["id"], "greenhouse", "ext-restamp-1", "Backend Engineer")
+    assert result is None  # still a dedup hit, not a new row
+
+    reopened = repo.get_jobs(company["id"])[0]
+    assert reopened["is_open"] is True
+
+
+def test_close_unseen_jobs_marks_missing_jobs_closed():
+    company = repo.get_or_create_company("Acme", ats_type="greenhouse", ats_token="acme-close")
+    repo.add_job(company["id"], "greenhouse", "ext-still-open", "Still Open Role")
+    repo.add_job(company["id"], "greenhouse", "ext-now-closed", "Now Closed Role")
+
+    closed_count = repo.close_unseen_jobs(company["id"], seen_external_ids={"ext-still-open"})
+    assert closed_count == 1
+
+    jobs = {j["external_id"]: j for j in repo.get_jobs(company["id"])}
+    assert jobs["ext-still-open"]["is_open"] is True
+    assert jobs["ext-now-closed"]["is_open"] is False
+
+
+def test_close_unseen_jobs_never_reopens_anything():
+    """close_unseen_jobs only ever closes -- it must never flip an
+    already-closed job back to open just because it wasn't in this
+    particular seen_external_ids set (that's add_job's job, on a real
+    re-scrape hit)."""
+    company = repo.get_or_create_company("Acme", ats_type="greenhouse", ats_token="acme-noreopen")
+    repo.add_job(company["id"], "greenhouse", "ext-a", "Role A")
+    repo.close_unseen_jobs(company["id"], seen_external_ids=set())
+
+    already_closed = repo.get_jobs(company["id"])[0]
+    assert already_closed["is_open"] is False
+
+    # Calling it again with the job "seen" this time must not touch it --
+    # only add_job re-opens.
+    closed_count = repo.close_unseen_jobs(company["id"], seen_external_ids={"ext-a"})
+    assert closed_count == 0
+    still_closed = repo.get_jobs(company["id"])[0]
+    assert still_closed["is_open"] is False
+
+
+def test_get_jobs_open_only_filters_closed_jobs():
+    company = repo.get_or_create_company("Acme", ats_type="greenhouse", ats_token="acme-openonly")
+    repo.add_job(company["id"], "greenhouse", "ext-open", "Open Role")
+    repo.add_job(company["id"], "greenhouse", "ext-closed", "Closed Role")
+    repo.close_unseen_jobs(company["id"], seen_external_ids={"ext-open"})
+
+    all_jobs = repo.get_jobs(company["id"])
+    open_jobs = repo.get_jobs(company["id"], open_only=True)
+
+    assert len(all_jobs) == 2
+    assert len(open_jobs) == 1
+    assert open_jobs[0]["external_id"] == "ext-open"
+
+
 # ---------------------------------------------------------------------------
 # Shared caches
 # ---------------------------------------------------------------------------
@@ -346,3 +421,22 @@ def test_research_cache_roundtrip():
     repo.set_cached_research(job["id"], {"overview": "A widget company"})
     cached = repo.get_cached_research(job["id"])
     assert cached["result_json"]["overview"] == "A widget company"
+
+
+def test_get_job_with_company_returns_company_name():
+    company = repo.get_or_create_company("Repo Test Co", ats_type="greenhouse", ats_token="repo-test-co")
+    job = repo.add_job(company["id"], "greenhouse", "ext-repo-1", "Backend Engineer", apply_url="https://example.com/apply/1")
+
+    result = repo.get_job_with_company(job["id"])
+    assert result is not None
+    assert result["company_name"] == "Repo Test Co"
+    assert result["apply_url"] == "https://example.com/apply/1"
+    assert result["title"] == "Backend Engineer"
+
+
+def test_get_job_with_company_unknown_id_returns_none():
+    assert repo.get_job_with_company("00000000-0000-0000-0000-000000000000") is None
+
+
+def test_get_job_with_company_malformed_id_returns_none_not_error():
+    assert repo.get_job_with_company("not-a-uuid") is None

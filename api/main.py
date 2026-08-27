@@ -32,8 +32,9 @@ from datetime import datetime, timezone
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 # Add project root to path so we can import existing modules
@@ -41,7 +42,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from db import repository as repo
-from db.current_user import get_current_user_id
+from api.auth import get_authenticated_user_id
 from api.rate_limit import get_client_ip, preview_limiter, resume_upload_limiter
 
 
@@ -78,10 +79,23 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — allow frontend dev server
+# CORS — allow frontend dev server (and, in prod, whatever origins are
+# configured via ALLOWED_ORIGINS so a code change isn't needed to add the
+# deployed frontend's origin later).
+#
+# ALLOWED_ORIGINS (config/.env): comma-separated list of origins, e.g.
+#   ALLOWED_ORIGINS=https://app.example.com,https://staging.example.com
+# Falls back to localhost dev if unset -- this preserves today's behavior
+# for anyone who hasn't added the new env var yet.
+_allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "").strip()
+if _allowed_origins_env:
+    ALLOWED_ORIGINS = [o.strip() for o in _allowed_origins_env.split(",") if o.strip()]
+else:
+    ALLOWED_ORIGINS = ["http://localhost:3000"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -111,6 +125,14 @@ class LeadResponse(BaseModel):
     posted_date: str
     domain: str
     review_decision: str
+    # Phase 5 additions. channel is a real list[str] (not the all-strings
+    # convention every other field here follows) since it's genuinely a
+    # small array -- the frontend needs it as one to render per-channel
+    # badges (5.4), not a stringified Python list repr.
+    channel: list[str] = []
+    cover_note: str = ""
+    applied_at: str = ""
+    job_id: str = ""
 
 
 class StatsResponse(BaseModel):
@@ -127,6 +149,20 @@ class StatsResponse(BaseModel):
 
 class EditRequest(BaseModel):
     outreach_draft: str
+
+
+class EditCoverNoteRequest(BaseModel):
+    cover_note: str
+
+
+class SaveJobRequest(BaseModel):
+    """Which channel(s) to create the lead for -- a signed-in user acting
+    on a matched catalog job (Phase 5.3) may want apply only, outreach
+    only, or both. Defaults to both since that's this channel's headline
+    scenario (the plan's own "a lead can be both apply and outreach at
+    once" framing).
+    """
+    channel: list[str] = ["apply", "outreach"]
 
 
 class DemoProjectResponse(BaseModel):
@@ -250,33 +286,44 @@ class DemoBuildSummary(BaseModel):
 # one Postgres read instead of N. Less critical than it was for Sheets (no
 # hard read-quota to worry about with Postgres), but still avoids redundant
 # round-trips within the same page load.
+#
+# Keyed by user_id (Phase 3): pre-auth this only ever served the single
+# local operator, so a bare {data, ts} dict was safe. Now that requests
+# carry a real per-request user_id, the cache MUST be keyed per-user --
+# otherwise user A's leads could be served to user B for up to _LEADS_TTL
+# seconds after A's request warms the cache.
 _LEADS_TTL = 8  # seconds
-_leads_cache: dict = {"data": None, "ts": 0.0}
+_leads_cache: dict[str, dict] = {}  # user_id -> {"data": [...], "ts": float}
 _leads_cache_lock = threading.Lock()
 
 
-def _get_all_leads_cached(force: bool = False) -> list[dict]:
-    """Return all leads for the current (single) user, served from an
-    in-memory cache when fresh.
-    """
+def _get_all_leads_cached(user_id: str, force: bool = False) -> list[dict]:
+    """Return all leads for user_id, served from an in-memory cache when fresh."""
     now = time.monotonic()
     with _leads_cache_lock:
-        if not force and _leads_cache["data"] is not None and (now - _leads_cache["ts"]) < _LEADS_TTL:
-            return _leads_cache["data"]
+        entry = _leads_cache.get(user_id)
+        if not force and entry is not None and (now - entry["ts"]) < _LEADS_TTL:
+            return entry["data"]
 
-    user_id = get_current_user_id()
     data = repo.get_leads(user_id)
     with _leads_cache_lock:
-        _leads_cache["data"] = data
-        _leads_cache["ts"] = time.monotonic()
+        _leads_cache[user_id] = {"data": data, "ts": time.monotonic()}
     return data
 
 
-def _invalidate_leads_cache():
-    """Drop the cached leads so the next read re-fetches from Postgres."""
+def _invalidate_leads_cache(user_id: Optional[str] = None):
+    """Drop cached leads so the next read re-fetches from Postgres.
+
+    With no user_id, clears every tenant's cache entry (used by call sites
+    that don't have a specific user_id in scope, e.g. background pipeline
+    workers) -- clearing more than necessary is always safe, just costs an
+    extra Postgres read on the next request.
+    """
     with _leads_cache_lock:
-        _leads_cache["data"] = None
-        _leads_cache["ts"] = 0.0
+        if user_id is None:
+            _leads_cache.clear()
+        else:
+            _leads_cache.pop(user_id, None)
 
 
 def _get_search_criteria_path():
@@ -342,13 +389,20 @@ def _lead_to_response(lead: dict) -> LeadResponse:
         posted_date=s(lead.get("posted_date")),
         domain=s(lead.get("domain")),
         review_decision=s(lead.get("review_decision")),
+        channel=lead.get("channel") or [],
+        cover_note=s(lead.get("cover_note")),
+        applied_at=s(lead.get("applied_at")),
+        job_id=s(lead.get("job_id")),
     )
 
 
 @app.get("/api/leads", response_model=list[LeadResponse])
-def list_leads(status: Optional[str] = Query(None, description="Filter by status")):
+def list_leads(
+    status: Optional[str] = Query(None, description="Filter by status"),
+    user_id: str = Depends(get_authenticated_user_id),
+):
     """List all leads, optionally filtered by status (served from TTL cache)."""
-    leads = _get_all_leads_cached()
+    leads = _get_all_leads_cached(user_id)
     if status:
         leads = [l for l in leads if str(l.get("status", "")).strip() == status]
 
@@ -356,9 +410,9 @@ def list_leads(status: Optional[str] = Query(None, description="Filter by status
 
 
 @app.get("/api/leads/{lead_id}", response_model=LeadResponse)
-def get_lead(lead_id: str):
+def get_lead(lead_id: str, user_id: str = Depends(get_authenticated_user_id)):
     """Get a single lead by ID (served from TTL cache)."""
-    leads = _get_all_leads_cached()
+    leads = _get_all_leads_cached(user_id)
     lead = next((l for l in leads if str(l.get("id", "")) == lead_id), None)
 
     if not lead:
@@ -367,22 +421,109 @@ def get_lead(lead_id: str):
     return _lead_to_response(lead)
 
 
+@app.get("/api/leads/{lead_id}/resume-pdf")
+def get_lead_resume_pdf(lead_id: str, user_id: str = Depends(get_authenticated_user_id)):
+    """Serve the tailored resume PDF for a lead (Phase 5.4's apply-channel
+    review UI needs a real preview/download link, not just the filename
+    text the outreach review page already shows). Tenant-scoped: the
+    lookup goes through the caller's own leads, same as get_lead, so a
+    user can't fetch another tenant's resume PDF by guessing a lead_id.
+    """
+    leads = _get_all_leads_cached(user_id)
+    lead = next((l for l in leads if str(l.get("id", "")) == lead_id), None)
+    if not lead:
+        raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
+
+    resume_version = (lead.get("resume_version") or "").strip()
+    if not resume_version:
+        raise HTTPException(status_code=404, detail="No tailored resume for this lead yet")
+
+    from skills.tailor_resume import RESUMES_DIR
+    pdf_path = os.path.join(RESUMES_DIR, f"{resume_version}.pdf")
+    if not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="Tailored resume PDF file not found on disk")
+
+    return FileResponse(pdf_path, media_type="application/pdf", filename=f"{resume_version}.pdf")
+
+
+@app.post("/api/jobs/{job_id}/save", response_model=LeadResponse)
+def save_job_as_lead(
+    job_id: str,
+    body: SaveJobRequest = SaveJobRequest(),
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Create a per-user Lead from a shared-catalog Job (Phase 5.3).
+
+    This is the job-to-lead conversion path that didn't exist anywhere in
+    the codebase before this phase -- the ATS catalog connectors
+    (skills/scrape_job_boards/{greenhouse,lever,ashby}.py) only ever write
+    to the shared companies/jobs tables, never to a per-user Lead. This
+    route is what a signed-in user acting on one of their matched catalog
+    jobs (the anonymous /api/anon/resume feed's matched_jobs, or a future
+    signed-in equivalent) actually calls to turn that job into a lead they
+    can act on.
+
+    Explicitly sets job_id (the FK back to the catalog row) and
+    listing_url = job.apply_url -- the literal deep link the Apply
+    channel exists to hand the user. This is the one thing this route
+    must never get wrong: listing_url is not optional/best-effort here,
+    it is copied straight from the catalog job's own apply_url.
+    """
+    job = repo.get_job_with_company(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    try:
+        lead = repo.add_lead(user_id, {
+            "job_id": job["id"],
+            "channel": body.channel,
+            "source": job.get("source"),
+            "company": job.get("company_name") or "",
+            "role": job.get("title") or "",
+            "jd_text": job.get("jd_text") or "",
+            "listing_url": job.get("apply_url") or "",
+            "status": "matched",
+        })
+    except repo.DuplicateLeadError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except repo.ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    _invalidate_leads_cache(user_id)
+    return _lead_to_response(lead)
+
+
 @app.post("/api/leads/{lead_id}/approve")
-def approve_lead(lead_id: str):
+def approve_lead(
+    lead_id: str,
+    channel: Optional[str] = Query(
+        None, description="Which channel's review thread to approve, for leads paused on both"
+    ),
+    user_id: str = Depends(get_authenticated_user_id),
+):
     """Approve a lead.
 
     Tries to resume the LangGraph review checkpoint first (this is what
-    actually drives the pipeline forward into send_node); if the lead
-    isn't currently paused in the graph (e.g. it was added directly, never
-    fed through feed_graph), falls back to a plain Postgres status update
-    so the dashboard button still works either way.
-    """
-    user_id = get_current_user_id()
+    actually drives the pipeline forward into send_node for outreach); if
+    the lead isn't currently paused in the graph (e.g. it was added
+    directly, never fed through feed_graph), falls back to a plain
+    Postgres status update so the dashboard button still works either way.
 
+    channel (Phase 5.2, optional): for a lead paused on both channels'
+    threads at once, disambiguates which one this approval targets. Left
+    unset, orchestrator.review_cli's own resolution order applies
+    (outreach preferred when both are paused) -- existing callers that
+    never knew about channels keep working unchanged; the apply review UI
+    (5.4) always passes channel="apply" explicitly. The direct-update
+    fallback below has no thread to resolve, so it always writes
+    "approved"/"approved" regardless of channel -- a lead reaching that
+    fallback was never fed into the graph in the first place, so there's
+    no channel-specific "ready_to_apply" distinction to make.
+    """
     try:
         from orchestrator.review_cli import approve_lead as _approve
-        if _approve(lead_id):
-            _invalidate_leads_cache()
+        if _approve(lead_id, user_id=user_id, channel=channel):
+            _invalidate_leads_cache(user_id)
             return {"status": "approved", "lead_id": lead_id, "via": "graph"}
     except Exception as e:
         print(f"  approve via graph failed ({e}), falling back to direct update")
@@ -391,19 +532,27 @@ def approve_lead(lead_id: str):
         repo.update_lead(user_id, lead_id, {"status": "approved", "review_decision": "approved"})
     except repo.NotFoundError:
         raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
-    _invalidate_leads_cache()
+    _invalidate_leads_cache(user_id)
     return {"status": "approved", "lead_id": lead_id, "via": "direct"}
 
 
 @app.post("/api/leads/{lead_id}/reject")
-def reject_lead(lead_id: str):
-    """Reject a lead (graph resume, or direct Postgres update fallback)."""
-    user_id = get_current_user_id()
+def reject_lead(
+    lead_id: str,
+    channel: Optional[str] = Query(
+        None, description="Which channel's review thread to reject, for leads paused on both"
+    ),
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Reject a lead (graph resume, or direct Postgres update fallback).
 
+    See approve_lead's docstring for the channel param's contract --
+    identical here.
+    """
     try:
         from orchestrator.review_cli import reject_lead as _reject
-        if _reject(lead_id):
-            _invalidate_leads_cache()
+        if _reject(lead_id, user_id=user_id, channel=channel):
+            _invalidate_leads_cache(user_id)
             return {"status": "rejected", "lead_id": lead_id, "via": "graph"}
     except Exception as e:
         print(f"  reject via graph failed ({e}), falling back to direct update")
@@ -412,19 +561,25 @@ def reject_lead(lead_id: str):
         repo.update_lead(user_id, lead_id, {"status": "rejected", "review_decision": "rejected"})
     except repo.NotFoundError:
         raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
-    _invalidate_leads_cache()
+    _invalidate_leads_cache(user_id)
     return {"status": "rejected", "lead_id": lead_id, "via": "direct"}
 
 
 @app.post("/api/leads/{lead_id}/edit")
-def edit_lead(lead_id: str, body: EditRequest):
-    """Edit outreach draft and approve the lead (graph resume, or direct fallback)."""
-    user_id = get_current_user_id()
+def edit_lead(lead_id: str, body: EditRequest, user_id: str = Depends(get_authenticated_user_id)):
+    """Edit outreach draft and approve the lead (graph resume, or direct fallback).
 
+    Outreach-channel only -- see edit_apply_lead below for the apply
+    channel's cover-note equivalent. Kept as two distinct routes with two
+    distinct request bodies (outreach_draft vs cover_note) rather than one
+    route branching on a field name, since the two artifacts are shaped
+    differently enough that one shared payload would be harder to read,
+    not easier (per PHASE_5_PLAN.md 5.3's own guidance on this).
+    """
     try:
         from orchestrator.review_cli import edit_lead as _edit
-        if _edit(lead_id, body.outreach_draft):
-            _invalidate_leads_cache()
+        if _edit(lead_id, body.outreach_draft, user_id=user_id, channel="outreach"):
+            _invalidate_leads_cache(user_id)
             return {"status": "approved", "lead_id": lead_id, "draft_updated": True, "via": "graph"}
     except Exception as e:
         print(f"  edit via graph failed ({e}), falling back to direct update")
@@ -437,14 +592,66 @@ def edit_lead(lead_id: str, body: EditRequest):
         })
     except repo.NotFoundError:
         raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
-    _invalidate_leads_cache()
+    _invalidate_leads_cache(user_id)
     return {"status": "approved", "lead_id": lead_id, "draft_updated": True, "via": "direct"}
 
 
+@app.post("/api/leads/{lead_id}/edit-cover-note")
+def edit_apply_lead(
+    lead_id: str, body: EditCoverNoteRequest, user_id: str = Depends(get_authenticated_user_id)
+):
+    """Edit the apply-channel's cover note and approve the lead (graph
+    resume, or direct fallback). Apply-channel counterpart to edit_lead.
+    """
+    try:
+        from orchestrator.review_cli import edit_apply_lead as _edit
+        if _edit(lead_id, body.cover_note, user_id=user_id):
+            _invalidate_leads_cache(user_id)
+            return {"status": "ready_to_apply", "lead_id": lead_id, "cover_note_updated": True, "via": "graph"}
+    except Exception as e:
+        print(f"  edit-cover-note via graph failed ({e}), falling back to direct update")
+
+    try:
+        repo.update_lead(user_id, lead_id, {
+            "status": "ready_to_apply",
+            "cover_note": body.cover_note,
+            "review_decision": "edited",
+        })
+    except repo.NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
+    _invalidate_leads_cache(user_id)
+    return {"status": "ready_to_apply", "lead_id": lead_id, "cover_note_updated": True, "via": "direct"}
+
+
+@app.post("/api/leads/{lead_id}/mark-applied")
+def mark_applied(lead_id: str, user_id: str = Depends(get_authenticated_user_id)):
+    """Mark a lead as applied -- the apply channel's terminal action,
+    called by the user after they've actually submitted the application
+    via the real listing_url deep link. No auto-fill, no automated
+    submission-detection; this is a plain, explicit, human-driven status
+    update (per this channel's locked "prepare + hand off, never a bot
+    submitting a form" constraint).
+
+    A plain repo.update_lead call, same tenant-isolation guarantee every
+    other lead-scoped route already gets for free -- a different user
+    calling this on someone else's lead_id gets the standard 404, not a
+    write to another tenant's row.
+    """
+    try:
+        updated = repo.update_lead(user_id, lead_id, {
+            "status": "applied",
+            "applied_at": datetime.now(timezone.utc),
+        })
+    except repo.NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
+    _invalidate_leads_cache(user_id)
+    return {"status": "applied", "lead_id": lead_id, "applied_at": _lead_to_response(updated).applied_at}
+
+
 @app.post("/api/leads/{lead_id}/research", response_model=ResearchResponse)
-def research_lead(lead_id: str):
+def research_lead(lead_id: str, user_id: str = Depends(get_authenticated_user_id)):
     """Generate structured company research with demo project idea for a lead."""
-    leads = _get_all_leads_cached()
+    leads = _get_all_leads_cached(user_id)
     lead = next((l for l in leads if str(l.get("id", "")) == lead_id), None)
     if not lead:
         raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
@@ -606,7 +813,7 @@ def _resume_build_bg(build_id: str, secrets: dict, demo_project: dict, company: 
 
 
 @app.post("/api/leads/{lead_id}/build-demo", response_model=DemoBuildStatusResponse)
-def build_demo(lead_id: str, body: BuildDemoRequest):
+def build_demo(lead_id: str, body: BuildDemoRequest, user_id: str = Depends(get_authenticated_user_id)):
     """Start building a demo project in a sandbox container (non-blocking).
 
     Returns immediately with build_id="..." and stage="pending"; poll
@@ -615,7 +822,7 @@ def build_demo(lead_id: str, body: BuildDemoRequest):
     from sandbox.orchestrator import BuildState
     from sandbox.config import DEFAULT_MAX_ATTEMPTS
 
-    leads = _get_all_leads_cached()
+    leads = _get_all_leads_cached(user_id)
     lead = next((l for l in leads if str(l.get("id", "")) == lead_id), None)
     if not lead:
         raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
@@ -645,7 +852,7 @@ def build_demo(lead_id: str, body: BuildDemoRequest):
 
 
 @app.get("/api/leads/{lead_id}/build-demo/{build_id}/status", response_model=DemoBuildStatusResponse)
-def build_demo_status(lead_id: str, build_id: str):
+def build_demo_status(lead_id: str, build_id: str, user_id: str = Depends(get_authenticated_user_id)):
     """Poll the live status of a demo build."""
     entry = _get_build_entry(build_id)
     if not entry or entry["lead_id"] != lead_id:
@@ -683,7 +890,10 @@ def build_demo_status(lead_id: str, build_id: str):
 
 
 @app.post("/api/leads/{lead_id}/build-demo/{build_id}/secrets", response_model=DemoBuildStatusResponse)
-def build_demo_provide_secrets(lead_id: str, build_id: str, body: ProvideSecretsRequest):
+def build_demo_provide_secrets(
+    lead_id: str, build_id: str, body: ProvideSecretsRequest,
+    user_id: str = Depends(get_authenticated_user_id),
+):
     """Provide requested secrets and resume a paused build (non-blocking)."""
     entry = _get_build_entry(build_id)
     if not entry or entry["lead_id"] != lead_id:
@@ -718,7 +928,7 @@ def build_demo_provide_secrets(lead_id: str, build_id: str, body: ProvideSecrets
 
 
 @app.post("/api/leads/{lead_id}/build-demo/{build_id}/cancel")
-def build_demo_cancel(lead_id: str, build_id: str):
+def build_demo_cancel(lead_id: str, build_id: str, user_id: str = Depends(get_authenticated_user_id)):
     """Stop a build and destroy its sandbox container."""
     from sandbox import orchestrator
 
@@ -738,7 +948,7 @@ def build_demo_cancel(lead_id: str, build_id: str):
 
 
 @app.get("/api/builds", response_model=list[DemoBuildSummary])
-def list_builds():
+def list_builds(user_id: str = Depends(get_authenticated_user_id)):
     """List all demo builds from this server session, most recent first.
 
     Builds live only in memory (see _demo_builds above) — this list resets
@@ -776,9 +986,9 @@ def list_builds():
 # ---------------------------------------------------------------------------
 
 @app.get("/api/stats", response_model=StatsResponse)
-def get_stats():
+def get_stats(user_id: str = Depends(get_authenticated_user_id)):
     """Dashboard stats — count leads by status (served from TTL cache)."""
-    leads = _get_all_leads_cached()
+    leads = _get_all_leads_cached(user_id)
     total = len(leads)
 
     counts = {
@@ -807,7 +1017,7 @@ def get_stats():
 # ---------------------------------------------------------------------------
 
 @app.post("/api/pipeline/scrape")
-def trigger_scrape(sources: Optional[list[str]] = None):
+def trigger_scrape(sources: Optional[list[str]] = None, user_id: str = Depends(get_authenticated_user_id)):
     """Trigger scraping from one or more sources.
 
     Valid sources: arbeitnow, jobicy, x, careers_page, yc
@@ -850,18 +1060,26 @@ def trigger_scrape(sources: Optional[list[str]] = None):
 # ---------------------------------------------------------------------------
 # On-demand full pipeline run (Phase 10b — dashboard "Run Pipeline" button)
 # ---------------------------------------------------------------------------
-
-# Shared run-state, updated live by the background pipeline thread.
-_pipeline_run_state: dict = {
-    "running": False,
-    "started_at": None,
-    "finished_at": None,
-    "current_step": None,
-    "steps": [],        # [{step, status}]
-    "summary": None,    # final summary dict from the runner
-    "error": None,
-}
-_pipeline_lock = threading.Lock()
+#
+# Phase 4.4: this used to be ONE global `_pipeline_run_state` dict + ONE
+# global `_pipeline_lock` (threading.Lock()) shared by every caller --
+# meaning two different signed-in users clicking "Run Pipeline" at the same
+# time collided on the same dict, and the second caller got a spurious 409
+# "Pipeline already running" even though it was a completely different
+# person's run. Each run is now a `pipeline_runs` row (db/models.py),
+# scoped by user_id -- repo.get_running_pipeline_run(user_id) replaces the
+# global lock's "is anything running" check with a per-user query, and
+# repo.get_latest_pipeline_run(user_id) replaces the global dict read.
+# This also means a run's status survives an API process restart (or a
+# second replica) instead of vanishing with the in-memory dict.
+#
+# NOTE (unchanged from Phase 3): the pipeline's sourcing/tailoring/outreach
+# work itself (orchestrator.pipeline_runner.run_sourcing_pipeline) still
+# operates against a single user_id per run -- what Phase 4.4 fixes is that
+# TWO DIFFERENT USERS' runs no longer collide with each other. Making the
+# actual scraping/tailoring logic aware of per-user search criteria, quotas,
+# etc. beyond "whose leads table do writes land in" remains out of scope
+# here, same as it was for Phase 3.
 
 
 def _now_iso() -> str:
@@ -875,27 +1093,17 @@ class RunPipelineRequest(BaseModel):
     csv_path: Optional[str] = None
 
 
-def _run_pipeline_bg(sources, yc_max_leads, x_max_leads, csv_path):
-    """Background worker that runs the sourcing pipeline and tracks progress."""
+def _run_pipeline_bg(user_id: str, run_id: str, sources, yc_max_leads, x_max_leads, csv_path):
+    """Background worker that runs the sourcing pipeline for user_id and
+    tracks progress in that run's pipeline_runs row (not a global dict).
+    """
     from orchestrator.pipeline_runner import run_sourcing_pipeline
 
-    with _pipeline_lock:
-        _pipeline_run_state.update({
-            "running": True,
-            "started_at": _now_iso(),
-            "finished_at": None,
-            "current_step": "starting",
-            "steps": [],
-            "summary": None,
-            "error": None,
-        })
-
     def on_step(label: str, status: str):
-        with _pipeline_lock:
-            _pipeline_run_state["current_step"] = label if status == "running" else None
-            # Record only terminal states to keep the list clean
-            if status in ("ok", "error"):
-                _pipeline_run_state["steps"].append({"step": label, "status": status})
+        try:
+            repo.append_pipeline_run_step(run_id, label, status)
+        except Exception as e:
+            print(f"  ⚠️  pipeline run {run_id}: failed to record step '{label}': {e}")
 
     try:
         summary = run_sourcing_pipeline(
@@ -904,36 +1112,61 @@ def _run_pipeline_bg(sources, yc_max_leads, x_max_leads, csv_path):
             x_max_leads=x_max_leads,
             csv_path=csv_path,
             progress_callback=on_step,
+            user_id=user_id,
         )
-        with _pipeline_lock:
-            _pipeline_run_state["summary"] = summary
+        repo.update_pipeline_run(run_id, {"status": "completed", "summary": summary})
     except Exception as e:
-        with _pipeline_lock:
-            _pipeline_run_state["error"] = str(e)
+        repo.update_pipeline_run(run_id, {"status": "failed", "error": str(e)})
     finally:
         # New leads were likely written to Postgres — drop the cache so the
         # next dashboard/leads read reflects them.
-        _invalidate_leads_cache()
-        with _pipeline_lock:
-            _pipeline_run_state["running"] = False
-            _pipeline_run_state["current_step"] = None
-            _pipeline_run_state["finished_at"] = _now_iso()
+        _invalidate_leads_cache(user_id)
+        repo.update_pipeline_run(run_id, {"current_step": None, "finished_at": datetime.now(timezone.utc)})
+
+
+def _pipeline_run_to_response(run: Optional[dict]) -> dict:
+    """Shapes a pipeline_runs row (or None) into the response contract
+    frontend/src/lib/api.ts's PipelineRunState expects -- unchanged from
+    the pre-Phase-4 global-dict shape, so no frontend changes are needed.
+    """
+    if run is None:
+        return {
+            "running": False,
+            "started_at": None,
+            "finished_at": None,
+            "current_step": None,
+            "steps": [],
+            "summary": None,
+            "error": None,
+        }
+    return {
+        "running": run["status"] == "running",
+        "started_at": run["started_at"].isoformat() if run["started_at"] else None,
+        "finished_at": run["finished_at"].isoformat() if run["finished_at"] else None,
+        "current_step": run["current_step"],
+        "steps": run["steps"] or [],
+        "summary": run["summary"],
+        "error": run["error"],
+    }
 
 
 @app.post("/api/pipeline/run")
-def run_pipeline(body: RunPipelineRequest):
-    """Start the full sourcing+processing pipeline on demand (non-blocking).
+def run_pipeline(body: RunPipelineRequest, user_id: str = Depends(get_authenticated_user_id)):
+    """Start the full sourcing+processing pipeline on demand (non-blocking),
+    scoped to the calling user_id.
 
     Runs in a background thread; poll /api/pipeline/run-status for progress.
+    Rejects with 409 only if THIS user already has a run in progress --
+    a different user's concurrent run never blocks this one (Phase 4.4).
     """
-    with _pipeline_lock:
-        if _pipeline_run_state["running"]:
-            raise HTTPException(status_code=409, detail="Pipeline already running")
+    if repo.get_running_pipeline_run(user_id):
+        raise HTTPException(status_code=409, detail="Pipeline already running")
 
+    run = repo.create_pipeline_run(user_id)
     sources = body.sources or ["arbeitnow", "jobicy", "yc"]
     threading.Thread(
         target=_run_pipeline_bg,
-        args=(sources, body.yc_max_leads, body.x_max_leads, body.csv_path),
+        args=(user_id, run["id"], sources, body.yc_max_leads, body.x_max_leads, body.csv_path),
         daemon=True,
     ).start()
 
@@ -941,22 +1174,21 @@ def run_pipeline(body: RunPipelineRequest):
 
 
 @app.get("/api/pipeline/run-status")
-def pipeline_run_status():
-    """Return the live state of the current/last pipeline run."""
-    with _pipeline_lock:
-        return dict(_pipeline_run_state)
+def pipeline_run_status(user_id: str = Depends(get_authenticated_user_id)):
+    """Return the live state of the caller's current/last pipeline run."""
+    run = repo.get_latest_pipeline_run(user_id)
+    return _pipeline_run_to_response(run)
 
 
 @app.post("/api/pipeline/upload-csv")
-async def upload_csv(file: UploadFile = File(...)):
+async def upload_csv(file: UploadFile = File(...), user_id: str = Depends(get_authenticated_user_id)):
     """Upload a companies CSV and run the company_list scraper + processing.
 
     The CSV is saved to config/uploaded_companies.csv, then the pipeline runs
-    with only the company_list source in the background.
+    with only the company_list source in the background, scoped to user_id.
     """
-    with _pipeline_lock:
-        if _pipeline_run_state["running"]:
-            raise HTTPException(status_code=409, detail="Pipeline already running")
+    if repo.get_running_pipeline_run(user_id):
+        raise HTTPException(status_code=409, detail="Pipeline already running")
 
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Please upload a .csv file")
@@ -969,9 +1201,10 @@ async def upload_csv(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save CSV: {e}")
 
+    run = repo.create_pipeline_run(user_id)
     threading.Thread(
         target=_run_pipeline_bg,
-        args=(["company_list"], 15, 5, save_path),
+        args=(user_id, run["id"], ["company_list"], 15, 5, save_path),
         daemon=True,
     ).start()
 
@@ -979,7 +1212,7 @@ async def upload_csv(file: UploadFile = File(...)):
 
 
 @app.post("/api/pipeline/find-emails")
-def trigger_find_emails():
+def trigger_find_emails(user_id: str = Depends(get_authenticated_user_id)):
     """Run the contact email discovery skill."""
     try:
         from skills.find_contact_email import run
@@ -990,7 +1223,7 @@ def trigger_find_emails():
 
 
 @app.post("/api/pipeline/tailor-resumes")
-def trigger_tailor_resumes():
+def trigger_tailor_resumes(user_id: str = Depends(get_authenticated_user_id)):
     """Run the resume tailoring skill for leads that need it."""
     try:
         from skills.tailor_resume import run
@@ -1001,7 +1234,7 @@ def trigger_tailor_resumes():
 
 
 @app.post("/api/pipeline/draft-outreach")
-def trigger_draft_outreach():
+def trigger_draft_outreach(user_id: str = Depends(get_authenticated_user_id)):
     """Run the outreach drafting skill."""
     try:
         from skills.draft_outreach import run
@@ -1011,42 +1244,53 @@ def trigger_draft_outreach():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/pipeline/draft-cover-notes")
+def trigger_draft_cover_notes(user_id: str = Depends(get_authenticated_user_id)):
+    """Run the apply-channel cover-note drafting skill (Phase 5.1)."""
+    try:
+        from skills.draft_cover_note import run
+        run()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/pipeline/feed-graph")
-def trigger_feed_graph():
-    """Feed pending leads into the LangGraph review pipeline."""
+def trigger_feed_graph(user_id: str = Depends(get_authenticated_user_id)):
+    """Feed the caller's pending leads into the LangGraph review pipeline."""
     try:
         from orchestrator.feed_graph import feed_pending_leads
-        count = feed_pending_leads()
+        count = feed_pending_leads(user_id=user_id)
         return {"status": "success", "leads_fed": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/pipeline/send")
-def trigger_send():
+def trigger_send(user_id: str = Depends(get_authenticated_user_id)):
     """Send (or draft) all approved leads via Gmail. Returns a summary."""
     try:
         from skills.send_via_gmail import run, is_direct_send
         summary = run()
-        _invalidate_leads_cache()
+        _invalidate_leads_cache(user_id)
         return {"status": "success", "mode": "direct" if is_direct_send() else "drafts", "summary": summary}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/pipeline/check-followups")
-def trigger_check_followups():
-    """Check sent leads for follow-up needs."""
+def trigger_check_followups(user_id: str = Depends(get_authenticated_user_id)):
+    """Check the caller's sent leads for follow-up needs."""
     try:
         from orchestrator.check_followups import check_and_queue_followups
-        count = check_and_queue_followups()
+        count = check_and_queue_followups(user_id=user_id)
         return {"status": "success", "followups_queued": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/pipeline/catalog-refresh")
-def trigger_catalog_refresh(providers: Optional[list[str]] = None):
+def trigger_catalog_refresh(providers: Optional[list[str]] = None, user_id: str = Depends(get_authenticated_user_id)):
     """Sync the shared job catalog (companies/jobs) from Greenhouse, Lever,
     and Ashby. Unlike the other /api/pipeline/* routes, this writes to the
     shared catalog, not per-user leads -- see
@@ -1065,8 +1309,18 @@ def trigger_catalog_refresh(providers: Optional[list[str]] = None):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/settings/search-criteria", response_model=SettingsResponse)
-def get_search_criteria():
-    """Get current search criteria configuration."""
+def get_search_criteria(user_id: str = Depends(get_authenticated_user_id)):
+    """Get current search criteria configuration.
+
+    NOTE: this reads config/search_criteria.json -- a single global file,
+    not the per-user `search_criteria` table. It's the pipeline's global
+    scraping/matching config (role keywords, tech stack, etc used by
+    skills/match_jobs.py and the scrapers), distinct from a signed-in
+    user's own inferred/editable criteria, which live in the `search_criteria`
+    table and are served by /api/profile/search-criteria (Phase 3.7). Both
+    exist side by side; this route is just gated behind auth now like every
+    other non-anon route, its behavior is otherwise unchanged.
+    """
     path = _get_search_criteria_path()
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="search_criteria.json not found")
@@ -1085,8 +1339,8 @@ def get_search_criteria():
 
 
 @app.put("/api/settings/search-criteria")
-def update_search_criteria(body: SettingsUpdateRequest):
-    """Update search criteria configuration."""
+def update_search_criteria(body: SettingsUpdateRequest, user_id: str = Depends(get_authenticated_user_id)):
+    """Update search criteria configuration (global pipeline config file -- see get_search_criteria's note)."""
     path = _get_search_criteria_path()
 
     # Read existing
@@ -1118,7 +1372,7 @@ def update_search_criteria(body: SettingsUpdateRequest):
 
 
 @app.get("/api/settings/pipeline-config", response_model=PipelineConfigResponse)
-def get_pipeline_config():
+def get_pipeline_config(user_id: str = Depends(get_authenticated_user_id)):
     """Get pipeline configuration from .env."""
     return PipelineConfigResponse(
         model_backend=_read_env_value("MODEL_BACKEND", "claude"),
@@ -1129,7 +1383,7 @@ def get_pipeline_config():
 
 
 @app.put("/api/settings/pipeline-config")
-def update_pipeline_config(body: PipelineConfigUpdateRequest):
+def update_pipeline_config(body: PipelineConfigUpdateRequest, user_id: str = Depends(get_authenticated_user_id)):
     """Update pipeline configuration in .env."""
     env_path = _get_env_path()
 
@@ -1171,7 +1425,7 @@ def update_pipeline_config(body: PipelineConfigUpdateRequest):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/scheduler/status")
-def scheduler_status():
+def scheduler_status(user_id: str = Depends(get_authenticated_user_id)):
     """Return whether the scheduler is running and its jobs' next run times."""
     try:
         from orchestrator.scheduler import get_scheduler, get_jobs_status
@@ -1183,7 +1437,7 @@ def scheduler_status():
 
 
 @app.post("/api/scheduler/start")
-def scheduler_start():
+def scheduler_start(user_id: str = Depends(get_authenticated_user_id)):
     """Start the scheduler (idempotent)."""
     try:
         from orchestrator.scheduler import start_scheduler, get_jobs_status
@@ -1194,7 +1448,7 @@ def scheduler_start():
 
 
 @app.post("/api/scheduler/stop")
-def scheduler_stop():
+def scheduler_stop(user_id: str = Depends(get_authenticated_user_id)):
     """Stop the scheduler."""
     try:
         from orchestrator.scheduler import stop_scheduler
@@ -1205,10 +1459,10 @@ def scheduler_stop():
 
 
 @app.post("/api/scheduler/trigger/{job_id}")
-def scheduler_trigger(job_id: str):
+def scheduler_trigger(job_id: str, user_id: str = Depends(get_authenticated_user_id)):
     """Manually trigger a scheduled job now (runs in the background).
 
-    Valid job_ids: sourcing, followups
+    Valid job_ids: sourcing, followups, catalog_refresh
     """
     try:
         from orchestrator.scheduler import trigger_job_now
@@ -1287,6 +1541,18 @@ class MatchedJobResponse(BaseModel):
     jd_text: Optional[str] = None
     apply_url: Optional[str] = None
     source: str
+    # Signed-in-only fields (Phase 6): unused/defaulted for the anonymous
+    # /api/anon/resume route above, populated by /api/jobs/matched below.
+    # match_score/matched_signals are the same numbers skills/match_jobs.py
+    # already computes internally to rank the list -- surfaced here so the
+    # UI can show *why* a job matched instead of just an opaque ordering.
+    match_score: int = 0
+    matched_signals: list[str] = []
+    # If the signed-in user already saved this job as a lead, its id/channel
+    # so the frontend can render "Saved" instead of a duplicate Save button
+    # rather than only finding out on a 409 from POST /api/jobs/{id}/save.
+    already_saved_lead_id: Optional[str] = None
+    already_saved_channel: list[str] = []
 
 
 class AnonResumeUploadResponse(BaseModel):
@@ -1326,6 +1592,68 @@ def _build_company_name_map(jobs: list[dict]) -> dict[str, str]:
             select(Company.id, Company.name).where(Company.id.in_(company_ids))
         ).all()
         return {str(row[0]): row[1] for row in rows}
+
+
+@app.get("/api/jobs/matched", response_model=list[MatchedJobResponse])
+def get_matched_jobs(user_id: str = Depends(get_authenticated_user_id)):
+    """Signed-in equivalent of the anonymous /api/anon/resume feed below --
+    match the shared catalog against the caller's own SAVED search
+    criteria (the `search_criteria` table, populated by the anon-signup
+    conversion flow or /api/profile/search-criteria), rather than a
+    one-shot inferred set. This is the "wow" moment for a first-time
+    signed-in user: real, ranked, save-able jobs, no waiting on a fresh
+    resume upload if one was already done pre-signup.
+
+    404s (via an empty list, not an HTTPException -- this is a normal,
+    expected state for a brand-new account, not an error) when the user
+    has no search criteria saved yet. The frontend distinguishes "no
+    criteria yet" from "criteria but zero matches" by calling
+    /api/profile/search-criteria separately (already 404s in that case) --
+    this route deliberately doesn't duplicate that signal.
+    """
+    criteria = repo.get_search_criteria(user_id)
+    if criteria is None:
+        return []
+
+    from skills.match_jobs import match_jobs, matched_signals, score_job
+
+    # open_only=True: never surface a job whose company-side board no
+    # longer lists it -- see db.repository.close_unseen_jobs/add_job for
+    # how is_open stays accurate.
+    all_jobs = repo.get_jobs(open_only=True)  # whole shared catalog -- no user_id, Phase 1's tables
+    company_names = _build_company_name_map(all_jobs)
+    matched = match_jobs(all_jobs, criteria, limit=50)
+
+    # Look up which of these jobs the user already turned into a lead, so
+    # the frontend can render "Saved" instead of risking a duplicate-save
+    # 409 on click. One pass over the user's own leads (small, per-user),
+    # keyed by job_id -- not per-job queries.
+    existing_by_job_id: dict[str, dict] = {}
+    for lead in repo.get_leads(user_id):
+        job_id = lead.get("job_id")
+        if job_id:
+            existing_by_job_id[str(job_id)] = lead
+
+    response = []
+    for job in matched:
+        job_id = str(job["id"])
+        existing = existing_by_job_id.get(job_id)
+        response.append(MatchedJobResponse(
+            id=job_id,
+            company_name=company_names.get(str(job.get("company_id")), "Unknown Company"),
+            title=job.get("title") or "",
+            location=job.get("location"),
+            department=job.get("department"),
+            jd_text=job.get("jd_text"),
+            apply_url=job.get("apply_url"),
+            source=job.get("source") or "",
+            match_score=score_job(job, criteria),
+            matched_signals=matched_signals(job, criteria),
+            already_saved_lead_id=str(existing["id"]) if existing else None,
+            already_saved_channel=(existing.get("channel") or []) if existing else [],
+        ))
+
+    return response
 
 
 @app.post("/api/anon/resume", response_model=AnonResumeUploadResponse)
@@ -1373,7 +1701,8 @@ async def anon_upload_resume(request: Request, file: UploadFile = File(...)):
 
     inferred_criteria = infer_criteria(parsed_resume)
 
-    all_jobs = repo.get_jobs()  # whole shared catalog -- no user_id, Phase 1's tables
+    # open_only=True: see the /api/jobs/matched route's identical comment.
+    all_jobs = repo.get_jobs(open_only=True)  # whole shared catalog -- no user_id, Phase 1's tables
     company_names = _build_company_name_map(all_jobs)
     matched = match_jobs(all_jobs, inferred_criteria, limit=50)
 
@@ -1446,6 +1775,151 @@ def anon_tailored_preview(request: Request, body: AnonPreviewRequest):
         tailored_resume=tailored,
         keyword_coverage=coverage,
     )
+
+
+# ---------------------------------------------------------------------------
+# Account conversion (Phase 3.4) + Profile (Phase 3.7)
+# ---------------------------------------------------------------------------
+#
+# convert-anon-session is the bridge from Phase 2's anonymous flow into a
+# real account: the frontend sends back exactly what /api/anon/resume gave
+# it (parsed_resume + inferred_criteria), now that the visitor has signed
+# in with Google and we have a real user_id. No session migration needed
+# -- the frontend already held everything in memory.
+#
+# The profile routes are the per-user counterpart to
+# /api/settings/search-criteria (which reads/writes a single global
+# config/search_criteria.json used by the CLI pipeline/scrapers -- see
+# that route's docstring). These read/write the `search_criteria` and
+# `resumes` tables, scoped to the authenticated user.
+
+
+class ConvertAnonSessionRequest(BaseModel):
+    """Exactly the shape /api/anon/resume returns -- see ParsedResumeResponse
+    and InferredCriteriaResponse above."""
+    parsed_resume: dict
+    inferred_criteria: dict
+
+
+class ConvertAnonSessionResponse(BaseModel):
+    resume_id: str
+    search_criteria_id: str
+
+
+@app.post("/api/account/convert-anon-session", response_model=ConvertAnonSessionResponse)
+def convert_anon_session(
+    body: ConvertAnonSessionRequest,
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Persist a just-signed-in user's anonymous resume + inferred criteria.
+
+    Idempotency: calling this more than once (e.g. a double-clicked sign-up,
+    or a user who signs in again after a prior conversion) creates a NEW
+    resume version each time rather than erroring or silently no-opping --
+    resumes.is_primary tracks which one is current (the newest becomes
+    primary, per repo.add_resume's demote-then-insert logic), consistent
+    with the "resume versions" concept Phase 4's profile page builds on.
+    search_criteria, by contrast, is upserted in place (repo.upsert_search_criteria
+    already treats it as one-row-per-user) -- re-converting just refreshes
+    the same criteria row rather than creating duplicates.
+    """
+    criteria = dict(body.inferred_criteria)
+    criteria["inferred_from_resume"] = True
+
+    resume = repo.add_resume(user_id, file_ref=None, parsed_json=body.parsed_resume, is_primary=True)
+    saved_criteria = repo.upsert_search_criteria(user_id, criteria)
+
+    return ConvertAnonSessionResponse(
+        resume_id=str(resume["id"]),
+        search_criteria_id=str(saved_criteria["id"]),
+    )
+
+
+class ProfileSearchCriteriaResponse(BaseModel):
+    roles: list[str]
+    tech_stack: list[str]
+    seniority: Optional[str] = None
+    locations: list[str]
+    remote_pref: Optional[str] = None
+    inferred_from_resume: bool
+
+
+class ProfileSearchCriteriaUpdateRequest(BaseModel):
+    roles: Optional[list[str]] = None
+    tech_stack: Optional[list[str]] = None
+    seniority: Optional[str] = None
+    locations: Optional[list[str]] = None
+    remote_pref: Optional[str] = None
+
+
+class ProfileResumeResponse(BaseModel):
+    id: str
+    file_ref: Optional[str] = None
+    parsed_json: Optional[dict] = None
+    is_primary: bool
+    created_at: str
+
+
+@app.get("/api/profile/search-criteria", response_model=ProfileSearchCriteriaResponse)
+def get_profile_search_criteria(user_id: str = Depends(get_authenticated_user_id)):
+    """The signed-in user's own saved search criteria (per-user `search_criteria`
+    table row) -- distinct from /api/settings/search-criteria's global pipeline
+    config file. 404s if the user has never had criteria saved (e.g. signed in
+    without ever running the anonymous resume hook)."""
+    criteria = repo.get_search_criteria(user_id)
+    if criteria is None:
+        raise HTTPException(status_code=404, detail="No search criteria saved for this account yet")
+
+    return ProfileSearchCriteriaResponse(
+        roles=criteria.get("roles") or [],
+        tech_stack=criteria.get("tech_stack") or [],
+        seniority=criteria.get("seniority"),
+        locations=criteria.get("locations") or [],
+        remote_pref=criteria.get("remote_pref"),
+        inferred_from_resume=bool(criteria.get("inferred_from_resume")),
+    )
+
+
+@app.put("/api/profile/search-criteria", response_model=ProfileSearchCriteriaResponse)
+def update_profile_search_criteria(
+    body: ProfileSearchCriteriaUpdateRequest,
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Edit the signed-in user's own search criteria. A field left as None
+    keeps its existing saved value (repo.upsert_search_criteria only
+    overwrites keys present in the dict) -- editing is partial, matching
+    the existing /api/settings/search-criteria PUT's merge semantics.
+    Editing here always sets inferred_from_resume=False, since a manual
+    edit is no longer purely LLM-inferred.
+    """
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    updates["inferred_from_resume"] = False
+    saved = repo.upsert_search_criteria(user_id, updates)
+
+    return ProfileSearchCriteriaResponse(
+        roles=saved.get("roles") or [],
+        tech_stack=saved.get("tech_stack") or [],
+        seniority=saved.get("seniority"),
+        locations=saved.get("locations") or [],
+        remote_pref=saved.get("remote_pref"),
+        inferred_from_resume=bool(saved.get("inferred_from_resume")),
+    )
+
+
+@app.get("/api/profile/resumes", response_model=list[ProfileResumeResponse])
+def list_profile_resumes(user_id: str = Depends(get_authenticated_user_id)):
+    """The signed-in user's saved resume versions, newest first."""
+    resumes = repo.get_resumes(user_id)
+    return [
+        ProfileResumeResponse(
+            id=str(r["id"]),
+            file_ref=r.get("file_ref"),
+            parsed_json=r.get("parsed_json"),
+            is_primary=bool(r.get("is_primary")),
+            created_at=r["created_at"].isoformat() if r.get("created_at") else "",
+        )
+        for r in resumes
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -12,21 +12,39 @@ Usage:
 
 import os
 import sys
+from typing import Optional
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from db import repository as repo
 from db.current_user import get_current_user_id
-from graph.pipeline import build_followup_graph, get_checkpointer_connection, DB_PATH
+from graph.pipeline import (
+    build_followup_graph,
+    get_postgres_checkpointer,
+    make_followup_thread_id,
+)
 
 
-def check_and_queue_followups(db_path: str = DB_PATH) -> int:
-    """Check all sent leads for follow-up needs via the followup graph.
+def check_and_queue_followups(user_id: Optional[str] = None) -> int:
+    """Check all of user_id's sent leads for follow-up needs via the
+    followup graph.
+
+    Args:
+        user_id: whose sent leads to check. Every HTTP-reachable caller
+            (api/main.py's /api/pipeline/check-followups route, and
+            orchestrator.pipeline_runner.run_followup_pipeline when invoked
+            on behalf of a real request) MUST pass the real authenticated
+            user_id -- defaulting to db.current_user's single-operator
+            stand-in is only correct for the CLI entry point below and
+            orchestrator.scheduler's cron trigger (neither has a real
+            per-request identity to thread through).
 
     Returns the number of leads that entered the follow-up flow.
     """
-    user_id = get_current_user_id()
-    cp = get_checkpointer_connection(db_path)
+    if user_id is None:
+        user_id = get_current_user_id()
+
+    cp = get_postgres_checkpointer()
     graph = build_followup_graph(cp)
 
     leads = repo.get_leads(user_id, status="sent")
@@ -45,11 +63,13 @@ def check_and_queue_followups(db_path: str = DB_PATH) -> int:
         company = lead.get("company") or lead.get("x_handle") or lead_id
 
         # Use a unique thread ID for follow-up runs to avoid collision
-        # with the main pipeline thread for the same lead
-        thread_id = f"{lead_id}_followup_{lead.get('followup_count', 0)}"
+        # with the main pipeline thread for the same lead, scoped by
+        # user_id (Phase 4.2) for structural tenant isolation.
+        thread_id = make_followup_thread_id(user_id, lead_id, lead.get("followup_count", 0))
         config = {"configurable": {"thread_id": thread_id}}
 
         state = {
+            "user_id": user_id,
             "lead_id": lead_id,
             "source": lead.get("source", ""),
             "company": lead.get("company", ""),
@@ -60,6 +80,7 @@ def check_and_queue_followups(db_path: str = DB_PATH) -> int:
             "x_handle": lead.get("x_handle") or None,
             "resume_version": lead.get("resume_version") or None,
             "outreach_draft": lead.get("outreach_draft") or None,
+            "channel": lead.get("channel") or [],
             "followup_count": int(lead.get("followup_count") or 0),
             "is_followup": False,  # followup_check_node will set this if needed
             "status": "sent",

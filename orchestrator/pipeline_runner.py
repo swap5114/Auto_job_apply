@@ -63,6 +63,7 @@ def run_sourcing_pipeline(
     x_max_leads: int = 5,
     csv_path: str | None = None,
     progress_callback=None,
+    user_id: str | None = None,
 ) -> dict:
     """Run the full sourcing + processing chain.
 
@@ -70,7 +71,8 @@ def run_sourcing_pipeline(
       1. Scrape sources (arbeitnow, jobicy, careers_page, company_list, yc, x)
       2. find_contact_email
       3. tailor_resume
-      4. draft_outreach
+      4. draft_outreach + draft_cover_note (each filters to leads with the
+         relevant channel internally -- see their own run()'s docstrings)
       5. feed_graph (pauses leads at review interrupt)
 
     Args:
@@ -79,6 +81,20 @@ def run_sourcing_pipeline(
         x_max_leads: cap on X leads per run.
         csv_path: path to a companies CSV (required if 'company_list' in sources).
         progress_callback: optional fn(step_label, status) for live progress.
+        user_id: whose leads this run's feed_graph step feeds into the
+            LangGraph review pipeline (Phase 4.1). api/main.py's
+            /api/pipeline/run route (the only HTTP-reachable caller of this
+            function) always passes the real authenticated user_id here.
+            Defaults to None -- feed_pending_leads falls back to
+            db.current_user's single-operator stand-in only for the
+            standalone CLI entry point below (`python -m
+            orchestrator.pipeline_runner sourcing`), which has no real
+            per-request identity to thread through. The scraper/enrichment
+            steps above (1-4) already resolve their own user_id
+            per-lead-source internally via db.current_user, unchanged from
+            before Phase 4 -- see PHASE_4_PLAN.md's 4.1 audit, which
+            flagged those `run()` functions as a separate, out-of-scope
+            concern from the feed_graph bug this fixes.
 
     Returns a summary dict with per-step results.
     """
@@ -131,13 +147,16 @@ def run_sourcing_pipeline(
     from skills.tailor_resume import run as tailor_run
     results.append(_run_step("tailor_resume", tailor_run, callback=cb))
 
-    # --- 4. Draft outreach ---
+    # --- 4. Draft outreach + cover notes (channel-filtered internally) ---
     from skills.draft_outreach import run as draft_run
     results.append(_run_step("draft_outreach", draft_run, callback=cb))
 
+    from skills.draft_cover_note import run as draft_cover_note_run
+    results.append(_run_step("draft_cover_note", draft_cover_note_run, callback=cb))
+
     # --- 5. Feed into graph (pause at review) ---
     from orchestrator.feed_graph import feed_pending_leads
-    results.append(_run_step("feed_graph", feed_pending_leads, callback=cb))
+    results.append(_run_step("feed_graph", feed_pending_leads, user_id=user_id, callback=cb))
 
     ok = sum(1 for r in results if r["status"] == "ok")
     failed = sum(1 for r in results if r["status"] == "error")
@@ -150,8 +169,15 @@ def run_sourcing_pipeline(
     return {"pipeline": "sourcing", "ok": ok, "failed": failed, "steps": results}
 
 
-def run_followup_pipeline(progress_callback=None) -> dict:
-    """Run the follow-up check: re-queue stale sent leads through the graph."""
+def run_followup_pipeline(progress_callback=None, user_id: str | None = None) -> dict:
+    """Run the follow-up check: re-queue stale sent leads through the graph.
+
+    Args:
+        user_id: whose sent leads to check (Phase 4.1) -- see
+            run_sourcing_pipeline's docstring for the same contract.
+            Defaults to None for the CLI/scheduler entry points, which
+            legitimately fall back to db.current_user.
+    """
     print("\n" + "=" * 60)
     print(f"  FOLLOW-UP PIPELINE START  [{_now()}]")
     print("=" * 60)
@@ -159,7 +185,9 @@ def run_followup_pipeline(progress_callback=None) -> dict:
     results = []
 
     from orchestrator.check_followups import check_and_queue_followups
-    results.append(_run_step("check_followups", check_and_queue_followups, callback=progress_callback))
+    results.append(_run_step(
+        "check_followups", check_and_queue_followups, user_id=user_id, callback=progress_callback
+    ))
 
     ok = sum(1 for r in results if r["status"] == "ok")
     failed = sum(1 for r in results if r["status"] == "error")

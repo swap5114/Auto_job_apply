@@ -24,7 +24,11 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from orchestrator.pipeline_runner import run_sourcing_pipeline, run_followup_pipeline
+from orchestrator.pipeline_runner import (
+    run_sourcing_pipeline,
+    run_followup_pipeline,
+    run_catalog_refresh,
+)
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "schedule.json")
 
@@ -60,6 +64,19 @@ def _followup_job():
     """Scheduled follow-up job."""
     print(f"\n🕐 [SCHEDULER] Triggering follow-up pipeline at {datetime.now().isoformat()}")
     run_followup_pipeline()
+
+
+def _catalog_refresh_job(params: dict | None = None):
+    """Scheduled catalog-refresh job -- the shared Job/Company catalog
+    every user's matched-jobs feed reads from. Without this running on a
+    schedule, the catalog only ever grows (and never closes stale
+    listings) when someone manually hits /api/pipeline/catalog-refresh --
+    see config/schedule.json's "catalog_refresh" entry for why this
+    matters for a first-time user's experience specifically.
+    """
+    params = params or {}
+    print(f"\n🕐 [SCHEDULER] Triggering catalog refresh at {datetime.now().isoformat()}")
+    run_catalog_refresh(providers=params.get("providers"))
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +123,25 @@ def build_scheduler() -> BackgroundScheduler:
             ),
             id="followups",
             name="Follow-up pipeline",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+
+    # Catalog refresh job
+    catalog_refresh = jobs.get("catalog_refresh", {})
+    if catalog_refresh.get("enabled", False):
+        cron = catalog_refresh.get("cron", {})
+        params = catalog_refresh.get("params", {})
+        scheduler.add_job(
+            _catalog_refresh_job,
+            trigger=CronTrigger(
+                hour=cron.get("hour", 4),
+                minute=cron.get("minute", 0),
+                timezone=timezone,
+            ),
+            id="catalog_refresh",
+            name="Catalog refresh",
+            kwargs={"params": params},
             replace_existing=True,
             misfire_grace_time=3600,
         )
@@ -167,6 +203,9 @@ def trigger_job_now(job_id: str) -> bool:
         return True
     elif job_id == "followups":
         threading.Thread(target=_followup_job, daemon=True).start()
+        return True
+    elif job_id == "catalog_refresh":
+        threading.Thread(target=_catalog_refresh_job, daemon=True).start()
         return True
     return False
 

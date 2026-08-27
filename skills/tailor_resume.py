@@ -421,7 +421,13 @@ def run():
 
         filename = save_resume(tailored, company)
         coverage = keyword_coverage(jd_text, tailored)
-        repo.update_lead(user_id, lead["id"], {"resume_version": filename})
+        # status: "tailored" mirrors graph/pipeline.py's tailor_resume_node
+        # (the graph-driven path already sets this) -- the standalone
+        # CLI/API route path was missing it, leaving a lead's status stuck
+        # at "matched" even after a resume was actually tailored for it.
+        repo.update_lead(user_id, lead["id"], {
+            "resume_version": filename, "keyword_coverage": coverage, "status": "tailored",
+        })
         tailored_count += 1
         print(f"Tailored resume for {company} -> resumes/{filename}.json / .md "
               f"(ATS keyword coverage: {coverage}%)")

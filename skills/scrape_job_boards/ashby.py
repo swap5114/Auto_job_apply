@@ -118,6 +118,7 @@ def sync_company(token: str) -> dict:
 
     added = 0
     skipped = 0
+    seen_external_ids = set()
 
     for job in listed_jobs:
         external_id = job.get("id") or ""
@@ -126,6 +127,8 @@ def sync_company(token: str) -> dict:
             print(f"  ⚠️  ashby:{token} -- skipping malformed posting (missing id/title): {job}")
             skipped += 1
             continue
+
+        seen_external_ids.add(external_id)
 
         result = repo.add_job(
             company["id"],
@@ -143,9 +146,20 @@ def sync_company(token: str) -> dict:
         else:
             skipped += 1
 
+    # See greenhouse.py's sync_company for why this runs on every real
+    # fetch (including an empty/all-unlisted board) but never on a
+    # fetch/parse failure. Note: an isListed=False job (filtered out of
+    # listed_jobs above) is intentionally treated as "not seen" here too
+    # -- it's no longer a job we should be matching users against,
+    # whether it was removed or just unlisted.
+    closed = repo.close_unseen_jobs(company["id"], seen_external_ids)
+
     repo.mark_company_scraped(company["id"])
 
-    print(f"  ✅ ashby:{token} ({company_name}) -- {added} new, {skipped} already known")
+    print(
+        f"  ✅ ashby:{token} ({company_name}) -- {added} new, {skipped} already known"
+        + (f", {closed} closed" if closed else "")
+    )
     return {"token": token, "status": "ok", "added": added, "skipped": skipped, "error": None}
 
 

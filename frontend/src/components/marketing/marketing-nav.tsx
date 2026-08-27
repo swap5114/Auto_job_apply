@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { Zap, ChevronRight } from "lucide-react";
+import { useAuth } from "@/lib/auth-context";
 
 const navLinks = [
   { name: "Features", href: "#features" },
@@ -10,6 +11,12 @@ const navLinks = [
 ];
 
 export function MarketingNav() {
+  // Signed-in visitors go straight to the dashboard; everyone else goes
+  // through /signin first (Phase 3.5) -- previously both links pointed at
+  // /dashboard unconditionally, before any auth existed.
+  const { user } = useAuth();
+  const primaryHref = user ? "/dashboard" : "/signin";
+
   return (
     <header className="sticky top-0 z-50 border-b border-border/60 bg-background/80 backdrop-blur-md">
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
@@ -37,13 +44,13 @@ export function MarketingNav() {
         {/* Actions */}
         <div className="flex items-center gap-3">
           <Link
-            href="/dashboard"
+            href={primaryHref}
             className="text-sm font-medium text-foreground transition-colors hover:text-muted-foreground"
           >
-            Sign in
+            {user ? "Dashboard" : "Sign in"}
           </Link>
           <Link
-            href="/dashboard"
+            href={primaryHref}
             className="inline-flex items-center gap-1 rounded-[10px] bg-primary px-3.5 py-2 text-sm font-medium text-primary-foreground shadow-button-brand transition-all hover:shadow-button-brand-hover"
           >
             Get started

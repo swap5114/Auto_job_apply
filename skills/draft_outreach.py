@@ -99,7 +99,13 @@ def run():
     leads = repo.get_leads(user_id)
     targets = [
         lead for lead in leads
-        if (lead.get("resume_version") or "").strip() and not (lead.get("outreach_draft") or "").strip()
+        if (lead.get("resume_version") or "").strip()
+        and not (lead.get("outreach_draft") or "").strip()
+        # Phase 5: don't waste an LLM call drafting an outreach message for
+        # a lead that has no outreach channel at all -- a lead with no
+        # channel set yet (pre-Phase-5 rows) defaults to outreach, same as
+        # route_channel_node/feed_pending_leads' own default.
+        and "outreach" in (lead.get("channel") or ["outreach"])
     ]
 
     drafted = 0

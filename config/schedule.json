@@ -9,7 +9,11 @@
         "minute": 0
       },
       "params": {
-        "sources": ["arbeitnow", "jobicy", "yc"],
+        "sources": [
+          "arbeitnow",
+          "jobicy",
+          "yc"
+        ],
         "yc_max_leads": 15,
         "x_max_leads": 5
       }
@@ -20,6 +24,21 @@
       "cron": {
         "hour": 18,
         "minute": 0
+      }
+    },
+    "catalog_refresh": {
+      "enabled": true,
+      "description": "Sync the shared job catalog (companies/jobs) from Greenhouse, Lever, and Ashby, and close out jobs no longer listed on the company's own board. This is what /api/jobs/matched and the anonymous /api/anon/resume feed actually match users against -- without this running, both are permanently empty regardless of how good a user's resume is.",
+      "cron": {
+        "hour": 4,
+        "minute": 0
+      },
+      "params": {
+        "providers": [
+          "greenhouse",
+          "lever",
+          "ashby"
+        ]
       }
     }
   }

@@ -8,7 +8,11 @@ xhtml2pdf
 pypdf # PDF text extraction for the anonymous resume-upload hook (Phase 2) -- already a transitive dep of xhtml2pdf, pinned explicitly since parse_resume.py depends on it directly
 python-docx # DOCX text extraction for the anonymous resume-upload hook (Phase 2)
 langgraph
-langgraph-checkpoint-sqlite
+langgraph-checkpoint-sqlite # kept for tests/test_phase7_review.py's fast, disposable checkpointer -- production code uses langgraph-checkpoint-postgres below
+langgraph-checkpoint-postgres==3.1.2 # Phase 4: Postgres-backed checkpointer, replacing SqliteSaver for real (non-test) pipeline runs -- durable across worker restarts, safe for concurrent multi-user access
+psycopg[binary]==3.3.4 # psycopg 3, required by langgraph-checkpoint-postgres (distinct from psycopg2-binary, which sqlalchemy/db.session.py uses)
+google-cloud-tasks==2.17.1 # Phase 4.4: Cloud Tasks client (api/tasks.py) -- pinned to a version compatible with protobuf<6 (google-genai's google-ai-generativelanguage dep already constrains protobuf below 6)
+protobuf<6.0.0,>=3.20.2 # pinned explicitly: google-cloud-tasks>=2.18 pulls protobuf>=6, which breaks google-ai-generativelanguage (transitive dep of google-genai, already in this file)
 google-api-python-client
 google-auth-oauthlib
 google-genai
@@ -29,6 +33,9 @@ docker
 sqlalchemy==2.0.36
 psycopg2-binary==2.9.10
 alembic==1.14.0
+
+# --- Phase 3: Accounts & Multi-Tenancy (Firebase Auth token verification) ---
+firebase-admin==7.5.0
 
 # Testing
 pytest==8.3.4

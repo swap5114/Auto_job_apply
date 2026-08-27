@@ -159,3 +159,24 @@ def test_score_job_counts_both_role_and_tech_signals():
     criteria = _criteria(roles=["backend engineer"], tech_stack=["python", "fastapi"])
     job = _job("Backend Engineer", "Python and FastAPI role.")
     assert score_job(job, criteria) == 3  # 1 role + 2 tech signals
+
+
+def test_matched_signals_returns_the_actual_matched_keywords():
+    from skills.match_jobs import matched_signals
+
+    criteria = _criteria(roles=["backend engineer"], tech_stack=["python", "fastapi", "kubernetes"])
+    job = _job("Backend Engineer", "We use Python and FastAPI.")
+
+    signals = matched_signals(job, criteria)
+
+    assert set(signals) == {"python", "fastapi", "backend engineer"}
+    assert "kubernetes" not in signals
+
+
+def test_matched_signals_empty_for_zero_signal_job():
+    from skills.match_jobs import matched_signals
+
+    criteria = _criteria(roles=["backend engineer"], tech_stack=["python"])
+    job = _job("Marketing Manager", "No tech skills needed, just charisma.")
+
+    assert matched_signals(job, criteria) == []

@@ -7,15 +7,35 @@
 
 const BASE = "/api";
 
+// Set once by AuthProvider (lib/auth-context.tsx) on mount -- this is the
+// one chokepoint (Phase 3.5) that lets every existing api.* call below
+// start carrying a real Authorization header without touching any of
+// them individually. Returns null before sign-in / for the anonymous
+// pre-signup flow, which intentionally never sends a token.
+let getAuthToken: (() => Promise<string | null>) | null = null;
+
+export function setAuthTokenGetter(getter: (() => Promise<string | null>) | null) {
+  getAuthToken = getter;
+}
+
 async function request<T>(
   path: string,
   options?: RequestInit
 ): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(options?.headers as Record<string, string> | undefined),
+  };
+
+  if (getAuthToken) {
+    const token = await getAuthToken();
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+  }
+
   const res = await fetch(`${BASE}${path}`, {
-    headers: {
-      "Content-Type": "application/json",
-      ...options?.headers,
-    },
+    headers,
     ...options,
   });
 
@@ -50,6 +70,52 @@ export interface Lead {
   posted_date: string;
   domain: string;
   review_decision: string;
+  // Phase 5 (Apply channel) additions.
+  channel: string[];
+  cover_note: string;
+  applied_at: string;
+  job_id: string;
+}
+
+export interface MatchedJob {
+  id: string;
+  company_name: string;
+  title: string;
+  location: string | null;
+  department: string | null;
+  jd_text: string | null;
+  apply_url: string | null;
+  source: string;
+  match_score: number;
+  matched_signals: string[];
+  already_saved_lead_id: string | null;
+  already_saved_channel: string[];
+}
+
+export interface ParsedResume {
+  name: string;
+  contact: Record<string, unknown>;
+  summary: string;
+  education: Record<string, unknown>[];
+  experience: Record<string, unknown>[];
+  projects: Record<string, unknown>[];
+  skills: Record<string, unknown>;
+  certifications: string[];
+}
+
+export interface InferredCriteria {
+  roles: string[];
+  tech_stack: string[];
+  seniority: string | null;
+  locations: string[];
+  remote_pref: string | null;
+  inferred_from_resume: boolean;
+}
+
+export interface AnonResumeUploadResult {
+  parsed_resume: ParsedResume;
+  inferred_criteria: InferredCriteria;
+  matched_jobs: MatchedJob[];
 }
 
 export interface DemoProject {
@@ -91,6 +157,23 @@ export interface SearchCriteria {
   non_tech_exclude_keywords: string[];
   years_experience_threshold: number;
   location_keywords: string[];
+}
+
+export interface ProfileSearchCriteria {
+  roles: string[];
+  tech_stack: string[];
+  seniority: string | null;
+  locations: string[];
+  remote_pref: string | null;
+  inferred_from_resume: boolean;
+}
+
+export interface ProfileResume {
+  id: string;
+  file_ref: string | null;
+  parsed_json: Record<string, unknown> | null;
+  is_primary: boolean;
+  created_at: string;
 }
 
 export interface PipelineConfig {
@@ -203,17 +286,60 @@ export const api = {
 
     get: (id: string) => request<Lead>(`/leads/${id}`),
 
-    approve: (id: string) =>
-      request<{ status: string }>(`/leads/${id}/approve`, { method: "POST" }),
+    approve: (id: string, channel?: "apply" | "outreach") =>
+      request<{ status: string }>(
+        `/leads/${id}/approve${channel ? `?channel=${channel}` : ""}`,
+        { method: "POST" }
+      ),
 
-    reject: (id: string) =>
-      request<{ status: string }>(`/leads/${id}/reject`, { method: "POST" }),
+    reject: (id: string, channel?: "apply" | "outreach") =>
+      request<{ status: string }>(
+        `/leads/${id}/reject${channel ? `?channel=${channel}` : ""}`,
+        { method: "POST" }
+      ),
 
     edit: (id: string, outreach_draft: string) =>
       request<{ status: string }>(`/leads/${id}/edit`, {
         method: "POST",
         body: JSON.stringify({ outreach_draft }),
       }),
+
+    // Apply channel's cover-note counterpart to edit() above.
+    editCoverNote: (id: string, cover_note: string) =>
+      request<{ status: string; cover_note_updated: boolean }>(`/leads/${id}/edit-cover-note`, {
+        method: "POST",
+        body: JSON.stringify({ cover_note }),
+      }),
+
+    // Apply channel's terminal action -- called after the user has
+    // actually submitted the application via the real listing_url deep
+    // link. No auto-fill, this is a plain manual status update.
+    markApplied: (id: string) =>
+      request<{ status: string; applied_at: string }>(`/leads/${id}/mark-applied`, {
+        method: "POST",
+      }),
+
+    // Auth is Bearer-token based (not cookies), so a plain <a href> to the
+    // API route wouldn't carry the Authorization header -- this fetches
+    // the PDF with the same auth headers every other api.* call uses and
+    // hands back a blob: URL the caller can open in a new tab or set as
+    // an <a href>/<iframe src>. Caller is responsible for
+    // URL.revokeObjectURL(...) once done with it, same as any other
+    // blob URL.
+    getResumePdfBlobUrl: async (id: string) => {
+      const headers: Record<string, string> = {};
+      if (getAuthToken) {
+        const token = await getAuthToken();
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+      }
+      const res = await fetch(`${BASE}/leads/${id}/resume-pdf`, { headers });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || `Failed to fetch resume PDF: ${res.status}`);
+      }
+      const blob = await res.blob();
+      return URL.createObjectURL(blob);
+    },
 
     research: (id: string) =>
       request<CompanyResearch>(`/leads/${id}/research`, { method: "POST" }),
@@ -243,6 +369,23 @@ export const api = {
     list: () => request<DemoBuildSummary[]>("/builds"),
   },
 
+  jobs: {
+    // Signed-in equivalent of the anonymous /api/anon/resume feed --
+    // matches the shared catalog against the caller's own SAVED search
+    // criteria (Phase 6). Empty array (not an error) if the user has no
+    // criteria saved yet.
+    matched: () => request<MatchedJob[]>("/jobs/matched"),
+
+    // Converts a shared-catalog matched job into a per-user Lead (Phase
+    // 5.3). channel defaults server-side to ["apply", "outreach"] when
+    // omitted.
+    save: (jobId: string, channel?: ("apply" | "outreach")[]) =>
+      request<Lead>(`/jobs/${jobId}/save`, {
+        method: "POST",
+        body: JSON.stringify(channel ? { channel } : {}),
+      }),
+  },
+
   stats: {
     get: () => request<Stats>("/stats"),
   },
@@ -261,8 +404,14 @@ export const api = {
       // multipart upload — don't set Content-Type, the browser sets the boundary
       const form = new FormData();
       form.append("file", file);
+      const headers: Record<string, string> = {};
+      if (getAuthToken) {
+        const token = await getAuthToken();
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+      }
       const res = await fetch(`${BASE}/pipeline/upload-csv`, {
         method: "POST",
+        headers,
         body: form,
       });
       if (!res.ok) {
@@ -286,6 +435,9 @@ export const api = {
 
     draftOutreach: () =>
       request<{ status: string }>("/pipeline/draft-outreach", { method: "POST" }),
+
+    draftCoverNotes: () =>
+      request<{ status: string }>("/pipeline/draft-cover-notes", { method: "POST" }),
 
     feedGraph: () =>
       request<{ status: string; leads_fed: number }>("/pipeline/feed-graph", { method: "POST" }),
@@ -328,4 +480,50 @@ export const api = {
   },
 
   health: () => request<{ status: string }>("/health"),
+
+  // -------------------------------------------------------------------------
+  // Account conversion (Phase 3.4/3.6) + Profile (Phase 3.7)
+  // -------------------------------------------------------------------------
+
+  anon: {
+    // Anonymous pre-signup resume upload: parse -> infer criteria -> match
+    // the shared catalog, all in one response. No auth header attempted
+    // here (getAuthToken is unset/returns null pre-signin, but this is
+    // explicit rather than relying on that) -- this route is deliberately
+    // reachable without an account.
+    uploadResume: async (file: File): Promise<AnonResumeUploadResult> => {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch(`${BASE}/anon/resume`, { method: "POST", body: form });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || `Upload failed: ${res.status}`);
+      }
+      return res.json();
+    },
+  },
+
+  account: {
+    convertAnonSession: (parsed_resume: object, inferred_criteria: object) =>
+      request<{ resume_id: string; search_criteria_id: string }>(
+        "/account/convert-anon-session",
+        {
+          method: "POST",
+          body: JSON.stringify({ parsed_resume, inferred_criteria }),
+        }
+      ),
+  },
+
+  profile: {
+    getSearchCriteria: () =>
+      request<ProfileSearchCriteria>("/profile/search-criteria"),
+
+    updateSearchCriteria: (data: Partial<ProfileSearchCriteria>) =>
+      request<ProfileSearchCriteria>("/profile/search-criteria", {
+        method: "PUT",
+        body: JSON.stringify(data),
+      }),
+
+    getResumes: () => request<ProfileResume[]>("/profile/resumes"),
+  },
 };

@@ -249,6 +249,11 @@ function LeadsPageInner() {
                         <Badge variant={statusVariantMap[lead.status] || "new"}>
                           {statusLabel(lead.status)}
                         </Badge>
+                        {(lead.channel || []).map((ch) => (
+                          <Badge key={ch} variant="outline" className="text-[10px] capitalize">
+                            {ch}
+                          </Badge>
+                        ))}
                       </span>
                     </td>
                     <td className="px-5 py-3.5 text-sm text-muted-foreground">{lead.posted_date || "—"}</td>
@@ -281,6 +286,11 @@ function LeadsPageInner() {
                   <Badge variant={statusVariantMap[selectedLead.status] || "new"}>
                     {statusLabel(selectedLead.status)}
                   </Badge>
+                  {(selectedLead.channel || []).map((ch) => (
+                    <Badge key={ch} variant="outline" className="text-[10px] capitalize">
+                      {ch}
+                    </Badge>
+                  ))}
                 </div>
                 <SheetTitle className="font-display text-2xl">
                   {selectedLead.company || `@${selectedLead.x_handle}`}

@@ -176,7 +176,8 @@ def apollo_match(payload: dict):
     if not APOLLO_API_KEY:
         return None, None
 
-    body = {**payload, "reveal_personal_emails": False}
+    body = {**payload, "reveal_personal_emails": False, "reveal_phone_number": False}
+
     try:
         resp = requests.post(
             APOLLO_MATCH_URL, json=body, headers=_apollo_headers(), timeout=20,

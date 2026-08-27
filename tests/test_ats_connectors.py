@@ -128,6 +128,31 @@ def test_greenhouse_sync_dedups_on_rerun():
     assert len(repo.get_jobs(company["id"])) == 2  # not 4
 
 
+def test_greenhouse_sync_closes_jobs_no_longer_on_the_board():
+    """A job present in an earlier sync but absent from a later one (the
+    company filled/pulled it) must be marked is_open=False, never
+    silently left looking open forever."""
+    with patch("skills.scrape_job_boards.greenhouse.requests.get",
+               return_value=_fake_response(200, GH_JOBS_FIXTURE)):
+        greenhouse.sync_company("acme-close-test")
+
+    # Second sync: the board now only lists the Backend Engineer role --
+    # Frontend Engineer (id 222) has been filled/removed.
+    shrunk_fixture = {"jobs": [GH_JOBS_FIXTURE["jobs"][0]]}
+    with patch("skills.scrape_job_boards.greenhouse.requests.get",
+               return_value=_fake_response(200, shrunk_fixture)):
+        greenhouse.sync_company("acme-close-test")
+
+    company = repo.get_or_create_company("Acme Co", ats_type="greenhouse", ats_token="acme-close-test")
+    jobs = {j["title"]: j for j in repo.get_jobs(company["id"])}
+    assert jobs["Backend Engineer"]["is_open"] is True
+    assert jobs["Frontend Engineer"]["is_open"] is False
+
+    open_jobs = repo.get_jobs(company["id"], open_only=True)
+    assert len(open_jobs) == 1
+    assert open_jobs[0]["title"] == "Backend Engineer"
+
+
 def test_greenhouse_sync_skips_malformed_job_entry():
     fixture = {"jobs": [{"id": None, "title": "No ID"}, GH_JOBS_FIXTURE["jobs"][0]]}
     with patch("skills.scrape_job_boards.greenhouse.requests.get",

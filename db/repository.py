@@ -35,6 +35,7 @@ from db.models import (
     Job,
     Lead,
     Notification,
+    PipelineRun,
     ResearchCache,
     Resume,
     SearchCriteria,
@@ -151,6 +152,7 @@ _LEAD_WRITABLE_FIELDS = {
     "cover_note",
     "outreach_draft",
     "review_decision",
+    "keyword_coverage",
     "applied_at",
     "sent_at",
     "last_checked",
@@ -465,6 +467,87 @@ def mark_notification_read(user_id: str, notification_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Pipeline runs (per-user; Phase 4.4 -- replaces api/main.py's single global
+# _pipeline_run_state dict so two users' on-demand pipeline runs don't
+# collide, and so run status survives an API process restart/replica swap)
+# ---------------------------------------------------------------------------
+
+
+def create_pipeline_run(user_id: str) -> dict:
+    """Start tracking a new pipeline run for user_id. Returns the new row."""
+    if not user_id:
+        raise ValidationError("create_pipeline_run requires a user_id")
+
+    with get_session() as session:
+        run = PipelineRun(user_id=user_id, status="running", steps=[])
+        session.add(run)
+        session.flush()
+        return _to_dict(run)
+
+
+def get_latest_pipeline_run(user_id: str) -> Optional[dict]:
+    """Return user_id's most recently started pipeline run (running or
+    finished), or None if they've never triggered one. This is what
+    /api/pipeline/run-status reads -- "the current/last run for this
+    caller", not a global.
+    """
+    with get_session() as session:
+        run = session.scalar(
+            select(PipelineRun)
+            .where(PipelineRun.user_id == user_id)
+            .order_by(PipelineRun.started_at.desc())
+        )
+        return _to_dict(run) if run else None
+
+
+def get_running_pipeline_run(user_id: str) -> Optional[dict]:
+    """Return user_id's currently-running pipeline run, or None. Used to
+    enforce "one run at a time per user" (the 409 check) without a global
+    lock -- two different users' runs never contend with each other here.
+    """
+    with get_session() as session:
+        run = session.scalar(
+            select(PipelineRun)
+            .where(PipelineRun.user_id == user_id, PipelineRun.status == "running")
+            .order_by(PipelineRun.started_at.desc())
+        )
+        return _to_dict(run) if run else None
+
+
+def update_pipeline_run(run_id: str, fields: dict) -> dict:
+    """Update a pipeline run row by its own id (not user-scoped in the
+    query, since the background thread that calls this already knows
+    exactly which run_id it started and isn't taking it from an untrusted
+    caller -- unlike every user-facing repo function above, there's no
+    "which tenant is asking" ambiguity to guard against here).
+    """
+    with get_session() as session:
+        run = session.get(PipelineRun, run_id)
+        if run is None:
+            raise NotFoundError(f"No pipeline run found with id {run_id}")
+        for key, value in fields.items():
+            setattr(run, key, value)
+        session.flush()
+        return _to_dict(run)
+
+
+def append_pipeline_run_step(run_id: str, step: str, status: str) -> dict:
+    """Append one {step, status} entry to a run's steps list and update
+    current_step -- mirrors api/main.py's old on_step callback, now
+    writing to Postgres instead of an in-memory dict.
+    """
+    with get_session() as session:
+        run = session.get(PipelineRun, run_id)
+        if run is None:
+            raise NotFoundError(f"No pipeline run found with id {run_id}")
+        run.current_step = step if status == "running" else None
+        if status in ("ok", "error"):
+            run.steps = [*(run.steps or []), {"step": step, "status": status}]
+        session.flush()
+        return _to_dict(run)
+
+
+# ---------------------------------------------------------------------------
 # Gmail accounts (per-user)
 # ---------------------------------------------------------------------------
 
@@ -578,15 +661,28 @@ def mark_company_scraped(company_id: str) -> None:
 def add_job(company_id: str, source: str, external_id: str, title: str, **kwargs) -> Optional[dict]:
     """Add a job, deduped on (company_id, external_id). Returns None if the
     job already exists (idempotent re-scrape), the dict otherwise.
+
+    Every call -- whether it inserts a new row or hits the dedup path on
+    an already-known job -- stamps last_seen_at=now() and is_open=True on
+    that job. This is what makes "still open" a real signal instead of a
+    one-time guess: a job only keeps a fresh last_seen_at/is_open=True by
+    genuinely showing up in the company's live board API again on a
+    later sync. See close_unseen_jobs() below for the other half (closing
+    jobs that stopped showing up).
     """
     if not (company_id and source and external_id and title):
         raise ValidationError("add_job requires company_id, source, external_id, and title")
+
+    now = datetime.now(timezone.utc)
 
     with get_session() as session:
         existing = session.scalar(
             select(Job).where(Job.company_id == company_id, Job.external_id == external_id)
         )
         if existing:
+            existing.last_seen_at = now
+            existing.is_open = True
+            session.flush()
             return None
 
         job = Job(
@@ -599,19 +695,83 @@ def add_job(company_id: str, source: str, external_id: str, title: str, **kwargs
             jd_text=kwargs.get("jd_text"),
             apply_url=kwargs.get("apply_url"),
             posted_at=kwargs.get("posted_at"),
+            last_seen_at=now,
+            is_open=True,
         )
         session.add(job)
         session.flush()
         return _to_dict(job)
 
 
-def get_jobs(company_id: Optional[str] = None) -> list[dict]:
+def close_unseen_jobs(company_id: str, seen_external_ids: set[str]) -> int:
+    """After a full sync of one company's board, mark every job for that
+    company NOT in seen_external_ids as closed (is_open=False) -- the
+    company's own live API just returned the current full set of open
+    postings, so anything previously in our catalog but absent from that
+    response has been filled or pulled.
+
+    Only touches jobs that are currently is_open=True (a job already
+    marked closed stays closed; this never "reopens" anything -- that
+    only happens via add_job's dedup path seeing it again for real).
+
+    Returns the number of jobs newly marked closed.
+    """
+    with get_session() as session:
+        stmt = select(Job).where(Job.company_id == company_id, Job.is_open.is_(True))
+        candidates = session.scalars(stmt).all()
+
+        closed = 0
+        for job in candidates:
+            if job.external_id not in seen_external_ids:
+                job.is_open = False
+                closed += 1
+
+        if closed:
+            session.flush()
+        return closed
+
+
+def get_jobs(company_id: Optional[str] = None, open_only: bool = False) -> list[dict]:
+    """Return catalog jobs, optionally scoped to one company and/or
+    filtered to only currently-open ones (is_open=True -- see add_job's
+    docstring for how that flag stays accurate).
+
+    open_only defaults to False so existing internal call sites (ATS
+    connector tests, prioritize_tokens' bookkeeping) keep seeing every
+    row unchanged; user-facing matching (skills/match_jobs.py's callers)
+    should pass open_only=True.
+    """
     with get_session() as session:
         stmt = select(Job)
         if company_id:
             stmt = stmt.where(Job.company_id == company_id)
+        if open_only:
+            stmt = stmt.where(Job.is_open.is_(True))
         jobs = session.scalars(stmt).all()
         return [_to_dict(j) for j in jobs]
+
+
+def get_job_with_company(job_id: str) -> Optional[dict]:
+    """Fetch a single catalog job plus its company name, for the
+    job-to-lead conversion path (Phase 5.3's save-job route) -- the same
+    join api/main.py's anon_tailored_preview already does inline, pulled
+    out here so it's reusable instead of duplicated a second time.
+
+    Returns None if job_id doesn't exist or isn't a well-formed UUID
+    (same "malformed id is indistinguishable from not found" convention
+    every other id-scoped lookup in this module follows).
+    """
+    if not _is_valid_uuid(job_id):
+        return None
+
+    with get_session() as session:
+        job = session.get(Job, job_id)
+        if job is None:
+            return None
+        company = session.get(Company, job.company_id)
+        job_dict = _to_dict(job)
+        job_dict["company_name"] = company.name if company else None
+        return job_dict
 
 
 def get_companies_by_ats_type(ats_type: str) -> list[dict]:
