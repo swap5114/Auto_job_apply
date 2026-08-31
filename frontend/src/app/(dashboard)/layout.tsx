@@ -1,5 +1,4 @@
 import { TopBar } from "@/components/layout/topbar";
-import { Toaster } from "sonner";
 import { PipelineProvider } from "@/lib/pipeline-context";
 import { RequireAuth } from "@/components/layout/require-auth";
 
@@ -20,8 +19,6 @@ export default function DashboardLayout({
 
           {/* Content — padded to clear the floating top bar */}
           <main className="mx-auto max-w-6xl px-4 pt-24">{children}</main>
-
-          <Toaster position="bottom-right" richColors />
         </div>
       </PipelineProvider>
     </RequireAuth>

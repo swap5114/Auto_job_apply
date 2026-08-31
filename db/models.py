@@ -234,8 +234,18 @@ class Lead(Base):
 
     applied_at = Column(DateTime(timezone=True), nullable=True)
     sent_at = Column(DateTime(timezone=True), nullable=True)
+    # When a reply from the contact was first detected (v1 Task 7). Set by
+    # orchestrator/check_followups.py when the follow-up graph reports status
+    # "replied"; surfaced on the dashboard's reply funnel.
+    replied_at = Column(DateTime(timezone=True), nullable=True)
     last_checked = Column(DateTime(timezone=True), nullable=True)
     followup_count = Column(Integer, nullable=False, default=0)
+
+    # Short machine reason a lead is stuck/needs attention (v1 Task 11),
+    # e.g. "no_contact_found", "tailor_failed", "draft_failed", "send_failed",
+    # "needs_gmail". Surfaced on the dashboard so failures are visible and
+    # retriable, not silent. Cleared on a successful reprocess.
+    failure_reason = Column(String, nullable=True)
 
     listing_url = Column(String, nullable=True)
     # Original listing's posting date, kept as free-form text since sources
@@ -270,6 +280,11 @@ class GmailAccount(Base):
     email = Column(String, nullable=False)
     encrypted_refresh_token = Column(Text, nullable=False)
     scopes = Column(ARRAY(String), nullable=False, default=list)
+    # Per-user send preference (v1): "draft" (create a Gmail draft for the
+    # user to send manually) or "direct" (send automatically once approved).
+    # Replaces the old global GMAIL_DIRECT_SEND env flag. Chosen at connect
+    # time, editable in settings.
+    send_mode = Column(String, nullable=False, default="draft")
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
     user = relationship("User", back_populates="gmail_accounts")

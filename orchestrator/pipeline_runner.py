@@ -71,8 +71,8 @@ def run_sourcing_pipeline(
       1. Scrape sources (arbeitnow, jobicy, careers_page, company_list, yc, x)
       2. find_contact_email
       3. tailor_resume
-      4. draft_outreach + draft_cover_note (each filters to leads with the
-         relevant channel internally -- see their own run()'s docstrings)
+      4. draft_outreach (outreach channel only -- the apply channel and its
+         cover-note drafting were removed in v1)
       5. feed_graph (pauses leads at review interrupt)
 
     Args:
@@ -89,12 +89,13 @@ def run_sourcing_pipeline(
             db.current_user's single-operator stand-in only for the
             standalone CLI entry point below (`python -m
             orchestrator.pipeline_runner sourcing`), which has no real
-            per-request identity to thread through. The scraper/enrichment
-            steps above (1-4) already resolve their own user_id
-            per-lead-source internally via db.current_user, unchanged from
-            before Phase 4 -- see PHASE_4_PLAN.md's 4.1 audit, which
-            flagged those `run()` functions as a separate, out-of-scope
-            concern from the feed_graph bug this fixes.
+            per-request identity to thread through. v1 fix: user_id is now
+            threaded into EVERY step (scrape, find_contact_email,
+            tailor_resume, draft_outreach, feed_graph), not just feed_graph
+            -- so a signed-in user's run writes leads/enrichment/drafts to
+            their OWN leads table, not the local operator's. Each run()
+            still defaults to db.current_user when user_id is None (the CLI
+            path), so standalone invocation is unchanged.
 
     Returns a summary dict with per-step results.
     """
@@ -117,42 +118,39 @@ def run_sourcing_pipeline(
     for source in sources:
         if source == "arbeitnow":
             from skills.scrape_job_boards.arbeitnow import run as arbeitnow_run
-            results.append(_run_step("scrape:arbeitnow", arbeitnow_run, callback=cb))
+            results.append(_run_step("scrape:arbeitnow", arbeitnow_run, user_id=user_id, callback=cb))
         elif source == "jobicy":
             from skills.scrape_job_boards.jobicy import run as jobicy_run
-            results.append(_run_step("scrape:jobicy", jobicy_run, callback=cb))
+            results.append(_run_step("scrape:jobicy", jobicy_run, user_id=user_id, callback=cb))
         elif source == "careers_page":
             from skills.scrape_job_boards.careers_page import run as careers_run
-            results.append(_run_step("scrape:careers_page", careers_run, callback=cb))
+            results.append(_run_step("scrape:careers_page", careers_run, user_id=user_id, callback=cb))
         elif source == "company_list":
             if csv_path:
                 from skills.scrape_job_boards.company_list import run as cl_run
-                results.append(_run_step("scrape:company_list", cl_run, csv_path, callback=cb))
+                results.append(_run_step("scrape:company_list", cl_run, csv_path, user_id=user_id, callback=cb))
             else:
                 print("  ⚠️  'company_list' requested but no csv_path provided, skipping")
         elif source == "yc":
             from skills.scrape_job_boards.yc_startups import run as yc_run
-            results.append(_run_step("scrape:yc", yc_run, yc_max_leads, callback=cb))
+            results.append(_run_step("scrape:yc", yc_run, yc_max_leads, user_id=user_id, callback=cb))
         elif source == "x":
             from skills.scrape_x_leads import run as x_run
-            results.append(_run_step("scrape:x", x_run, x_max_leads, callback=cb))
+            results.append(_run_step("scrape:x", x_run, x_max_leads, user_id=user_id, callback=cb))
         else:
             print(f"  ⚠️  Unknown source '{source}', skipping")
 
     # --- 2. Enrich: find contact emails ---
     from skills.find_contact_email import run as find_email_run
-    results.append(_run_step("find_contact_email", find_email_run, callback=cb))
+    results.append(_run_step("find_contact_email", find_email_run, user_id=user_id, callback=cb))
 
     # --- 3. Tailor resumes ---
     from skills.tailor_resume import run as tailor_run
-    results.append(_run_step("tailor_resume", tailor_run, callback=cb))
+    results.append(_run_step("tailor_resume", tailor_run, user_id=user_id, callback=cb))
 
     # --- 4. Draft outreach + cover notes (channel-filtered internally) ---
     from skills.draft_outreach import run as draft_run
-    results.append(_run_step("draft_outreach", draft_run, callback=cb))
-
-    from skills.draft_cover_note import run as draft_cover_note_run
-    results.append(_run_step("draft_cover_note", draft_cover_note_run, callback=cb))
+    results.append(_run_step("draft_outreach", draft_run, user_id=user_id, callback=cb))
 
     # --- 5. Feed into graph (pause at review) ---
     from orchestrator.feed_graph import feed_pending_leads
@@ -167,6 +165,62 @@ def run_sourcing_pipeline(
     print("=" * 60 + "\n")
 
     return {"pipeline": "sourcing", "ok": ok, "failed": failed, "steps": results}
+
+
+def run_pipeline_for_leads(
+    user_id: str | None = None,
+    lead_ids: list[str] | None = None,
+    progress_callback=None,
+) -> dict:
+    """Process a user's already-saved leads through to the review queue --
+    the hero-chat "approve these startups -> start outreach" bridge (v1 Task 10).
+
+    Unlike run_sourcing_pipeline, this does NO scraping: the leads already
+    exist (saved from matched catalog jobs at status="matched"). It runs the
+    persisting processing chain in order:
+
+      1. find_contact_email  -> fills contact_email (uses the shared cache)
+      2. tailor_resume       -> resume_version, status="tailored"
+      3. draft_outreach      -> outreach_draft, status="pending_review"
+      4. feed_graph          -> pauses each at the review interrupt
+
+    Each skill is field/status-driven and user-scoped, so it naturally acts on
+    exactly the leads that still need each step (which, for a fresh hero-chat
+    user, are the ones they just saved). Each step is wrapped so one failing
+    stage never aborts the rest (per-lead isolation lives inside the graph
+    nodes; per-step isolation lives here).
+
+    lead_ids is accepted for validation/telemetry by the caller (the API route
+    checks they belong to the user before enqueuing); the processing itself is
+    field-driven, not id-filtered.
+    """
+    print("\n" + "=" * 60)
+    print(f"  PROCESS-LEADS PIPELINE START  [{_now()}]  ({len(lead_ids or [])} leads)")
+    print("=" * 60)
+
+    cb = progress_callback
+    results = []
+
+    from skills.find_contact_email import run as find_email_run
+    results.append(_run_step("find_contact_email", find_email_run, user_id=user_id, callback=cb))
+
+    from skills.tailor_resume import run as tailor_run
+    results.append(_run_step("tailor_resume", tailor_run, user_id=user_id, callback=cb))
+
+    from skills.draft_outreach import run as draft_run
+    results.append(_run_step("draft_outreach", draft_run, user_id=user_id, callback=cb))
+
+    from orchestrator.feed_graph import feed_pending_leads
+    results.append(_run_step("feed_graph", feed_pending_leads, user_id=user_id, callback=cb))
+
+    ok = sum(1 for r in results if r["status"] == "ok")
+    failed = sum(1 for r in results if r["status"] == "error")
+
+    print("\n" + "=" * 60)
+    print(f"  PROCESS-LEADS PIPELINE DONE  [{_now()}]  {ok} ok, {failed} failed")
+    print("=" * 60 + "\n")
+
+    return {"pipeline": "process_leads", "ok": ok, "failed": failed, "steps": results}
 
 
 def run_followup_pipeline(progress_callback=None, user_id: str | None = None) -> dict:
@@ -221,13 +275,17 @@ def run_catalog_refresh(providers: list[str] | None = None, progress_callback=No
     print("=" * 60)
 
     if providers is None:
-        providers = ["greenhouse", "lever", "ashby"]
+        # v1: YC is the primary catalog source for the hero-chat match feed.
+        providers = ["yc", "greenhouse", "lever", "ashby"]
 
     cb = progress_callback
     results = []
 
     for provider in providers:
-        if provider == "greenhouse":
+        if provider == "yc":
+            from skills.scrape_job_boards.yc_startups import run_catalog as yc_catalog_run
+            results.append(_run_step("catalog:yc", yc_catalog_run, callback=cb))
+        elif provider == "greenhouse":
             from skills.scrape_job_boards.greenhouse import run as greenhouse_run
             results.append(_run_step("catalog:greenhouse", greenhouse_run, callback=cb))
         elif provider == "lever":

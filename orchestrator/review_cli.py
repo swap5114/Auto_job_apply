@@ -79,10 +79,8 @@ def get_pending_review_leads(user_id: Optional[str] = None, checkpointer=None) -
                 "company": values.get("company", "N/A"),
                 "role": values.get("role", "N/A"),
                 "source": values.get("source", "N/A"),
-                "active_channel": values.get("active_channel", "outreach"),
                 "resume_version": values.get("resume_version", "N/A"),
                 "outreach_draft": values.get("outreach_draft", "N/A"),
-                "cover_note": values.get("cover_note", "N/A"),
                 "status": values.get("status", "pending_review")
             })
     return pending
@@ -102,21 +100,14 @@ def print_digest(user_id: Optional[str] = None, checkpointer=None) -> None:
         return
 
     for idx, lead in enumerate(pending, 1):
-        channel = lead.get("active_channel", "outreach")
-        print(f"\n[{idx}] LEAD ID: {lead['lead_id']} [{channel}]")
+        print(f"\n[{idx}] LEAD ID: {lead['lead_id']}")
         print(f"    Company: {lead['company']} | Role: {lead['role']} | Source: {lead['source']}")
         print(f"    Resume File: {lead['resume_version']}")
         print("    " + "-" * 72)
-        if channel == "apply":
-            print("    COVER NOTE:")
-            note_lines = (lead.get("cover_note") or "N/A").splitlines()
-            for line in note_lines:
-                print(f"        {line}")
-        else:
-            print("    OUTREACH DRAFT:")
-            draft_lines = (lead.get("outreach_draft") or "N/A").splitlines()
-            for line in draft_lines:
-                print(f"        {line}")
+        print("    OUTREACH DRAFT:")
+        draft_lines = (lead.get("outreach_draft") or "N/A").splitlines()
+        for line in draft_lines:
+            print(f"        {line}")
         print("    " + "-" * 72)
 
     print(f"\nTo take action, run:")
@@ -130,22 +121,16 @@ def _resolve_paused_review_thread(graph, user_id: str, lead_id: str, channel: Op
     """Finds the checkpoint thread currently paused at review for
     (user_id, lead_id), scoped to a specific channel when given.
 
-    Phase 5.2: a lead can have up to two independent threads (one per
-    channel in Lead.channel), each with its own review checkpoint. A
-    caller that already knows which channel it means (e.g. the apply
-    review UI) passes channel explicitly and only that thread is
-    considered. A caller that doesn't (e.g. existing outreach-only CLI/API
-    call sites, or an already-in-flight pre-Phase-5 outreach thread) gets
-    the same lookup order every one of them already relied on: try the
-    legacy 2-arg thread_id first (make_thread_id(user_id, lead_id), i.e.
-    channel=None), then fall back to trying "outreach" and "apply"
-    explicitly -- this keeps every pre-Phase-5 caller's behavior
-    unchanged while still resolving correctly for new dual-channel leads.
+    v1 is outreach-only. We try the legacy 2-arg thread_id first
+    (make_thread_id(user_id, lead_id), i.e. channel=None), then the
+    "outreach" channel thread that feed_graph now writes. The `channel`
+    param is retained (defaulting to None) for backward-compatible call
+    sites but only ever resolves outreach.
 
     Returns (thread_id, state) for the first matching paused-at-review
     thread found, or (None, None) if none match.
     """
-    candidates = [channel] if channel is not None else [None, "outreach", "apply"]
+    candidates = [channel] if channel is not None else [None, "outreach"]
     for candidate in candidates:
         thread_id = make_thread_id(user_id, lead_id, channel=candidate)
         config = {"configurable": {"thread_id": thread_id}}
@@ -193,25 +178,20 @@ def approve_lead(
 
     config = {"configurable": {"thread_id": thread_id}}
     graph.invoke(Command(resume="approved"), config)
-    resolved_channel = state.values.get("active_channel") or "outreach"
-    print(f"✅ [APPROVED] Lead '{lead_id}' ({resolved_channel}) approved successfully.")
 
-    # The LangGraph checkpoint (above) is what actually drives the review
-    # flow forward, but the leads table is the system of record for anything
-    # querying/listing leads (the API, the dashboard). Syncing it here keeps
-    # both in agreement. A failure here is loud (printed), not silent --
-    # per the project's "never silently skip" rule -- but doesn't roll back
-    # the already-resumed graph decision, since that resume already happened
-    # and can't be un-done from here.
-    #
-    # For the apply channel, "approved" means the tailored resume + cover
-    # note are ready to hand off -- the state-machine's own naming for
-    # that is "ready_to_apply" (matched -> tailoring -> ready_to_apply ->
-    # applied), distinct from outreach's "approved" (which still has a
-    # send step ahead of it).
-    lead_status = "ready_to_apply" if resolved_channel == "apply" else "approved"
+    # The graph ran through send_node on approval, so the TRUE resulting
+    # status is whatever send_node produced (sent / draft_created /
+    # approved_needs_gmail / send_failed), not a flat "approved". Read it back
+    # from the checkpoint and sync THAT to the leads table (the system of
+    # record the dashboard/API read), so the dashboard reflects reality
+    # instead of a stale "approved". Fall back to "approved" if the state is
+    # somehow unreadable.
+    final = graph.get_state(config)
+    final_status = (final.values.get("status") if (final and final.values) else None) or "approved"
+    print(f"✅ [APPROVED] Lead '{lead_id}' -> {final_status}.")
+
     try:
-        repo.update_lead(user_id, lead_id, {"status": lead_status, "review_decision": "approved"})
+        repo.update_lead(user_id, lead_id, {"status": final_status, "review_decision": "approved"})
     except Exception as e:
         print(f"⚠️ Warning: graph approved '{lead_id}' but failed to sync leads table status: {e}")
 
@@ -228,10 +208,7 @@ def edit_lead(
     """Resumes the review checkpoint for lead_id with an edited outreach draft.
 
     See approve_lead's docstring for the user_id/checkpointer/channel
-    contract -- identical here. Editing the apply channel's cover note
-    (rather than the outreach draft) is a distinct flow -- see
-    edit_apply_lead below -- since the interrupt payload/resume shape for
-    that channel carries cover_note, not outreach_draft.
+    contract -- identical here.
     """
     if user_id is None:
         user_id = get_current_user_id()
@@ -270,58 +247,14 @@ def edit_lead(
     }
 
     graph.invoke(Command(resume=decision), config)
-    print(f"✏️ [EDITED & APPROVED] Lead '{lead_id}' updated with new draft and approved.")
+
+    final = graph.get_state(config)
+    final_status = (final.values.get("status") if (final and final.values) else None) or "approved"
+    print(f"✏️ [EDITED & APPROVED] Lead '{lead_id}' updated with new draft -> {final_status}.")
 
     try:
         repo.update_lead(user_id, lead_id, {
-            "status": "approved", "outreach_draft": new_draft, "review_decision": "edited",
-        })
-    except Exception as e:
-        print(f"⚠️ Warning: graph edited '{lead_id}' but failed to sync leads table status: {e}")
-
-    return True
-
-
-def edit_apply_lead(
-    lead_id: str,
-    new_cover_note: Optional[str] = None,
-    user_id: Optional[str] = None,
-    checkpointer=None,
-) -> bool:
-    """Resumes the apply-channel review checkpoint for lead_id with an
-    edited cover note. Apply-channel counterpart to edit_lead (which
-    edits outreach_draft) -- always resolves the "apply" channel's thread
-    specifically, since a cover-note edit only ever makes sense there.
-    """
-    if user_id is None:
-        user_id = get_current_user_id()
-    if checkpointer is None:
-        checkpointer = get_postgres_checkpointer()
-
-    graph = build_pipeline_graph(checkpointer)
-    thread_id = make_thread_id(user_id, lead_id, channel="apply")
-    config = {"configurable": {"thread_id": thread_id}}
-
-    state = graph.get_state(config)
-    if not state or not state.next or "review" not in state.next:
-        print(f"Error: Lead ID '{lead_id}' has no apply-channel review paused.")
-        return False
-
-    if not new_cover_note or not new_cover_note.strip():
-        print("Error: Cover note cannot be empty.")
-        return False
-
-    decision = {
-        "status": "approved",
-        "cover_note": new_cover_note,
-    }
-
-    graph.invoke(Command(resume=decision), config)
-    print(f"✏️ [EDITED & APPROVED] Lead '{lead_id}' (apply) updated with new cover note and approved.")
-
-    try:
-        repo.update_lead(user_id, lead_id, {
-            "status": "ready_to_apply", "cover_note": new_cover_note, "review_decision": "edited",
+            "status": final_status, "outreach_draft": new_draft, "review_decision": "edited",
         })
     except Exception as e:
         print(f"⚠️ Warning: graph edited '{lead_id}' but failed to sync leads table status: {e}")
@@ -375,41 +308,26 @@ def main():
     # approve command
     approve_parser = subparsers.add_parser("approve", help="Approve a lead by lead_id")
     approve_parser.add_argument("lead_id", help="Lead ID to approve")
-    approve_parser.add_argument(
-        "--channel", choices=["apply", "outreach"], default=None,
-        help="Which channel's review thread to approve, for leads paused on both (default: auto-detect)",
-    )
 
     # edit command
     edit_parser = subparsers.add_parser("edit", help="Edit draft and approve a lead by lead_id")
     edit_parser.add_argument("lead_id", help="Lead ID to edit")
     edit_parser.add_argument("--draft", help="Optional new outreach draft text", default=None)
-    edit_parser.add_argument(
-        "--channel", choices=["apply", "outreach"], default=None,
-        help="Which channel's review thread to edit, for leads paused on both (default: auto-detect)",
-    )
 
     # reject command
     reject_parser = subparsers.add_parser("reject", help="Reject a lead by lead_id")
     reject_parser.add_argument("lead_id", help="Lead ID to reject")
-    reject_parser.add_argument(
-        "--channel", choices=["apply", "outreach"], default=None,
-        help="Which channel's review thread to reject, for leads paused on both (default: auto-detect)",
-    )
 
     args = parser.parse_args()
 
     if args.command in ("digest", "list") or not args.command:
         print_digest()
     elif args.command == "approve":
-        approve_lead(args.lead_id, channel=args.channel)
+        approve_lead(args.lead_id)
     elif args.command == "edit":
-        if args.channel == "apply":
-            edit_apply_lead(args.lead_id, args.draft)
-        else:
-            edit_lead(args.lead_id, args.draft, channel=args.channel)
+        edit_lead(args.lead_id, args.draft)
     elif args.command == "reject":
-        reject_lead(args.lead_id, channel=args.channel)
+        reject_lead(args.lead_id)
 
 
 if __name__ == "__main__":

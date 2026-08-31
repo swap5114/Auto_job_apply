@@ -155,7 +155,9 @@ _LEAD_WRITABLE_FIELDS = {
     "keyword_coverage",
     "applied_at",
     "sent_at",
+    "replied_at",
     "last_checked",
+    "failure_reason",
     "followup_count",
     "listing_url",
     "posted_date",
@@ -845,3 +847,95 @@ def set_cached_research(job_id: str, result_json: dict) -> dict:
         session.add(cache_row)
         session.flush()
         return _to_dict(cache_row)
+
+
+# ---------------------------------------------------------------------------
+# Gmail accounts (per-user OAuth, Task 5) -- one connected Gmail per user in
+# v1. Stores an ENCRYPTED refresh token (never a plaintext token) plus the
+# user's send preference ("draft" | "direct").
+# ---------------------------------------------------------------------------
+
+
+def get_gmail_account(user_id: str) -> Optional[dict]:
+    """Return the user's connected Gmail account (or None). Scoped by
+    user_id -- another tenant's row is invisible here, same discipline as
+    every other per-user lookup."""
+    with get_session() as session:
+        acct = session.scalar(
+            select(GmailAccount).where(GmailAccount.user_id == user_id)
+        )
+        return _to_dict(acct) if acct else None
+
+
+def upsert_gmail_account(
+    user_id: str,
+    email: str,
+    encrypted_refresh_token: str,
+    scopes: Optional[list] = None,
+    send_mode: str = "draft",
+) -> dict:
+    """Create or update the user's connected Gmail account.
+
+    v1 keeps a single Gmail per user: if the user reconnects (same or a
+    different Google account), the existing row is updated in place rather
+    than creating a second one. send_mode is preserved across a reconnect
+    only when not explicitly changed by the caller.
+    """
+    if not user_id:
+        raise ValidationError("upsert_gmail_account requires a user_id")
+    if not email:
+        raise ValidationError("upsert_gmail_account requires an email")
+    if not encrypted_refresh_token:
+        raise ValidationError("upsert_gmail_account requires an encrypted_refresh_token")
+    if send_mode not in ("draft", "direct"):
+        raise ValidationError(f"invalid send_mode: {send_mode!r} (expected 'draft' or 'direct')")
+
+    with get_session() as session:
+        acct = session.scalar(
+            select(GmailAccount).where(GmailAccount.user_id == user_id)
+        )
+        if acct:
+            acct.email = email
+            acct.encrypted_refresh_token = encrypted_refresh_token
+            acct.scopes = scopes or []
+            acct.send_mode = send_mode
+            session.flush()
+            return _to_dict(acct)
+
+        acct = GmailAccount(
+            user_id=user_id,
+            email=email,
+            encrypted_refresh_token=encrypted_refresh_token,
+            scopes=scopes or [],
+            send_mode=send_mode,
+        )
+        session.add(acct)
+        session.flush()
+        return _to_dict(acct)
+
+
+def update_gmail_send_mode(user_id: str, send_mode: str) -> dict:
+    """Update just the send preference for the user's connected Gmail."""
+    if send_mode not in ("draft", "direct"):
+        raise ValidationError(f"invalid send_mode: {send_mode!r} (expected 'draft' or 'direct')")
+    with get_session() as session:
+        acct = session.scalar(
+            select(GmailAccount).where(GmailAccount.user_id == user_id)
+        )
+        if not acct:
+            raise NotFoundError("No connected Gmail account for this user")
+        acct.send_mode = send_mode
+        session.flush()
+        return _to_dict(acct)
+
+
+def delete_gmail_account(user_id: str) -> bool:
+    """Disconnect the user's Gmail. Returns True if a row was removed."""
+    with get_session() as session:
+        acct = session.scalar(
+            select(GmailAccount).where(GmailAccount.user_id == user_id)
+        )
+        if not acct:
+            return False
+        session.delete(acct)
+        return True

@@ -20,22 +20,9 @@ import { Header } from "@/components/layout/header";
 import { PageTransition } from "@/components/layout/page-transition";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { SegmentedControl } from "@/components/ui/segmented-control";
 import { AnimatedCounter } from "@/components/ui/animated-counter";
 import { staggerContainer, fadeInUp, scaleIn } from "@/lib/motion";
 import { api, type MatchedJob } from "@/lib/api";
-
-type ChannelChoice = "both" | "apply" | "outreach";
-
-const CHANNEL_OPTIONS: { label: string; value: ChannelChoice }[] = [
-  { label: "Both", value: "both" },
-  { label: "Apply", value: "apply" },
-  { label: "Outreach", value: "outreach" },
-];
-
-function channelsFor(choice: ChannelChoice): ("apply" | "outreach")[] {
-  return choice === "both" ? ["apply", "outreach"] : [choice];
-}
 
 function Panel({ className = "", children }: { className?: string; children: React.ReactNode }) {
   return (
@@ -52,7 +39,6 @@ export default function MatchesPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [savingId, setSavingId] = useState<string | null>(null);
-  const [channelChoice, setChannelChoice] = useState<Record<string, ChannelChoice>>({});
 
   async function load() {
     setLoading(true);
@@ -87,8 +73,7 @@ export default function MatchesPage() {
   async function handleSave(job: MatchedJob) {
     setSavingId(job.id);
     try {
-      const channel = channelsFor(channelChoice[job.id] ?? "both");
-      const lead = await api.jobs.save(job.id, channel);
+      const lead = await api.jobs.save(job.id);
       setJobs((prev) =>
         prev.map((j) =>
           j.id === job.id
@@ -196,7 +181,6 @@ export default function MatchesPage() {
               {jobs.map((job) => {
                 const saved = !!job.already_saved_lead_id;
                 const busy = savingId === job.id;
-                const choice = channelChoice[job.id] ?? "both";
 
                 return (
                   <motion.div key={job.id} variants={fadeInUp} layout>
@@ -268,19 +252,12 @@ export default function MatchesPage() {
                             <ArrowRight className="ml-1.5 h-3 w-3" />
                           </Button>
                         ) : (
-                          <div className="flex items-center gap-2">
-                            <SegmentedControl
-                              options={CHANNEL_OPTIONS}
-                              value={choice}
-                              onChange={(v) => setChannelChoice((prev) => ({ ...prev, [job.id]: v }))}
-                            />
-                            <Button size="sm" disabled={busy} onClick={() => handleSave(job)}>
-                              {busy ? (
-                                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                              ) : null}
-                              Save
-                            </Button>
-                          </div>
+                          <Button size="sm" disabled={busy} onClick={() => handleSave(job)}>
+                            {busy ? (
+                              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                            ) : null}
+                            Save to pipeline
+                          </Button>
                         )}
                       </div>
                     </Panel>

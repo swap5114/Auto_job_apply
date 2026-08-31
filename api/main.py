@@ -32,9 +32,9 @@ from datetime import datetime, timezone
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile, File
+from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 
 # Add project root to path so we can import existing modules
@@ -132,6 +132,8 @@ class LeadResponse(BaseModel):
     channel: list[str] = []
     cover_note: str = ""
     applied_at: str = ""
+    replied_at: str = ""
+    failure_reason: str = ""
     job_id: str = ""
 
 
@@ -151,18 +153,10 @@ class EditRequest(BaseModel):
     outreach_draft: str
 
 
-class EditCoverNoteRequest(BaseModel):
-    cover_note: str
-
-
 class SaveJobRequest(BaseModel):
-    """Which channel(s) to create the lead for -- a signed-in user acting
-    on a matched catalog job (Phase 5.3) may want apply only, outreach
-    only, or both. Defaults to both since that's this channel's headline
-    scenario (the plan's own "a lead can be both apply and outreach at
-    once" framing).
-    """
-    channel: list[str] = ["apply", "outreach"]
+    """Which channel to create the lead for. v1 is outreach-only (the apply
+    channel was removed), so this is fixed to ["outreach"]."""
+    channel: list[str] = ["outreach"]
 
 
 class DemoProjectResponse(BaseModel):
@@ -392,6 +386,8 @@ def _lead_to_response(lead: dict) -> LeadResponse:
         channel=lead.get("channel") or [],
         cover_note=s(lead.get("cover_note")),
         applied_at=s(lead.get("applied_at")),
+        replied_at=s(lead.get("replied_at")),
+        failure_reason=s(lead.get("failure_reason")),
         job_id=s(lead.get("job_id")),
     )
 
@@ -473,15 +469,34 @@ def save_job_as_lead(
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
+    # Derive a domain from the catalog job's apply_url (for YC, this is the
+    # company's own website) so downstream email discovery can resolve a real
+    # founder/CEO via Apollo instead of guessing from the company name.
+    apply_url = job.get("apply_url") or ""
+    domain = ""
+    if apply_url:
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(apply_url if "://" in apply_url else f"https://{apply_url}").netloc
+            domain = host.replace("www.", "").strip()
+            # Skip ATS/job-board hosts -- those aren't the employer's domain.
+            if any(b in domain for b in ("greenhouse.io", "lever.co", "ashbyhq.com", "ycombinator.com")):
+                domain = ""
+        except Exception:
+            domain = ""
+
     try:
         lead = repo.add_lead(user_id, {
             "job_id": job["id"],
-            "channel": body.channel,
+            # v1 is outreach-only; the apply channel was removed, so every
+            # saved job becomes an outreach lead regardless of the request.
+            "channel": ["outreach"],
             "source": job.get("source"),
             "company": job.get("company_name") or "",
             "role": job.get("title") or "",
             "jd_text": job.get("jd_text") or "",
-            "listing_url": job.get("apply_url") or "",
+            "listing_url": apply_url,
+            "domain": domain,
             "status": "matched",
         })
     except repo.DuplicateLeadError as e:
@@ -569,9 +584,8 @@ def reject_lead(
 def edit_lead(lead_id: str, body: EditRequest, user_id: str = Depends(get_authenticated_user_id)):
     """Edit outreach draft and approve the lead (graph resume, or direct fallback).
 
-    Outreach-channel only -- see edit_apply_lead below for the apply
-    channel's cover-note equivalent. Kept as two distinct routes with two
-    distinct request bodies (outreach_draft vs cover_note) rather than one
+    v1 is outreach-only. Kept as a distinct route with its own request body
+    (outreach_draft) rather than one
     route branching on a field name, since the two artifacts are shaped
     differently enough that one shared payload would be harder to read,
     not easier (per PHASE_5_PLAN.md 5.3's own guidance on this).
@@ -596,58 +610,6 @@ def edit_lead(lead_id: str, body: EditRequest, user_id: str = Depends(get_authen
     return {"status": "approved", "lead_id": lead_id, "draft_updated": True, "via": "direct"}
 
 
-@app.post("/api/leads/{lead_id}/edit-cover-note")
-def edit_apply_lead(
-    lead_id: str, body: EditCoverNoteRequest, user_id: str = Depends(get_authenticated_user_id)
-):
-    """Edit the apply-channel's cover note and approve the lead (graph
-    resume, or direct fallback). Apply-channel counterpart to edit_lead.
-    """
-    try:
-        from orchestrator.review_cli import edit_apply_lead as _edit
-        if _edit(lead_id, body.cover_note, user_id=user_id):
-            _invalidate_leads_cache(user_id)
-            return {"status": "ready_to_apply", "lead_id": lead_id, "cover_note_updated": True, "via": "graph"}
-    except Exception as e:
-        print(f"  edit-cover-note via graph failed ({e}), falling back to direct update")
-
-    try:
-        repo.update_lead(user_id, lead_id, {
-            "status": "ready_to_apply",
-            "cover_note": body.cover_note,
-            "review_decision": "edited",
-        })
-    except repo.NotFoundError:
-        raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
-    _invalidate_leads_cache(user_id)
-    return {"status": "ready_to_apply", "lead_id": lead_id, "cover_note_updated": True, "via": "direct"}
-
-
-@app.post("/api/leads/{lead_id}/mark-applied")
-def mark_applied(lead_id: str, user_id: str = Depends(get_authenticated_user_id)):
-    """Mark a lead as applied -- the apply channel's terminal action,
-    called by the user after they've actually submitted the application
-    via the real listing_url deep link. No auto-fill, no automated
-    submission-detection; this is a plain, explicit, human-driven status
-    update (per this channel's locked "prepare + hand off, never a bot
-    submitting a form" constraint).
-
-    A plain repo.update_lead call, same tenant-isolation guarantee every
-    other lead-scoped route already gets for free -- a different user
-    calling this on someone else's lead_id gets the standard 404, not a
-    write to another tenant's row.
-    """
-    try:
-        updated = repo.update_lead(user_id, lead_id, {
-            "status": "applied",
-            "applied_at": datetime.now(timezone.utc),
-        })
-    except repo.NotFoundError:
-        raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
-    _invalidate_leads_cache(user_id)
-    return {"status": "applied", "lead_id": lead_id, "applied_at": _lead_to_response(updated).applied_at}
-
-
 @app.post("/api/leads/{lead_id}/research", response_model=ResearchResponse)
 def research_lead(lead_id: str, user_id: str = Depends(get_authenticated_user_id)):
     """Generate structured company research with demo project idea for a lead."""
@@ -658,13 +620,31 @@ def research_lead(lead_id: str, user_id: str = Depends(get_authenticated_user_id
 
     try:
         from skills.research_company import research_company
-        result = research_company(
-            company=str(lead.get("company", "")),
-            domain=str(lead.get("domain", "")),
-            role=str(lead.get("role", "")),
-            jd_text=str(lead.get("jd_text", "")),
-        )
-        
+
+        # Cross-user research cache (shared research_cache table, keyed by
+        # the catalog job_id). Company research is a property of the company/
+        # job, not the user, so once any user researches a catalog job every
+        # other user reuses it instead of spending another LLM call.
+        job_id = (lead.get("job_id") or "").strip() or None
+        result = None
+        if job_id:
+            cached = repo.get_cached_research(job_id)
+            if cached and cached.get("result_json"):
+                result = cached["result_json"]
+
+        if result is None:
+            result = research_company(
+                company=str(lead.get("company", "")),
+                domain=str(lead.get("domain", "")),
+                role=str(lead.get("role", "")),
+                jd_text=str(lead.get("jd_text", "")),
+            )
+            if job_id:
+                try:
+                    repo.set_cached_research(job_id, result)
+                except Exception as e:
+                    print(f"  ⚠️  research cache write failed for job {job_id}: {e}")
+
         # Build demo_project response if present
         demo_project = None
         if result.get("demo_project"):
@@ -1163,7 +1143,8 @@ def run_pipeline(body: RunPipelineRequest, user_id: str = Depends(get_authentica
         raise HTTPException(status_code=409, detail="Pipeline already running")
 
     run = repo.create_pipeline_run(user_id)
-    sources = body.sources or ["arbeitnow", "jobicy", "yc"]
+    # v1: YC is the only automated source (all other boards parked).
+    sources = body.sources or ["yc"]
     threading.Thread(
         target=_run_pipeline_bg,
         args=(user_id, run["id"], sources, body.yc_max_leads, body.x_max_leads, body.csv_path),
@@ -1178,6 +1159,90 @@ def pipeline_run_status(user_id: str = Depends(get_authenticated_user_id)):
     """Return the live state of the caller's current/last pipeline run."""
     run = repo.get_latest_pipeline_run(user_id)
     return _pipeline_run_to_response(run)
+
+
+class RunForLeadsRequest(BaseModel):
+    lead_ids: list[str] = []
+
+
+def _run_process_leads_bg(user_id: str, run_id: str, lead_ids: list[str]):
+    """Background worker: process a set of saved leads to the review queue."""
+    from orchestrator.pipeline_runner import run_pipeline_for_leads
+
+    def on_step(label: str, status: str):
+        try:
+            repo.append_pipeline_run_step(run_id, label, status)
+        except Exception as e:
+            print(f"  ⚠️  pipeline run {run_id}: failed to record step '{label}': {e}")
+
+    try:
+        summary = run_pipeline_for_leads(user_id=user_id, lead_ids=lead_ids, progress_callback=on_step)
+        repo.update_pipeline_run(run_id, {"status": "completed", "summary": summary})
+    except Exception as e:
+        repo.update_pipeline_run(run_id, {"status": "failed", "error": str(e)})
+    finally:
+        _invalidate_leads_cache(user_id)
+        repo.update_pipeline_run(run_id, {"current_step": None, "finished_at": datetime.now(timezone.utc)})
+
+
+@app.post("/api/pipeline/run-for-leads")
+def run_for_leads(body: RunForLeadsRequest, user_id: str = Depends(get_authenticated_user_id)):
+    """Start the outreach pipeline on a specific set of already-saved leads
+    (the hero-chat "approve these startups" bridge). Non-blocking; poll
+    /api/pipeline/run-status for progress.
+
+    Validates that every lead_id belongs to the caller before enqueuing --
+    a lead_id owned by another tenant (or nonexistent) is rejected, never
+    silently processed.
+    """
+    if not body.lead_ids:
+        raise HTTPException(status_code=400, detail="No lead_ids provided")
+
+    owned = {str(l.get("id")) for l in repo.get_leads(user_id)}
+    unknown = [lid for lid in body.lead_ids if lid not in owned]
+    if unknown:
+        raise HTTPException(status_code=404, detail=f"Lead(s) not found: {unknown}")
+
+    if repo.get_running_pipeline_run(user_id):
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    run = repo.create_pipeline_run(user_id)
+    threading.Thread(
+        target=_run_process_leads_bg,
+        args=(user_id, run["id"], list(body.lead_ids)),
+        daemon=True,
+    ).start()
+
+    return {"status": "started", "leads": len(body.lead_ids)}
+
+
+@app.post("/api/leads/{lead_id}/retry")
+def retry_lead(lead_id: str, user_id: str = Depends(get_authenticated_user_id)):
+    """Retry a stuck/failed lead (v1 Task 11). Clears its failure_reason and
+    re-runs the processing chain, which is field-driven so it resumes at
+    whichever stage failed (e.g. re-attempts email lookup, tailoring, or
+    drafting). Tenant-scoped: 404 for a lead the caller doesn't own."""
+    lead = next((l for l in _get_all_leads_cached(user_id) if str(l.get("id")) == lead_id), None)
+    if not lead:
+        raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
+
+    if repo.get_running_pipeline_run(user_id):
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    try:
+        repo.update_lead(user_id, lead_id, {"failure_reason": None})
+    except repo.NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
+    _invalidate_leads_cache(user_id)
+
+    run = repo.create_pipeline_run(user_id)
+    threading.Thread(
+        target=_run_process_leads_bg,
+        args=(user_id, run["id"], [lead_id]),
+        daemon=True,
+    ).start()
+
+    return {"status": "retrying", "lead_id": lead_id}
 
 
 @app.post("/api/pipeline/upload-csv")
@@ -1213,10 +1278,10 @@ async def upload_csv(file: UploadFile = File(...), user_id: str = Depends(get_au
 
 @app.post("/api/pipeline/find-emails")
 def trigger_find_emails(user_id: str = Depends(get_authenticated_user_id)):
-    """Run the contact email discovery skill."""
+    """Run the contact email discovery skill, scoped to the caller."""
     try:
         from skills.find_contact_email import run
-        run()
+        run(user_id=user_id)
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1224,10 +1289,10 @@ def trigger_find_emails(user_id: str = Depends(get_authenticated_user_id)):
 
 @app.post("/api/pipeline/tailor-resumes")
 def trigger_tailor_resumes(user_id: str = Depends(get_authenticated_user_id)):
-    """Run the resume tailoring skill for leads that need it."""
+    """Run the resume tailoring skill for the caller's leads that need it."""
     try:
         from skills.tailor_resume import run
-        run()
+        run(user_id=user_id)
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1235,21 +1300,10 @@ def trigger_tailor_resumes(user_id: str = Depends(get_authenticated_user_id)):
 
 @app.post("/api/pipeline/draft-outreach")
 def trigger_draft_outreach(user_id: str = Depends(get_authenticated_user_id)):
-    """Run the outreach drafting skill."""
+    """Run the outreach drafting skill for the caller's leads."""
     try:
         from skills.draft_outreach import run
-        run()
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/pipeline/draft-cover-notes")
-def trigger_draft_cover_notes(user_id: str = Depends(get_authenticated_user_id)):
-    """Run the apply-channel cover-note drafting skill (Phase 5.1)."""
-    try:
-        from skills.draft_cover_note import run
-        run()
+        run(user_id=user_id)
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1268,12 +1322,18 @@ def trigger_feed_graph(user_id: str = Depends(get_authenticated_user_id)):
 
 @app.post("/api/pipeline/send")
 def trigger_send(user_id: str = Depends(get_authenticated_user_id)):
-    """Send (or draft) all approved leads via Gmail. Returns a summary."""
+    """Send (or draft) the caller's approved leads via THEIR connected Gmail.
+    Returns a summary. If no Gmail is connected, returns a clear needs_gmail
+    status instead of failing."""
     try:
-        from skills.send_via_gmail import run, is_direct_send
-        summary = run()
+        from skills.send_via_gmail import run
+        acct = repo.get_gmail_account(user_id)
+        if not acct:
+            return {"status": "needs_gmail", "detail": "Connect your Gmail in Settings first."}
+        summary = run(user_id=user_id)
         _invalidate_leads_cache(user_id)
-        return {"status": "success", "mode": "direct" if is_direct_send() else "drafts", "summary": summary}
+        mode = "direct" if acct.get("send_mode") == "direct" else "drafts"
+        return {"status": "success", "mode": mode, "summary": summary}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1302,6 +1362,116 @@ def trigger_catalog_refresh(providers: Optional[list[str]] = None, user_id: str 
         return {"status": "success", "summary": summary}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Routes: Gmail connection (per-user OAuth, Task 5)
+# ---------------------------------------------------------------------------
+
+
+class GmailStatusResponse(BaseModel):
+    connected: bool
+    email: Optional[str] = None
+    send_mode: str = "draft"
+
+
+class GmailSendModeRequest(BaseModel):
+    send_mode: str  # "draft" | "direct"
+
+
+@app.get("/api/gmail/status", response_model=GmailStatusResponse)
+def gmail_status(user_id: str = Depends(get_authenticated_user_id)):
+    """Whether the caller has connected their Gmail, and their send mode."""
+    acct = repo.get_gmail_account(user_id)
+    if not acct:
+        return GmailStatusResponse(connected=False)
+    return GmailStatusResponse(
+        connected=True, email=acct.get("email"), send_mode=acct.get("send_mode", "draft")
+    )
+
+
+@app.get("/api/gmail/connect")
+def gmail_connect(
+    send_mode: str = Query("draft", description="'draft' or 'direct'"),
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Return the Google consent URL for the caller to connect their Gmail.
+
+    The caller's identity + chosen send preference ride through OAuth's
+    signed `state` param so the (unauthenticated) callback can trust them.
+    The frontend redirects the browser to `auth_url`.
+    """
+    if send_mode not in ("draft", "direct"):
+        raise HTTPException(status_code=400, detail="send_mode must be 'draft' or 'direct'")
+    from api import gmail_oauth
+
+    try:
+        auth_url = gmail_oauth.build_consent_url(user_id, send_mode)
+    except gmail_oauth.GmailOAuthConfigError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"auth_url": auth_url}
+
+
+@app.get("/api/gmail/callback")
+def gmail_callback(code: str = Query(None), state: str = Query(None), error: str = Query(None)):
+    """OAuth redirect target. Verifies state, exchanges the code for a refresh
+    token, persists an ENCRYPTED token, and redirects the browser back to the
+    frontend settings page.
+
+    This route is intentionally NOT behind get_authenticated_user_id: it's a
+    top-level browser redirect from Google with no Authorization header. The
+    user's identity is instead recovered from the signed `state` param.
+    """
+    from api import gmail_oauth
+
+    frontend = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+
+    if error:
+        return RedirectResponse(f"{frontend}/settings?gmail=error")
+    if not code or not state:
+        return RedirectResponse(f"{frontend}/settings?gmail=error")
+
+    try:
+        result = gmail_oauth.exchange_code_for_account(code, state)
+    except gmail_oauth.GmailOAuthStateError:
+        return RedirectResponse(f"{frontend}/settings?gmail=state_error")
+    except gmail_oauth.GmailOAuthConfigError:
+        return RedirectResponse(f"{frontend}/settings?gmail=config_error")
+    except Exception:
+        return RedirectResponse(f"{frontend}/settings?gmail=error")
+
+    try:
+        encrypted = gmail_oauth.encrypt_token(result["refresh_token"])
+        repo.upsert_gmail_account(
+            user_id=result["user_id"],
+            email=result["email"],
+            encrypted_refresh_token=encrypted,
+            scopes=result["scopes"],
+            send_mode=result["send_mode"],
+        )
+    except Exception:
+        return RedirectResponse(f"{frontend}/settings?gmail=error")
+
+    return RedirectResponse(f"{frontend}/settings?gmail=connected")
+
+
+@app.put("/api/gmail/send-mode", response_model=GmailStatusResponse)
+def gmail_set_send_mode(body: GmailSendModeRequest, user_id: str = Depends(get_authenticated_user_id)):
+    """Update the caller's send preference (draft vs direct)."""
+    if body.send_mode not in ("draft", "direct"):
+        raise HTTPException(status_code=400, detail="send_mode must be 'draft' or 'direct'")
+    try:
+        acct = repo.update_gmail_send_mode(user_id, body.send_mode)
+    except repo.NotFoundError:
+        raise HTTPException(status_code=404, detail="No connected Gmail account")
+    return GmailStatusResponse(connected=True, email=acct.get("email"), send_mode=acct["send_mode"])
+
+
+@app.post("/api/gmail/disconnect")
+def gmail_disconnect(user_id: str = Depends(get_authenticated_user_id)):
+    """Disconnect the caller's Gmail (removes the stored encrypted token)."""
+    removed = repo.delete_gmail_account(user_id)
+    return {"status": "disconnected" if removed else "not_connected"}
 
 
 # ---------------------------------------------------------------------------
@@ -1592,6 +1762,126 @@ def _build_company_name_map(jobs: list[dict]) -> dict[str, str]:
             select(Company.id, Company.name).where(Company.id.in_(company_ids))
         ).all()
         return {str(row[0]): row[1] for row in rows}
+
+
+# ---------------------------------------------------------------------------
+# Hero chat onboarding (v1 Task 9): a signed-in user attaches a resume and
+# types who they're targeting; we parse -> infer criteria -> blend the target
+# text -> match YC startups. The sign-in gate is enforced on the frontend
+# (send intercepts an unauthenticated click and runs Google sign-in first),
+# so this endpoint itself is authenticated like every other dashboard route.
+# ---------------------------------------------------------------------------
+
+_TARGET_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "are", "you", "your", "who",
+    "want", "looking", "target", "targeting", "startups", "startup", "companies",
+    "company", "roles", "role", "job", "jobs", "work", "working", "would", "like",
+    "into", "some", "any", "help", "build", "building", "team", "teams", "using",
+    "們", "a", "an", "in", "to", "of", "at", "on", "or",
+}
+
+
+def _blend_target_into_criteria(criteria: dict, target_text: str) -> dict:
+    """Fold the user's free-text targeting prompt into the inferred criteria.
+
+    match_jobs scores whole-word tech_stack + role keyword hits in a job's
+    title/jd_text, so we add the meaningful tokens from the prompt to BOTH
+    lists -- that's what makes "I'm targeting AI infra startups using Rust"
+    actually bias the ranking toward those jobs, not just the resume."""
+    import re
+
+    tokens = [t for t in re.split(r"[^a-zA-Z0-9+#.]+", (target_text or "").lower()) if t]
+    keywords = [t for t in tokens if len(t) >= 3 and t not in _TARGET_STOPWORDS]
+
+    blended = dict(criteria)
+    roles = list(blended.get("roles") or [])
+    tech = list(blended.get("tech_stack") or [])
+    for kw in keywords:
+        if kw not in roles:
+            roles.append(kw)
+        if kw not in tech:
+            tech.append(kw)
+    blended["roles"] = roles
+    blended["tech_stack"] = tech
+    return blended
+
+
+@app.post("/api/chat/match", response_model=AnonResumeUploadResponse)
+async def chat_match(
+    file: UploadFile = File(...),
+    target: str = Form(""),
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Hero-chat onboarding: parse the attached resume, infer criteria, blend
+    in the free-text target prompt, and return matched YC startups. Persists
+    the blended criteria to the user's account so the dashboard's matched-jobs
+    feed keeps working afterward."""
+    filename = file.filename or ""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext and ext not in ALLOWED_RESUME_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type '{ext}'. Allowed: .pdf, .docx, .txt")
+
+    content = await file.read()
+    if len(content) > MAX_RESUME_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail=f"File too large (max {MAX_RESUME_UPLOAD_BYTES // (1024 * 1024)}MB)")
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    from skills.parse_resume import ResumeParseError, UnsupportedFileTypeError, parse_resume_cached
+
+    try:
+        parsed_resume, _raw = parse_resume_cached(content, filename, file.content_type or "")
+    except UnsupportedFileTypeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ResumeParseError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    from skills.infer_criteria import infer_criteria
+    from skills.match_jobs import match_jobs, matched_signals, score_job
+
+    criteria = _blend_target_into_criteria(infer_criteria(parsed_resume), target)
+
+    # Persist so /api/jobs/matched + the pipeline see this user's criteria.
+    try:
+        repo.upsert_search_criteria(user_id, criteria)
+    except Exception as e:
+        print(f"  ⚠️  chat_match: failed to persist criteria for {user_id}: {e}")
+
+    # v1 is YC-focused: match only YC catalog jobs.
+    yc_jobs = [j for j in repo.get_jobs(open_only=True) if j.get("source") == "yc"]
+    company_names = _build_company_name_map(yc_jobs)
+    matched = match_jobs(yc_jobs, criteria, limit=30)
+
+    existing_by_job_id: dict[str, dict] = {}
+    for lead in repo.get_leads(user_id):
+        jid = lead.get("job_id")
+        if jid:
+            existing_by_job_id[str(jid)] = lead
+
+    matched_response = []
+    for job in matched:
+        jid = str(job["id"])
+        existing = existing_by_job_id.get(jid)
+        matched_response.append(MatchedJobResponse(
+            id=jid,
+            company_name=company_names.get(str(job.get("company_id")), "Unknown Company"),
+            title=job.get("title") or "",
+            location=job.get("location"),
+            department=job.get("department"),
+            jd_text=job.get("jd_text"),
+            apply_url=job.get("apply_url"),
+            source=job.get("source") or "",
+            match_score=score_job(job, criteria),
+            matched_signals=matched_signals(job, criteria),
+            already_saved_lead_id=str(existing["id"]) if existing else None,
+            already_saved_channel=(existing.get("channel") or []) if existing else [],
+        ))
+
+    return AnonResumeUploadResponse(
+        parsed_resume=ParsedResumeResponse(**parsed_resume),
+        inferred_criteria=InferredCriteriaResponse(**criteria),
+        matched_jobs=matched_response,
+    )
 
 
 @app.get("/api/jobs/matched", response_model=list[MatchedJobResponse])

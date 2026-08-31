@@ -238,16 +238,74 @@ def _lookup_by_domain(domain: str, company: str = None, contact_name: str = None
     """Resolve a contact for a known domain. Apollo first (named founder/CEO,
     best for personalized cold outreach), then Hunter (generic role inboxes
     like careers@/hr@) as a fallback when Apollo has no coverage. Returns
-    (email, name)."""
+    (email, name).
+
+    Global cross-user cache (v1): a resolved (email, name) for a domain is a
+    property of the company, not of any one user, so it's cached in the
+    shared enrichment_cache table under a synthetic "contact" provider. Once
+    ANY user resolves a domain, every other user reusing it skips both Apollo
+    and Hunter entirely -- no repeated credit burn. Only successful resolves
+    are cached (a miss isn't cached, so a domain that gains coverage later can
+    still be re-resolved)."""
     domain = _clean_domain(domain)
     if not domain:
         return None, None
 
-    email, name = apollo_lookup(domain, company=company, contact_name=contact_name)
-    if email:
-        return email, name
+    cached = _cache_get_contact(domain)
+    if cached is not None:
+        return cached
 
-    return hunter_lookup(domain), None
+    email, name = apollo_lookup(domain, company=company, contact_name=contact_name)
+    if not email:
+        email, name = hunter_lookup(domain), None
+
+    if email:
+        _cache_set_contact(domain, email, name)
+
+    return email, name
+
+
+# ---------------------------------------------------------------------------
+# Shared cross-user contact cache (backed by db.repository's enrichment_cache)
+# ---------------------------------------------------------------------------
+
+# Synthetic provider label for the cache row that stores the FINAL resolved
+# contact (regardless of whether Apollo or Hunter produced it), distinct from
+# the raw "apollo"/"hunter" provider grain the table also supports.
+_CONTACT_CACHE_PROVIDER = "contact"
+
+
+def _cache_get_contact(domain: str):
+    """Return (email, name) from the shared cache for domain, or None on miss.
+    A cache read failure (e.g. no DB in a unit test) degrades to a miss rather
+    than raising, so enrichment still works without the cache."""
+    try:
+        row = repo.get_cached_enrichment(domain, _CONTACT_CACHE_PROVIDER)
+    except Exception as e:
+        print(f"  ⚠️  enrichment cache read failed for {domain}: {e}")
+        return None
+    if not row:
+        return None
+    result = row.get("result_json") or {}
+    email = result.get("contact_email")
+    if not email:
+        return None
+    print(f"  💾 cache hit for {domain} -> {email} (no Apollo/Hunter credit spent)")
+    return email, result.get("contact_name")
+
+
+def _cache_set_contact(domain: str, email: str, name: str | None) -> None:
+    """Persist a resolved contact to the shared cache. Best-effort: a write
+    failure is logged loudly but never breaks the enrichment that just
+    succeeded."""
+    try:
+        repo.set_cached_enrichment(
+            domain,
+            _CONTACT_CACHE_PROVIDER,
+            {"contact_email": email, "contact_name": name},
+        )
+    except Exception as e:
+        print(f"  ⚠️  enrichment cache write failed for {domain}: {e}")
 
 
 def _lookup_by_guessed_domains(company: str, contact_name: str = None):
@@ -258,13 +316,22 @@ def _lookup_by_guessed_domains(company: str, contact_name: str = None):
     if not candidates:
         return None, None
 
+    # Shared-cache check first: if any candidate domain was already resolved
+    # by another user, reuse it and spend zero credits.
+    for guess in candidates:
+        cached = _cache_get_contact(_clean_domain(guess))
+        if cached is not None:
+            return cached
+
     apollo_email, apollo_name = apollo_lookup(candidates[0], company=company, contact_name=contact_name)
     if apollo_email:
+        _cache_set_contact(_clean_domain(candidates[0]), apollo_email, apollo_name)
         return apollo_email, apollo_name
 
     for guess in candidates:
         email = hunter_lookup(guess)
         if email:
+            _cache_set_contact(_clean_domain(guess), email, None)
             return email, None
 
     print(f"No email found for {company} -- tried domains: {', '.join(candidates)}")
@@ -324,7 +391,7 @@ def find_email_for_lead(lead: dict) -> str:
     return find_contact_email_for_lead(lead).get("contact_email")
 
 
-def run():
+def run(user_id: str | None = None):
     if not HUNTER_API_KEY and not APOLLO_API_KEY:
         print("Neither HUNTER_API_KEY nor APOLLO_API_KEY set in config/.env -- skipping find_contact_email.")
         return
@@ -333,7 +400,8 @@ def run():
     if not APOLLO_API_KEY:
         print("APOLLO_API_KEY not set -- running with Hunter only (no fallback).")
 
-    user_id = get_current_user_id()
+    if user_id is None:
+        user_id = get_current_user_id()
     leads = repo.get_leads(user_id)
     targets = [lead for lead in leads if not (lead.get("contact_email") or "").strip()]
 
@@ -346,7 +414,8 @@ def run():
         name = result.get("contact_name")
 
         if email:
-            fields = {"contact_email": email}
+            # Clear any prior "no_contact_found" flag now that we have one.
+            fields = {"contact_email": email, "failure_reason": None}
             # Only fill contact_name if Apollo gave us one and the lead doesn't
             # already have a (e.g. scraper-provided) name.
             if name and not (lead.get("contact_name") or "").strip():
@@ -357,6 +426,12 @@ def run():
             who = f" ({name})" if name else ""
             print(f"Found email for {label}: {email}{who}")
         else:
+            # Flag it so the dashboard shows "no contact found" (retriable),
+            # rather than the lead silently going quiet at send time.
+            try:
+                repo.update_lead(user_id, lead["id"], {"failure_reason": "no_contact_found"})
+            except Exception:
+                pass
             not_found += 1
 
     print(f"\nfind_contact_email: {found} found, {not_found} not found (left null).")

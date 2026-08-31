@@ -18,7 +18,7 @@ SYSTEM_PROMPT = """You are an outreach-drafting assistant for a job candidate. Y
 STRICT RULES -- violating any of these is a critical failure:
 1. NEVER claim a skill, experience, project, or credential that is not present in the resume JSON given.
 2. Do NOT copy resume bullets verbatim -- reference at most 1-2 relevant highlights in natural, conversational outreach language, not resume prose restated.
-3. Do NOT claim the resume is attached as a literal file in the message body (it gets attached separately when this is actually sent) -- "I've tailored my resume for this role" is fine, "please find attached" is not, since nothing is attached yet at draft time.
+3. Do NOT claim the resume is attached as a literal file in the message body (it gets attached separately when this is actually sent) -- "I've tailored my resume for this role" is fine, "please find attached" is not, since nothing is attached yet at draft time. Likewise, if you mention an idea, use-case, or project for the company, frame it as a PROPOSAL the candidate is thinking about or would prototype -- NEVER claim it is already built, shipped, demoed, or attached ("I built", "I've made", "here's my demo", "attached is my prototype" are all forbidden). Offer thinking, not a finished artifact.
 4. HARD LENGTH LIMIT: the message body (not counting the subject line or signature) must be under 150 words for EMAIL format, and under 60 words for DM format. Count as you write. Cut anything that isn't earning its place -- a shorter, sharper message beats a longer one.
 5. Write like a real person typed this in one sitting, not like a cover letter or a mail-merge template. Never use: "I came across your opening," "I am writing to express my interest," "I wanted to reach out," "I believe I would be a great fit," "please find attached," "I look forward to hearing from you," or any equivalent throat-clearing. Open with something specific -- a real observation about the company or role -- not a windup.
 6. Show hunger and a point of view, not a qualifications checklist. This candidate is ambitious and has a specific reason THIS company/problem excites them -- pull that reason from something real in the job description (what they build, the problem they're solving, a detail only this company's listing mentions), not a compliment generic enough to paste into any other outreach message. If you can't point to what in the JD justifies a line, cut the line.
@@ -88,14 +88,15 @@ Candidate's tailored resume for this lead (JSON):
     return raw_text
 
 
-def run():
+def run(user_id: str | None = None):
     from skills.llm_client import MODEL_BACKEND, ANTHROPIC_API_KEY
 
     if MODEL_BACKEND == "claude" and not ANTHROPIC_API_KEY:
         print("MODEL_BACKEND=claude but ANTHROPIC_API_KEY not set -- skipping draft_outreach.")
         return
 
-    user_id = get_current_user_id()
+    if user_id is None:
+        user_id = get_current_user_id()
     leads = repo.get_leads(user_id)
     targets = [
         lead for lead in leads
@@ -103,8 +104,7 @@ def run():
         and not (lead.get("outreach_draft") or "").strip()
         # Phase 5: don't waste an LLM call drafting an outreach message for
         # a lead that has no outreach channel at all -- a lead with no
-        # channel set yet (pre-Phase-5 rows) defaults to outreach, same as
-        # route_channel_node/feed_pending_leads' own default.
+        # channel set defaults to outreach (v1 is outreach-only).
         and "outreach" in (lead.get("channel") or ["outreach"])
     ]
 
@@ -119,15 +119,26 @@ def run():
         except FileNotFoundError:
             print(f"Skipping {label} ({lead['id']}) -- tailored resume file not found for "
                   f"resume_version '{resume_version}'.")
+            try:
+                repo.update_lead(user_id, lead["id"], {"failure_reason": "draft_failed"})
+            except Exception:
+                pass
             continue
 
         try:
             draft = draft_outreach_message(tailored_resume, lead)
         except Exception as e:
             print(f"Failed to draft outreach for {label}: {e}")
+            try:
+                repo.update_lead(user_id, lead["id"], {"failure_reason": "draft_failed"})
+            except Exception:
+                pass
             continue
 
-        repo.update_lead(user_id, lead["id"], {"outreach_draft": draft, "status": "pending_review"})
+        # Success clears any prior failure flag.
+        repo.update_lead(user_id, lead["id"], {
+            "outreach_draft": draft, "status": "pending_review", "failure_reason": None,
+        })
         drafted += 1
         print(f"\nDrafted outreach for {label} [status -> pending_review]:\n{'-' * 60}\n{draft}\n{'-' * 60}")
 

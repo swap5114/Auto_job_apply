@@ -92,6 +92,12 @@ class TestPhase7Review(unittest.TestCase):
             "skills.send_via_gmail.get_gmail_service",
             return_value=fake_gmail_service,
         )
+        # send_node (v1 Task 6) builds a per-user Gmail context; mock it to a
+        # connected account in "direct" mode so the approved path sends.
+        patcher_send_ctx = patch(
+            "skills.send_via_gmail.get_user_send_context",
+            return_value=(fake_gmail_service, "tester@gmail.com", "direct"),
+        )
         # send_node -> skills.send_via_gmail.send_email / create_draft (never place a real API call)
         patcher_send_email = patch(
             "skills.send_via_gmail.send_email",
@@ -104,7 +110,7 @@ class TestPhase7Review(unittest.TestCase):
 
         for patcher in (
             patcher_email, patcher_research, patcher_tailor, patcher_llm,
-            patcher_load_resume, patcher_gmail, patcher_send_email, patcher_create_draft,
+            patcher_load_resume, patcher_gmail, patcher_send_ctx, patcher_send_email, patcher_create_draft,
         ):
             patcher.start()
             self.addCleanup(patcher.stop)

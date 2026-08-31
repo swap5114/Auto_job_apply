@@ -88,19 +88,14 @@ def _mock_graph_externals():
             return_value={"name": "Test Candidate", "contact": {}, "skills": {}},
         ),
         patch("skills.send_via_gmail.get_gmail_service", return_value=fake_gmail_service),
+        # v1 Task 6: send_node builds per-user Gmail context. Mock it to a
+        # connected account in "direct" mode so the approved path sends.
+        patch(
+            "skills.send_via_gmail.get_user_send_context",
+            return_value=(fake_gmail_service, "tester@gmail.com", "direct"),
+        ),
         patch("skills.send_via_gmail.send_email", return_value={"id": "fake-sent-id"}),
         patch("skills.send_via_gmail.create_draft", return_value={"id": "fake-draft-id"}),
-        # Phase 5.2: draft_cover_note_node's external boundary (the apply
-        # channel's counterpart to draft_outreach.load_tailored_resume /
-        # llm_generate above).
-        patch(
-            "skills.draft_cover_note.load_tailored_resume",
-            return_value={"name": "Test Candidate", "contact": {}, "skills": {}},
-        ),
-        patch(
-            "skills.draft_cover_note.draft_cover_note",
-            return_value="Dear hiring team, ... Test Candidate",
-        ),
     ]
 
 
@@ -448,7 +443,9 @@ def test_two_users_paused_leads_are_independently_resumable(mocked_graph_externa
 
     a_lead_after = repo.get_lead(user_a["id"], lead_a["id"])
     b_lead_after = repo.get_lead(user_b["id"], lead_b["id"])
-    assert a_lead_after["status"] == "approved"
+    # v1 Task 6: approve now runs through send_node; with the mocked connected
+    # Gmail in "direct" mode, the approved lead becomes "sent".
+    assert a_lead_after["status"] == "sent"
     assert b_lead_after["status"] == "rejected"
 
     # Neither user has any leads left paused at review.
@@ -506,156 +503,65 @@ def test_two_users_pipelines_run_concurrently_on_separate_threads(mocked_graph_e
 
 
 # ---------------------------------------------------------------------------
-# 4.5 -- Apply/Outreach router scaffold
+# v1 outreach-only graph: a lead reaches the review interrupt, then send
 # ---------------------------------------------------------------------------
 
 
-def test_route_channel_node_defaults_to_outreach_and_continues():
-    from graph.pipeline import route_channel_node
-
-    result = route_channel_node({"channel": ["outreach"], "company": "X"})
-    assert result["active_channel"] == "outreach"
-    assert result["status"] != "apply_channel_not_implemented"
-
-
-def test_route_channel_node_apply_only_continues():
-    """Phase 5.2 replaces the old apply -> apply_channel_not_implemented
-    dead-end: an apply-only lead now continues into the shared research/
-    tailor flow, same as outreach, rather than ending the run.
-    """
-    from graph.pipeline import route_channel_node
-
-    result = route_channel_node({"channel": ["apply"], "company": "X"})
-    assert result["active_channel"] == "apply"
-    assert result["status"] != "apply_channel_not_implemented"
-
-
-# ---------------------------------------------------------------------------
-# Phase 5.2 -- apply-channel graph run + dual-channel thread independence
-# ---------------------------------------------------------------------------
-
-
-def test_apply_channel_lead_reaches_review_interrupt_not_end(mocked_graph_externals, pg_checkpointer):
-    """Direct regression guard for 5.2's replacement of route_channel_node's
-    old dead-end: an apply-only lead run through the real graph must pause
-    at the review interrupt (with a cover_note drafted), not run straight
-    to END via the old dead-end, and must never reach the outreach-only
-    send node (no contact_email/outreach_draft is even present in state).
-    """
-    user = _make_user("applyReview")
-    lead_id = "apply-lead-001"
+def test_outreach_lead_reaches_review_interrupt(mocked_graph_externals, pg_checkpointer):
+    """An outreach lead run through the real graph must pause at the review
+    interrupt with a drafted outreach message (v1 has no apply channel)."""
+    user = _make_user("outreachReview")
+    lead_id = "outreach-lead-001"
 
     graph = build_pipeline_graph(pg_checkpointer)
-    thread_id = make_thread_id(user["id"], lead_id, channel="apply")
+    thread_id = make_thread_id(user["id"], lead_id, channel="outreach")
     config = {"configurable": {"thread_id": thread_id}}
 
-    state = {
+    graph.invoke({
         "user_id": user["id"],
         "lead_id": lead_id,
-        "source": "greenhouse",
-        "company": "Apply Test Co",
+        "source": "yc",
+        "company": "Outreach Test Co",
         "role": "Backend Engineer",
         "jd_text": "Python backend role.",
-        "listing_url": "https://example.com/jobs/apply-lead-001",
-        "channel": ["apply"],
-        "active_channel": "apply",
+        "contact_email": "founder@example.com",
+        "channel": ["outreach"],
         "status": "matched",
-    }
-
-    graph.invoke(state, config)
+    }, config)
 
     result_state = graph.get_state(config)
     assert result_state is not None
     assert "review" in result_state.next
-    assert result_state.values.get("cover_note") == "Dear hiring team, ... Test Candidate"
+    assert result_state.values.get("outreach_draft") == "Subject: Test outreach\n\nThis is a test draft."
     assert result_state.values.get("resume_version") == "fake_resume_version"
-    # Never touched the outreach-only fields/nodes.
-    assert not result_state.values.get("outreach_draft")
 
 
-def test_apply_channel_approve_sets_ready_to_apply_not_approved(mocked_graph_externals, pg_checkpointer):
-    """Approving an apply-channel review must land on "ready_to_apply"
-    (the plan's own state-machine naming), not "approved" -- and must
-    never reach send_node (apply has no send step).
-    """
+def test_outreach_approve_sets_approved_and_reaches_send(mocked_graph_externals, pg_checkpointer):
+    """Approving an outreach review lands on "approved" and routes into the
+    send node (v1 send step)."""
     from orchestrator.review_cli import approve_lead
 
-    user = _make_user("applyApprove")
-    lead_id = "apply-lead-002"
+    user = _make_user("outreachApprove")
+    lead_id = "outreach-lead-002"
     repo.add_lead(user["id"], {
-        "company": "Apply Approve Co", "role": "Engineer", "jd_text": "Python backend role.",
-        "channel": ["apply"], "status": "pending_review",
+        "company": "Outreach Approve Co", "role": "Engineer", "jd_text": "Python backend role.",
     })
 
     graph = build_pipeline_graph(pg_checkpointer)
-    thread_id = make_thread_id(user["id"], lead_id, channel="apply")
+    thread_id = make_thread_id(user["id"], lead_id, channel="outreach")
     config = {"configurable": {"thread_id": thread_id}}
     graph.invoke({
-        "user_id": user["id"], "lead_id": lead_id, "company": "Apply Approve Co",
-        "role": "Engineer", "jd_text": "Python backend role.", "channel": ["apply"],
-        "active_channel": "apply", "status": "matched",
+        "user_id": user["id"], "lead_id": lead_id, "company": "Outreach Approve Co",
+        "role": "Engineer", "jd_text": "Python backend role.",
+        "contact_email": "founder@example.com", "channel": ["outreach"], "status": "matched",
     }, config)
 
-    approved = approve_lead(lead_id, user_id=user["id"], checkpointer=pg_checkpointer, channel="apply")
+    approved = approve_lead(lead_id, user_id=user["id"], checkpointer=pg_checkpointer)
     assert approved is True
 
     final_state = graph.get_state(config)
-    assert final_state.next == ()  # completed, no send node reached
-    assert final_state.values.get("status") == "ready_to_apply"
+    assert final_state.next == ()  # ran through send to END
     assert final_state.values.get("review_decision") == "approved"
-
-
-def test_dual_channel_lead_gets_two_independent_threads(mocked_graph_externals, pg_checkpointer):
-    """A lead with channel = ["apply", "outreach"] must produce two
-    independent, correctly-scoped graph threads (5.2's thread_id-per-channel
-    decision) -- approving one must not affect the other's paused state.
-    """
-    from orchestrator.feed_graph import feed_pending_leads
-    from orchestrator.review_cli import approve_lead, get_pending_review_leads
-
-    user = _make_user("dualChannel")
-    lead = repo.add_lead(user["id"], {
-        "company": "Dual Channel Co", "role": "Engineer", "jd_text": "Python backend role.",
-        "channel": ["apply", "outreach"], "status": "pending_review",
-    })
-
-    fed_count = feed_pending_leads(user_id=user["id"])
-    assert fed_count == 2  # one run per channel, same lead
-
-    graph = build_pipeline_graph(pg_checkpointer)
-    apply_thread = make_thread_id(user["id"], lead["id"], channel="apply")
-    outreach_thread = make_thread_id(user["id"], lead["id"], channel="outreach")
-
-    apply_state = graph.get_state({"configurable": {"thread_id": apply_thread}})
-    outreach_state = graph.get_state({"configurable": {"thread_id": outreach_thread}})
-    assert "review" in apply_state.next
-    assert "review" in outreach_state.next
-    assert apply_state.values.get("cover_note") == "Dear hiring team, ... Test Candidate"
-    assert outreach_state.values.get("outreach_draft") == "Subject: Test outreach\n\nThis is a test draft."
-
-    pending = get_pending_review_leads(user["id"], checkpointer=pg_checkpointer)
-    assert len(pending) == 2
-    channels_pending = sorted(p["active_channel"] for p in pending)
-    assert channels_pending == ["apply", "outreach"]
-
-    # Approve only the apply-channel thread.
-    approved = approve_lead(lead["id"], user_id=user["id"], checkpointer=pg_checkpointer, channel="apply")
-    assert approved is True
-
-    apply_after = graph.get_state({"configurable": {"thread_id": apply_thread}})
-    outreach_after = graph.get_state({"configurable": {"thread_id": outreach_thread}})
-    assert apply_after.next == ()  # apply thread resolved
-    assert apply_after.values.get("status") == "ready_to_apply"
-    # The outreach thread must be completely untouched by approving apply.
-    assert "review" in outreach_after.next
-    assert outreach_after.values.get("review_decision") is None
-
-
-def test_route_channel_node_both_channels_prefers_outreach():
-    from graph.pipeline import route_channel_node
-
-    result = route_channel_node({"channel": ["apply", "outreach"], "company": "X"})
-    assert result["active_channel"] == "outreach"
 
 
 # ---------------------------------------------------------------------------

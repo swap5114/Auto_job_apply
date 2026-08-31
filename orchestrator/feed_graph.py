@@ -30,20 +30,11 @@ from graph.pipeline import (
 def feed_pending_leads(user_id: Optional[str] = None) -> int:
     """Feeds all of user_id's pending_review leads into the LangGraph pipeline.
 
-    Each (lead, channel) pair gets its own thread (thread_id =
-    f"{user_id}:{lead_id}:{channel}", per Phase 5.2 -- extending Phase
-    4.2's structural tenant isolation with a per-channel dimension). A
-    lead with channel = ["apply", "outreach"] needs two independent
-    review gates (approving the tailored resume+cover note is a separate
-    human decision from approving the outreach draft), so this feeds the
-    SAME lead into the graph once per channel present in Lead.channel,
-    not once per lead. Each run pauses at its own review interrupt,
-    waiting for approve/edit/reject via the CLI or API, scoped to that
-    one channel's thread.
-
-    Leads with no channel set at all default to a single ["outreach"]
-    run, preserving pre-Phase-5 behavior for any lead created before
-    Lead.channel was populated.
+    Each lead gets one outreach thread (thread_id =
+    f"{user_id}:{lead_id}:outreach", per Phase 4.2's structural tenant
+    isolation). Each run pauses at the review interrupt, waiting for
+    approve/edit/reject via the CLI or API. v1 is outreach-only (the apply
+    channel was removed), so there is exactly one thread per lead.
 
     Args:
         user_id: whose pending_review leads to feed. Every HTTP-reachable
@@ -78,55 +69,44 @@ def feed_pending_leads(user_id: Optional[str] = None) -> int:
             print(f"Warning: skipping lead with no id — {lead.get('company', '?')}")
             continue
 
-        channels = lead.get("channel") or ["outreach"]
-        lead_fed_any = False
+        thread_id = make_thread_id(user_id, lead_id, channel="outreach")
 
-        for ch in channels:
-            thread_id = make_thread_id(user_id, lead_id, channel=ch)
+        # Check if this lead's thread already exists (avoid re-feeding).
+        config = {"configurable": {"thread_id": thread_id}}
+        existing_state = graph.get_state(config)
+        if existing_state and existing_state.values:
+            skipped += 1
+            continue
 
-            # Check if this channel's thread already exists for this lead
-            # (avoid re-feeding).
-            config = {"configurable": {"thread_id": thread_id}}
-            existing_state = graph.get_state(config)
-            if existing_state and existing_state.values:
-                skipped += 1
-                continue
+        # Build pipeline state from lead fields (v1: outreach-only).
+        state = {
+            "user_id": user_id,
+            "lead_id": lead_id,
+            "source": lead.get("source", ""),
+            "company": lead.get("company", ""),
+            "role": lead.get("role", ""),
+            "jd_text": lead.get("jd_text", ""),
+            "contact_name": lead.get("contact_name") or None,
+            "contact_email": lead.get("contact_email") or None,
+            "x_handle": lead.get("x_handle") or None,
+            "resume_version": lead.get("resume_version") or None,
+            "outreach_draft": lead.get("outreach_draft") or None,
+            "listing_url": lead.get("listing_url") or None,
+            "channel": ["outreach"],
+            "status": "in_review",
+        }
 
-            # Build pipeline state from lead fields, scoped to this channel's run.
-            state = {
-                "user_id": user_id,
-                "lead_id": lead_id,
-                "source": lead.get("source", ""),
-                "company": lead.get("company", ""),
-                "role": lead.get("role", ""),
-                "jd_text": lead.get("jd_text", ""),
-                "contact_name": lead.get("contact_name") or None,
-                "contact_email": lead.get("contact_email") or None,
-                "x_handle": lead.get("x_handle") or None,
-                "resume_version": lead.get("resume_version") or None,
-                "outreach_draft": lead.get("outreach_draft") or None,
-                "cover_note": lead.get("cover_note") or None,
-                "listing_url": lead.get("listing_url") or None,
-                "channel": channels,
-                "active_channel": ch,
-                "status": "in_review",
-            }
+        # Start graph execution — it will hit the review interrupt and pause
+        graph.invoke(state, config)
 
-            # Start graph execution — it will hit the review interrupt and pause
-            graph.invoke(state, config)
+        fed += 1
+        label = lead.get("company") or lead.get("x_handle") or lead_id
+        print(f"  Fed into graph: {label} ({lead_id})")
 
-            fed += 1
-            lead_fed_any = True
-            label = lead.get("company") or lead.get("x_handle") or lead_id
-            print(f"  Fed into graph: {label} ({lead_id}) [channel={ch}]")
-
-        # Mark lead as in_review once, after every channel's run has been
-        # fed, so we don't re-feed any channel on the next call.
-        if lead_fed_any:
-            try:
-                repo.update_lead(user_id, lead_id, {"status": "in_review"})
-            except Exception as e:
-                print(f"Warning: fed lead {lead_id} into graph but failed to update status: {e}")
+        try:
+            repo.update_lead(user_id, lead_id, {"status": "in_review"})
+        except Exception as e:
+            print(f"Warning: fed lead {lead_id} into graph but failed to update status: {e}")
 
     print(f"\nfeed_graph: {fed} (lead, channel) runs fed, {skipped} already had active threads.")
     return fed

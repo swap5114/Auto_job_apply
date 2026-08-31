@@ -388,7 +388,7 @@ def backfill_pdfs():
         print(f"Backfilled PDF: resumes/{base_filename}.pdf")
 
 
-def run():
+def run(user_id: str | None = None):
     from skills.llm_client import MODEL_BACKEND, ANTHROPIC_API_KEY
 
     if MODEL_BACKEND == "claude" and not ANTHROPIC_API_KEY:
@@ -397,7 +397,8 @@ def run():
 
     backfill_pdfs()
 
-    user_id = get_current_user_id()
+    if user_id is None:
+        user_id = get_current_user_id()
     base_resume = load_base_resume()
     leads = repo.get_leads(user_id)
     targets = [lead for lead in leads if not (lead.get("resume_version") or "").strip()]
@@ -411,12 +412,20 @@ def run():
 
         if not jd_text.strip():
             print(f"Skipping {company} ({lead['id']}) -- no jd_text to tailor against.")
+            try:
+                repo.update_lead(user_id, lead["id"], {"failure_reason": "no_job_description"})
+            except Exception:
+                pass
             continue
 
         try:
             tailored = tailor_resume(base_resume, company, role, jd_text)
         except Exception as e:
             print(f"Failed to tailor resume for {company}: {e}")
+            try:
+                repo.update_lead(user_id, lead["id"], {"failure_reason": "tailor_failed"})
+            except Exception:
+                pass
             continue
 
         filename = save_resume(tailored, company)
@@ -425,8 +434,10 @@ def run():
         # (the graph-driven path already sets this) -- the standalone
         # CLI/API route path was missing it, leaving a lead's status stuck
         # at "matched" even after a resume was actually tailored for it.
+        # Clear any prior failure flag now that tailoring succeeded.
         repo.update_lead(user_id, lead["id"], {
-            "resume_version": filename, "keyword_coverage": coverage, "status": "tailored",
+            "resume_version": filename, "keyword_coverage": coverage,
+            "status": "tailored", "failure_reason": None,
         })
         tailored_count += 1
         print(f"Tailored resume for {company} -> resumes/{filename}.json / .md "

@@ -7,7 +7,10 @@ import { MarketingNav } from "@/components/marketing/marketing-nav";
 import { PillBadge } from "@/components/marketing/pill-badge";
 import { LogoCloud } from "@/components/marketing/logo-cloud";
 import { FeatureCards } from "@/components/marketing/feature-cards";
-import { ResumeUploadWidget } from "@/components/marketing/resume-upload-widget";
+import { HeroChat } from "@/components/marketing/hero-chat";
+import { UsageVideos } from "@/components/marketing/usage-videos";
+import { FAQ } from "@/components/marketing/faq";
+import { UpcomingFeatures } from "@/components/marketing/upcoming-features";
 import { Footer } from "@/components/marketing/footer";
 import { useAuth } from "@/lib/auth-context";
 
@@ -49,7 +52,7 @@ export default function LandingPage() {
                 transition={{ duration: 0.6, delay: 0.05 }}
                 className="mt-6 font-display text-5xl leading-[1.05] text-foreground md:text-6xl"
               >
-                The better way to land your next role
+                Personalized outreach to YC startups that actually gets read
               </motion.h1>
 
               <motion.p
@@ -58,8 +61,9 @@ export default function LandingPage() {
                 transition={{ duration: 0.6, delay: 0.12 }}
                 className="mt-5 max-w-md text-lg leading-relaxed text-muted-foreground"
               >
-                A multi-agent pipeline that sources leads, tailors your resume,
-                and drafts outreach — you just approve and send.
+                We find YC startups hiring now, tailor your resume to each, and draft
+                outreach that opens with a genuinely useful idea for them — you approve,
+                and it sends from your own inbox.
               </motion.p>
 
               <motion.div
@@ -94,9 +98,10 @@ export default function LandingPage() {
               </motion.p>
             </div>
 
-            {/* Right: real product demo -- upload a resume, see real matches */}
+            {/* Right: hero chat -- attach a resume, describe your target,
+                sign in, and see matched YC startups. */}
             <div className="lg:pl-8">
-              <ResumeUploadWidget />
+              <HeroChat />
             </div>
           </div>
         </section>
@@ -132,6 +137,21 @@ export default function LandingPage() {
               <ChevronRight className="h-4 w-4" />
             </Link>
           </div>
+        </section>
+
+        {/* === USAGE VIDEOS === */}
+        <section className="border-t border-border/60">
+          <UsageVideos />
+        </section>
+
+        {/* === UPCOMING FEATURES === */}
+        <section className="border-t border-border/60 bg-card/40">
+          <UpcomingFeatures />
+        </section>
+
+        {/* === FAQ === */}
+        <section className="border-t border-border/60">
+          <FAQ />
         </section>
       </main>
 

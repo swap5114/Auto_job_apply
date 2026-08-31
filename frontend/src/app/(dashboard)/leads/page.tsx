@@ -40,8 +40,22 @@ function statusLabel(status: string) {
     new: "New", pending_review: "In Review", in_review: "In Review",
     approved: "Approved", sent: "Sent", draft_created: "Draft",
     replied: "Replied", rejected: "Rejected",
+    approved_needs_gmail: "Needs Gmail", send_skipped: "Not sent", send_failed: "Send failed",
   };
   return labels[status] || status || "New";
+}
+
+const FAILURE_LABELS: Record<string, string> = {
+  no_contact_found: "No contact email found",
+  no_job_description: "No job description",
+  tailor_failed: "Resume tailoring failed",
+  draft_failed: "Draft generation failed",
+  send_failed: "Send failed",
+};
+
+function failureLabel(reason?: string) {
+  if (!reason) return "";
+  return FAILURE_LABELS[reason] || reason.replace(/_/g, " ");
 }
 
 const filters = [
@@ -150,6 +164,20 @@ function LeadsPageInner() {
     setEditDraft(lead.outreach_draft || "");
   }
 
+  async function doRetry(lead: Lead) {
+    setActionBusy(true);
+    try {
+      await api.leads.retry(lead.id);
+      toast.success(`Retrying ${lead.company || lead.x_handle || "lead"}…`);
+      setSelectedLead(null);
+      await load();
+    } catch (e: any) {
+      toast.error(e?.message || "Retry failed");
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
   return (
     <PageTransition>
       <Header
@@ -254,6 +282,11 @@ function LeadsPageInner() {
                             {ch}
                           </Badge>
                         ))}
+                        {lead.failure_reason && (
+                          <Badge variant="rejected" className="text-[10px]">
+                            {failureLabel(lead.failure_reason)}
+                          </Badge>
+                        )}
                       </span>
                     </td>
                     <td className="px-5 py-3.5 text-sm text-muted-foreground">{lead.posted_date || "—"}</td>
@@ -313,6 +346,17 @@ function LeadsPageInner() {
 
                 {/* Overview */}
                 <TabsContent value="overview" className="mt-4 space-y-4">
+                  {selectedLead.failure_reason && (
+                    <div className="flex items-center justify-between gap-3 rounded-xl border border-red-200 bg-red-50 p-4">
+                      <div>
+                        <p className="text-xs font-medium text-red-700">Needs attention</p>
+                        <p className="mt-0.5 text-sm text-red-700">{failureLabel(selectedLead.failure_reason)}</p>
+                      </div>
+                      <Button size="sm" variant="outline" disabled={actionBusy} onClick={() => doRetry(selectedLead)}>
+                        {actionBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Retry"}
+                      </Button>
+                    </div>
+                  )}
                   {selectedLead.contact_email && (
                     <div className="rounded-xl border bg-card p-4">
                       <p className="text-xs font-medium text-muted-foreground">Contact</p>

@@ -23,10 +23,12 @@ FOLLOWUP_DAYS = int(os.getenv("FOLLOWUP_DAYS", "5"))
 MAX_FOLLOWUPS = int(os.getenv("MAX_FOLLOWUPS", "2"))
 
 
-def get_gmail_service():
-    """Reuse the Gmail auth from send_via_gmail."""
+def get_gmail_service(user_id: str | None = None):
+    """Reuse the Gmail auth from send_via_gmail. When user_id is given, builds
+    the service from THAT user's own connected Gmail (v1 Task 6); otherwise
+    falls back to the shared single-operator token."""
     from skills.send_via_gmail import get_gmail_service as _get_service
-    return _get_service()
+    return _get_service(user_id)
 
 
 def check_thread_for_reply(service, contact_email: str, sent_after: str) -> bool:

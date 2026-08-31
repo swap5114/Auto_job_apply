@@ -193,12 +193,13 @@ def extract_role_links(markdown: str) -> list:
     return candidates
 
 
-def run(csv_path: str):
+def run(csv_path: str, user_id: str | None = None):
     if not FIRECRAWL_API_KEY:
         print("FIRECRAWL_API_KEY not set in config/.env -- skipping company_list scrape.")
         return
 
-    user_id = get_current_user_id()
+    if user_id is None:
+        user_id = get_current_user_id()
     companies = read_companies(csv_path)
 
     added = 0

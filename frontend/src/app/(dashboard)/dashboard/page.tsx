@@ -199,6 +199,12 @@ export default function DashboardPage() {
       ).length,
     [leads]
   );
+  // Leads approved but stuck because the user hasn't connected their Gmail
+  // (send_node's soft "approved_needs_gmail" state, Task 6).
+  const needsGmailCount = useMemo(
+    () => leads.filter((l) => l.status === "approved_needs_gmail").length,
+    [leads]
+  );
 
   const kpis = [
     { label: "Total Leads", value: stats?.total ?? 0, icon: FileText },
@@ -257,6 +263,18 @@ export default function DashboardPage() {
       ) : (
         <div className="space-y-4 pb-16">
           {leads.length === 0 && <WelcomeBanner />}
+
+          {needsGmailCount > 0 && (
+            <div className="flex flex-col items-start justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 sm:flex-row sm:items-center">
+              <span>
+                {needsGmailCount} approved outreach message{needsGmailCount > 1 ? "s are" : " is"} waiting
+                to send — connect your Gmail to send {needsGmailCount > 1 ? "them" : "it"} from your inbox.
+              </span>
+              <Button asChild size="sm" variant="outline" className="shrink-0">
+                <Link href="/settings">Connect Gmail</Link>
+              </Button>
+            </div>
+          )}
 
           {approvedNoEmailCount > 0 && (
             <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
@@ -456,6 +474,9 @@ function statusVerb(status: string): string {
     draft_created: "Draft created",
     replied: "Replied",
     rejected: "Rejected",
+    approved_needs_gmail: "Approved — needs Gmail",
+    send_failed: "Send failed",
+    send_skipped: "Not sent",
   };
   return map[status] || "Lead";
 }

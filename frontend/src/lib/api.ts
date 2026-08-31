@@ -74,6 +74,8 @@ export interface Lead {
   channel: string[];
   cover_note: string;
   applied_at: string;
+  replied_at: string;
+  failure_reason: string;
   job_id: string;
 }
 
@@ -304,21 +306,6 @@ export const api = {
         body: JSON.stringify({ outreach_draft }),
       }),
 
-    // Apply channel's cover-note counterpart to edit() above.
-    editCoverNote: (id: string, cover_note: string) =>
-      request<{ status: string; cover_note_updated: boolean }>(`/leads/${id}/edit-cover-note`, {
-        method: "POST",
-        body: JSON.stringify({ cover_note }),
-      }),
-
-    // Apply channel's terminal action -- called after the user has
-    // actually submitted the application via the real listing_url deep
-    // link. No auto-fill, this is a plain manual status update.
-    markApplied: (id: string) =>
-      request<{ status: string; applied_at: string }>(`/leads/${id}/mark-applied`, {
-        method: "POST",
-      }),
-
     // Auth is Bearer-token based (not cookies), so a plain <a href> to the
     // API route wouldn't carry the Authorization header -- this fetches
     // the PDF with the same auth headers every other api.* call uses and
@@ -343,6 +330,10 @@ export const api = {
 
     research: (id: string) =>
       request<CompanyResearch>(`/leads/${id}/research`, { method: "POST" }),
+
+    // Retry a stuck/failed lead -- clears its failure and re-runs processing.
+    retry: (id: string) =>
+      request<{ status: string; lead_id: string }>(`/leads/${id}/retry`, { method: "POST" }),
 
     buildDemo: (id: string, demo_project: DemoProject, max_attempts?: number) =>
       request<DemoBuildStatus>(`/leads/${id}/build-demo`, {
@@ -376,14 +367,57 @@ export const api = {
     // criteria saved yet.
     matched: () => request<MatchedJob[]>("/jobs/matched"),
 
-    // Converts a shared-catalog matched job into a per-user Lead (Phase
-    // 5.3). channel defaults server-side to ["apply", "outreach"] when
-    // omitted.
-    save: (jobId: string, channel?: ("apply" | "outreach")[]) =>
+    // Converts a shared-catalog matched job into a per-user outreach Lead.
+    // v1 is outreach-only, so the server always creates an outreach lead.
+    save: (jobId: string) =>
       request<Lead>(`/jobs/${jobId}/save`, {
         method: "POST",
-        body: JSON.stringify(channel ? { channel } : {}),
+        body: JSON.stringify({}),
       }),
+  },
+
+  chat: {
+    // Hero onboarding: attach a resume + type who you're targeting, get
+    // matched YC startups. Multipart; requires auth (the hero gates send
+    // behind Google sign-in).
+    match: async (file: File, target: string) => {
+      const form = new FormData();
+      form.append("file", file);
+      form.append("target", target);
+      const headers: Record<string, string> = {};
+      if (getAuthToken) {
+        const token = await getAuthToken();
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+      }
+      const res = await fetch(`${BASE}/chat/match`, { method: "POST", headers, body: form });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || `Match failed: ${res.status}`);
+      }
+      return res.json() as Promise<AnonResumeUploadResult>;
+    },
+  },
+
+  gmail: {
+    // Whether the signed-in user has connected their own Gmail, plus their
+    // send preference ("draft" | "direct").
+    status: () =>
+      request<{ connected: boolean; email: string | null; send_mode: "draft" | "direct" }>(
+        "/gmail/status"
+      ),
+
+    // Returns Google's consent URL; the caller redirects the browser to it.
+    connectUrl: (send_mode: "draft" | "direct") =>
+      request<{ auth_url: string }>(`/gmail/connect?send_mode=${send_mode}`),
+
+    setSendMode: (send_mode: "draft" | "direct") =>
+      request<{ connected: boolean; email: string | null; send_mode: "draft" | "direct" }>(
+        "/gmail/send-mode",
+        { method: "PUT", body: JSON.stringify({ send_mode }) }
+      ),
+
+    disconnect: () =>
+      request<{ status: string }>("/gmail/disconnect", { method: "POST" }),
   },
 
   stats: {
@@ -399,6 +433,14 @@ export const api = {
       }),
 
     runStatus: () => request<PipelineRunState>("/pipeline/run-status"),
+
+    // Start the outreach pipeline on a specific set of already-saved leads
+    // (the hero-chat "approve these startups" bridge, Task 10).
+    runForLeads: (leadIds: string[]) =>
+      request<{ status: string; leads: number }>("/pipeline/run-for-leads", {
+        method: "POST",
+        body: JSON.stringify({ lead_ids: leadIds }),
+      }),
 
     uploadCsv: async (file: File) => {
       // multipart upload — don't set Content-Type, the browser sets the boundary
@@ -435,9 +477,6 @@ export const api = {
 
     draftOutreach: () =>
       request<{ status: string }>("/pipeline/draft-outreach", { method: "POST" }),
-
-    draftCoverNotes: () =>
-      request<{ status: string }>("/pipeline/draft-cover-notes", { method: "POST" }),
 
     feedGraph: () =>
       request<{ status: string; leads_fed: number }>("/pipeline/feed-graph", { method: "POST" }),

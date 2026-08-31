@@ -185,9 +185,18 @@ def company_to_lead(company: dict) -> dict:
     }
 
 
-def run(max_leads: int = 20):
-    """Main entry point: scrape YC startups that are hiring + recently funded."""
-    user_id = get_current_user_id()
+def run(max_leads: int = 20, user_id: str | None = None):
+    """Main entry point: scrape YC startups that are hiring + recently funded.
+
+    Args:
+        max_leads: cap on new YC leads to add this run.
+        user_id: whose leads table to write to. Defaults to the single
+            local operator (db.current_user) for the CLI entry point;
+            HTTP-reachable callers (run_sourcing_pipeline on behalf of a
+            signed-in user) MUST pass the authenticated user_id.
+    """
+    if user_id is None:
+        user_id = get_current_user_id()
     print(f"\n{'='*60}")
     print("YC Startups Scraper")
     print(f"{'='*60}")
@@ -272,6 +281,97 @@ def run(max_leads: int = 20):
     return added
 
 
+def _gather_candidates(max_count: int) -> list[dict]:
+    """Shared candidate-gathering: hiring + recent-batch, tech-first, deduped,
+    topped up from recent batches until we have up to max_count companies.
+    Used by both run() (per-user leads) and run_catalog() (shared catalog)."""
+    hiring = fetch_hiring_companies()
+    recent = [c for c in hiring if is_recent_batch(c.get("batch", ""))]
+    tech = [c for c in recent if is_tech_company(c)]
+    non_tech = [c for c in recent if not is_tech_company(c)]
+    candidates = tech + non_tech
+
+    if len(candidates) < max_count:
+        seen_ids = {c.get("id") for c in candidates}
+        for batch in RECENT_BATCHES[:3]:
+            for c in fetch_batch_companies(batch):
+                if c.get("id") not in seen_ids and c.get("isHiring"):
+                    candidates.append(c)
+                    seen_ids.add(c.get("id"))
+    return candidates
+
+
+def run_catalog(max_companies: int = 50) -> dict:
+    """Sync YC startups into the SHARED catalog (companies/jobs), NOT per-user
+    leads -- this is what makes YC startups matchable by skills/match_jobs.py
+    for the hero-chat onboarding (v1 Task 8).
+
+    Mirrors the ATS connectors (greenhouse/lever/ashby): each YC company
+    becomes a Company (ats_type="yc", ats_token=slug) with one Job row
+    (external_id=slug), deduped on (company_id, external_id) so re-running is
+    idempotent. The company website (when known) is used as the job's
+    apply_url so downstream email discovery can resolve a real domain.
+    """
+    print(f"\n{'='*60}")
+    print("YC Catalog Sync (shared companies/jobs)")
+    print(f"{'='*60}")
+
+    candidates = _gather_candidates(max_companies)
+
+    added = 0
+    skipped = 0
+    errored = 0
+    processed = 0
+
+    for company in candidates:
+        if processed >= max_companies:
+            break
+        name = company.get("name") or ""
+        slug = company.get("slug") or company.get("id")
+        if not name or not slug:
+            continue
+
+        lead_shape = company_to_lead(company)  # reuse jd_text/domain/url builder
+        if not yc_matches_criteria(lead_shape, company):
+            continue
+
+        processed += 1
+        try:
+            cat_company = repo.get_or_create_company(
+                name=name, ats_type="yc", ats_token=str(slug)
+            )
+            website = company.get("website") or ""
+            apply_url = website or lead_shape.get("listing_url") or ""
+            result = repo.add_job(
+                cat_company["id"],
+                source="yc",
+                external_id=str(slug),
+                title=lead_shape.get("role") or f"Engineering @ {name}",
+                location="Remote/Unspecified",
+                department="Engineering",
+                jd_text=lead_shape.get("jd_text") or "",
+                apply_url=apply_url,
+                posted_at=None,
+            )
+            if result is not None:
+                added += 1
+            else:
+                skipped += 1
+            repo.mark_company_scraped(cat_company["id"])
+        except Exception as e:
+            print(f"  ❌ yc catalog: error on {name}: {e}")
+            errored += 1
+
+    print(f"\n{'='*60}")
+    print(f"YC Catalog: {added} new jobs, {skipped} already known, {errored} errored")
+    print(f"{'='*60}\n")
+    return {"provider": "yc", "added": added, "skipped": skipped, "errored": errored}
+
+
 if __name__ == "__main__":
-    max_leads = int(sys.argv[1]) if len(sys.argv) > 1 else 20
-    run(max_leads)
+    if len(sys.argv) > 1 and sys.argv[1] == "catalog":
+        max_c = int(sys.argv[2]) if len(sys.argv) > 2 else 50
+        run_catalog(max_c)
+    else:
+        max_leads = int(sys.argv[1]) if len(sys.argv) > 1 else 20
+        run(max_leads)

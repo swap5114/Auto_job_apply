@@ -117,17 +117,76 @@ def get_gmail_credentials():
 
     return creds
 
-def get_gmail_service():
-    """Build and return the Gmail API service object."""
-    from googleapiclient.discovery import build
+class NoGmailConnected(Exception):
+    """Raised when a per-user send is attempted but the user hasn't connected
+    their Gmail (v1 Task 6). Callers treat this as a soft, recoverable state
+    ("approved, needs Gmail"), NOT a hard error that kills the batch."""
 
-    creds = get_gmail_credentials()
-    service = build("gmail", "v1", credentials=creds)
-    return service
+
+def _service_from_credentials(creds):
+    from googleapiclient.discovery import build
+    return build("gmail", "v1", credentials=creds)
+
+
+def get_gmail_service(user_id: str | None = None):
+    """Build a Gmail API service.
+
+    v1: when user_id is given, build credentials from THAT user's own stored
+    (encrypted) OAuth refresh token (per-user Gmail, Task 5/6) so mail sends
+    from their inbox, not a shared account. Raises NoGmailConnected if the
+    user hasn't connected Gmail yet.
+
+    When user_id is None (the single-operator CLI / legacy path), fall back to
+    the shared config/gmail_token.json desktop token, unchanged.
+    """
+    if user_id is None:
+        return _service_from_credentials(get_gmail_credentials())
+
+    from api import gmail_oauth
+    from google.auth.transport.requests import Request
+
+    acct = repo.get_gmail_account(user_id)
+    if not acct:
+        raise NoGmailConnected(f"User {user_id} has not connected a Gmail account")
+
+    refresh_token = gmail_oauth.decrypt_token(acct["encrypted_refresh_token"])
+    creds = gmail_oauth.build_credentials_from_refresh_token(refresh_token)
+    # Mint a fresh access token from the refresh token before first use.
+    creds.refresh(Request())
+    return _service_from_credentials(creds)
+
+
+def get_user_send_context(user_id: str):
+    """Return (service, sender_email, send_mode) for a user's connected Gmail.
+    Raises NoGmailConnected if none is connected."""
+    acct = repo.get_gmail_account(user_id)
+    if not acct:
+        raise NoGmailConnected(f"User {user_id} has not connected a Gmail account")
+    service = get_gmail_service(user_id)
+    return service, acct.get("email", ""), acct.get("send_mode", "draft")
 
 # ---------------------------------------------------------------------------
 # Email construction
 # ---------------------------------------------------------------------------
+
+def _compliance_footer() -> str:
+    """CAN-SPAM baseline appended to every outgoing message body (v1 Task 14):
+    a clear opt-out line and, when configured, a physical mailing address.
+
+    The opt-out note is always included (a one-line, human "reply to opt out"
+    is honest for 1:1 cold outreach). A physical address is appended only when
+    COMPLIANCE_ADDRESS is set, since it's user/deployment-specific.
+    """
+    opt_out = os.getenv(
+        "COMPLIANCE_UNSUBSCRIBE_NOTE",
+        "P.S. Not the right time? Just reply and I won't follow up.",
+    )
+    address = os.getenv("COMPLIANCE_ADDRESS", "").strip()
+    parts = ["\n\n--\n" + opt_out]
+    if address:
+        parts.append(address)
+    return "\n".join(parts)
+
 
 def build_email_message(
     to: str,
@@ -139,7 +198,8 @@ def build_email_message(
     """Construct a MIME email and return base64url-encoded raw message.
 
     If attachment_path points to an existing file (the tailored resume PDF),
-    it's attached to the message.
+    it's attached to the message. A compliance footer (opt-out + optional
+    physical address) is appended to the body.
     """
     message = MIMEMultipart()
     message["to"] = to
@@ -147,7 +207,7 @@ def build_email_message(
     if sender:
         message["from"] = sender
 
-    msg_body = MIMEText(body, "plain")
+    msg_body = MIMEText(body + _compliance_footer(), "plain")
     message.attach(msg_body)
 
     if attachment_path and os.path.exists(attachment_path):
@@ -194,9 +254,9 @@ def extract_subject_and_body(outreach_draft: str, company: str, role: str) -> tu
 # Core actions: create draft / send
 # ---------------------------------------------------------------------------
 
-def create_draft(service, to: str, subject: str, body: str, attachment_path: str = "") -> dict:
+def create_draft(service, to: str, subject: str, body: str, attachment_path: str = "", sender: str = "") -> dict:
     """Create a Gmail draft (optionally with a PDF attachment)."""
-    raw_message = build_email_message(to, subject, body, SENDER_EMAIL, attachment_path)
+    raw_message = build_email_message(to, subject, body, sender or SENDER_EMAIL, attachment_path)
     draft_body = {"message": {"raw": raw_message}}
 
     draft = service.users().drafts().create(
@@ -205,9 +265,9 @@ def create_draft(service, to: str, subject: str, body: str, attachment_path: str
 
     return draft
 
-def send_email(service, to: str, subject: str, body: str, attachment_path: str = "") -> dict:
+def send_email(service, to: str, subject: str, body: str, attachment_path: str = "", sender: str = "") -> dict:
     """Send an email directly (optionally with a PDF attachment)."""
-    raw_message = build_email_message(to, subject, body, SENDER_EMAIL, attachment_path)
+    raw_message = build_email_message(to, subject, body, sender or SENDER_EMAIL, attachment_path)
     message_body = {"raw": raw_message}
 
     sent = service.users().messages().send(
@@ -220,8 +280,13 @@ def send_email(service, to: str, subject: str, body: str, attachment_path: str =
 # Main skill logic
 # ---------------------------------------------------------------------------
 
-def process_approved_lead(service, lead: dict, user_id: str) -> str:
+def process_approved_lead(
+    service, lead: dict, user_id: str, direct_send: bool, sender: str = "",
+) -> str:
     """Process a single approved lead: create draft or send.
+
+    direct_send: the per-user send preference (True = send now, False = draft).
+    sender: the connected Gmail address to put in the From header.
 
     Returns one of: "sent", "draft_created", "skipped_no_email",
     "skipped_no_draft", "failed".
@@ -248,15 +313,15 @@ def process_approved_lead(service, lead: dict, user_id: str) -> str:
         print(f"  ⚠️  {company} ({lead_id}) — no tailored resume PDF found, sending without attachment")
 
     try:
-        if is_direct_send():
-            result = send_email(service, contact_email, subject, body, attachment)
+        if direct_send:
+            result = send_email(service, contact_email, subject, body, attachment, sender=sender)
             msg_id = result.get("id", "?")
             repo.update_lead(user_id, lead_id, {"status": "sent", "sent_at": _now_iso()})
             attach_note = " (+resume)" if attachment else ""
             print(f"  ✅ SENT to {contact_email} ({company}){attach_note} — msg_id: {msg_id}")
             return "sent"
         else:
-            result = create_draft(service, contact_email, subject, body, attachment)
+            result = create_draft(service, contact_email, subject, body, attachment, sender=sender)
             draft_id = result.get("id", "?")
             repo.update_lead(user_id, lead_id, {"status": "draft_created", "sent_at": _now_iso()})
             attach_note = " (+resume)" if attachment else ""
@@ -272,34 +337,61 @@ def _now_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
 
-def run() -> dict:
-    """Main entry point: process all approved leads.
+def run(user_id: str | None = None) -> dict:
+    """Main entry point: process all of a user's approved leads.
+
+    v1: when user_id is given (the HTTP path), send/draft from THAT user's
+    connected Gmail using THEIR send preference. If the user hasn't connected
+    Gmail, this is a soft no-op (summary["error"]="no_gmail_connected") -- the
+    leads stay 'approved', not failed.
+
+    When user_id is None (single-operator CLI), fall back to the shared token
+    + the global GMAIL_DIRECT_SEND flag, unchanged.
 
     Returns a summary dict: {sent, draft_created, skipped_no_email,
     skipped_no_draft, failed, total, error}.
     """
-    direct_send = is_direct_send()
-    print("=" * 60)
-    print("  GMAIL SKILL — Processing approved leads")
-    print(f"  Mode: {'DIRECT SEND' if direct_send else 'DRAFTS ONLY'}")
-    print("=" * 60)
-    print()
-
     summary = {
         "sent": 0, "draft_created": 0, "skipped_no_email": 0,
         "skipped_no_draft": 0, "failed": 0, "total": 0, "error": None,
     }
 
-    try:
-        service = get_gmail_service()
-    except FileNotFoundError as e:
-        print(f"ERROR: {e}")
-        summary["error"] = str(e)
-        return summary
-    except Exception as e:
-        print(f"ERROR: Failed to authenticate with Gmail: {e}")
-        summary["error"] = str(e)
-        return summary
+    sender = ""
+    if user_id is None:
+        # Legacy single-operator CLI path: shared token + global flag.
+        target_user = get_current_user_id()
+        direct_send = is_direct_send()
+        sender = SENDER_EMAIL
+        try:
+            service = get_gmail_service()
+        except FileNotFoundError as e:
+            print(f"ERROR: {e}")
+            summary["error"] = str(e)
+            return summary
+        except Exception as e:
+            print(f"ERROR: Failed to authenticate with Gmail: {e}")
+            summary["error"] = str(e)
+            return summary
+    else:
+        # Per-user path: this user's own Gmail + their send preference.
+        target_user = user_id
+        try:
+            service, sender, send_mode = get_user_send_context(user_id)
+        except NoGmailConnected:
+            print(f"  ⚠️  User {user_id} has no Gmail connected — leaving approved leads as-is.")
+            summary["error"] = "no_gmail_connected"
+            return summary
+        except Exception as e:
+            print(f"ERROR: Failed to build Gmail service for user {user_id}: {e}")
+            summary["error"] = str(e)
+            return summary
+        direct_send = (send_mode == "direct")
+
+    print("=" * 60)
+    print("  GMAIL SKILL — Processing approved leads")
+    print(f"  Mode: {'DIRECT SEND' if direct_send else 'DRAFTS ONLY'}"
+          + (f"  Sender: {sender}" if sender else ""))
+    print("=" * 60)
 
     # Which statuses to (re)process:
     #  - always 'approved' (newly approved, not yet actioned)
@@ -311,8 +403,7 @@ def run() -> dict:
     if direct_send:
         statuses.append("draft_created")
 
-    user_id = get_current_user_id()
-    all_leads = repo.get_leads(user_id)
+    all_leads = repo.get_leads(target_user)
     seen = set()
     leads = []
     for lead in all_leads:
@@ -329,7 +420,7 @@ def run() -> dict:
         return summary
 
     for lead in leads:
-        outcome = process_approved_lead(service, lead, user_id)
+        outcome = process_approved_lead(service, lead, target_user, direct_send, sender)
         summary[outcome] = summary.get(outcome, 0) + 1
 
     print(

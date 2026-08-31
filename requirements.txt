@@ -37,6 +37,9 @@ alembic==1.14.0
 # --- Phase 3: Accounts & Multi-Tenancy (Firebase Auth token verification) ---
 firebase-admin==7.5.0
 
+# --- v1 Task 5: per-user Gmail OAuth refresh-token encryption (Fernet) ---
+cryptography  # already a transitive dep of firebase-admin/google-auth; pinned explicitly since api/gmail_oauth.py uses cryptography.fernet directly
+
 # Testing
 pytest==8.3.4
 pytest-postgresql==6.1.1

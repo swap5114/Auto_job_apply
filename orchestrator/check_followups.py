@@ -12,6 +12,7 @@ Usage:
 
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Optional
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
@@ -54,6 +55,7 @@ def check_and_queue_followups(user_id: Optional[str] = None) -> int:
         return 0
 
     queued = 0
+    replied = 0
 
     for lead in leads:
         lead_id = lead.get("id")
@@ -89,20 +91,47 @@ def check_and_queue_followups(user_id: Optional[str] = None) -> int:
         try:
             graph.invoke(state, config)
 
+            now = datetime.now(timezone.utc)
+
             # Check if it paused at review (meaning a follow-up draft was generated)
             final_state = graph.get_state(config)
             if final_state and final_state.next and "review" in final_state.next:
                 queued += 1
+                _safe_update(user_id, lead_id, {"last_checked": now})
                 print(f"  📋 {company} — follow-up draft queued for review (thread: {thread_id})")
             else:
-                # Ran to END — either replied, max followups, or check failed
+                # Ran to END — either replied, max followups, or check failed.
                 status = final_state.values.get("status", "unknown") if final_state else "unknown"
-                print(f"  ✓  {company} — no follow-up needed (status: {status})")
+                if status == "replied":
+                    # v1 Task 7: persist the reply so the dashboard reflects it.
+                    # Reply detection lives only in the graph state otherwise --
+                    # the leads table (what the API/dashboard read) never learned
+                    # about it before this write.
+                    _safe_update(user_id, lead_id, {
+                        "status": "replied", "replied_at": now, "last_checked": now,
+                    })
+                    replied += 1
+                    print(f"  💬 {company} — REPLY detected, marked replied")
+                else:
+                    _safe_update(user_id, lead_id, {"last_checked": now})
+                    print(f"  ✓  {company} — no follow-up needed (status: {status})")
 
         except Exception as e:
             print(f"  ❌ Error processing {company}: {e}")
 
+    if replied:
+        print(f"\ncheck_followups: {replied} reply(ies) detected and marked.")
     return queued
+
+
+def _safe_update(user_id: str, lead_id: str, fields: dict) -> None:
+    """Best-effort lead update -- a persistence failure is logged loudly (per
+    the project's 'never silently skip' rule) but doesn't abort the whole
+    follow-up sweep for the remaining leads."""
+    try:
+        repo.update_lead(user_id, lead_id, fields)
+    except Exception as e:
+        print(f"  ⚠️  failed to persist follow-up update for lead {lead_id}: {e}")
 
 
 def main():

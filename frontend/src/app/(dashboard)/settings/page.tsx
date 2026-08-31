@@ -10,7 +10,156 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
+import { Mail, CheckCircle2 } from "lucide-react";
 import { api, type SearchCriteria, type PipelineConfig } from "@/lib/api";
+
+type GmailStatus = { connected: boolean; email: string | null; send_mode: "draft" | "direct" };
+
+function GmailConnectionCard() {
+  const [status, setStatus] = useState<GmailStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    try {
+      setStatus(await api.gmail.status());
+    } catch {
+      setStatus({ connected: false, email: null, send_mode: "draft" });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+    // Surface the OAuth callback outcome (?gmail=connected|error|...).
+    const params = new URLSearchParams(window.location.search);
+    const g = params.get("gmail");
+    if (g === "connected") toast.success("Gmail connected");
+    else if (g === "state_error") toast.error("Gmail connect session expired — try again");
+    else if (g === "config_error") toast.error("Gmail OAuth isn't configured on the server");
+    else if (g === "error") toast.error("Couldn't connect Gmail");
+    if (g) window.history.replaceState({}, "", window.location.pathname);
+  }, []);
+
+  async function connect(mode: "draft" | "direct") {
+    setBusy(true);
+    try {
+      const { auth_url } = await api.gmail.connectUrl(mode);
+      window.location.href = auth_url; // redirect to Google consent
+    } catch (e: any) {
+      toast.error(e?.message || "Couldn't start Gmail connect");
+      setBusy(false);
+    }
+  }
+
+  async function setMode(mode: "draft" | "direct") {
+    if (!status?.connected) return;
+    setBusy(true);
+    try {
+      setStatus(await api.gmail.setSendMode(mode));
+      toast.success(mode === "direct" ? "Emails will send automatically on approval" : "Emails will be saved as drafts");
+    } catch (e: any) {
+      toast.error(e?.message || "Couldn't update send mode");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disconnect() {
+    setBusy(true);
+    try {
+      await api.gmail.disconnect();
+      toast.success("Gmail disconnected");
+      await load();
+    } catch (e: any) {
+      toast.error(e?.message || "Couldn't disconnect");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (loading) {
+    return (
+      <Card>
+        <CardContent className="flex items-center gap-2 p-6 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" /> Loading Gmail status…
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card>
+      <CardContent className="space-y-5 p-6">
+        <div className="flex items-start gap-3">
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted">
+            <Mail className="h-5 w-5 text-muted-foreground" />
+          </div>
+          <div className="flex-1">
+            <p className="text-sm font-medium text-foreground">Your Gmail</p>
+            {status?.connected ? (
+              <p className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
+                Connected as {status.email}
+              </p>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                Connect your Gmail so approved outreach sends from your own inbox.
+              </p>
+            )}
+          </div>
+        </div>
+
+        {!status?.connected ? (
+          <div className="flex gap-3">
+            <Button disabled={busy} onClick={() => connect("draft")}>
+              {busy ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <Mail className="mr-2 h-3.5 w-3.5" />}
+              Connect Gmail
+            </Button>
+          </div>
+        ) : (
+          <>
+            <Separator />
+            <div className="space-y-3">
+              <label className="text-sm font-medium text-foreground">Send mode</label>
+              <p className="text-xs text-muted-foreground">
+                Choose what happens when you approve outreach in the review queue.
+              </p>
+              <div className="flex gap-3">
+                <button
+                  disabled={busy}
+                  onClick={() => setMode("draft")}
+                  className={`rounded-lg border px-4 py-2.5 text-sm font-medium transition-colors ${status.send_mode === "draft"
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "border-border bg-background text-muted-foreground hover:bg-muted"
+                    }`}
+                >
+                  Save as draft
+                </button>
+                <button
+                  disabled={busy}
+                  onClick={() => setMode("direct")}
+                  className={`rounded-lg border px-4 py-2.5 text-sm font-medium transition-colors ${status.send_mode === "direct"
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "border-border bg-background text-muted-foreground hover:bg-muted"
+                    }`}
+                >
+                  Send directly
+                </button>
+              </div>
+            </div>
+            <Separator />
+            <Button variant="outline" size="sm" disabled={busy} onClick={disconnect}>
+              Disconnect Gmail
+            </Button>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
 
 function TagInput({
   label,
@@ -152,6 +301,7 @@ export default function SettingsPage() {
             <TabsList>
               <TabsTrigger value="criteria">Search Criteria</TabsTrigger>
               <TabsTrigger value="pipeline">Pipeline Config</TabsTrigger>
+              <TabsTrigger value="gmail">Gmail</TabsTrigger>
             </TabsList>
 
             {/* Search Criteria */}
@@ -231,8 +381,8 @@ export default function SettingsPage() {
                           key={backend}
                           onClick={() => setConfig((c) => (c ? { ...c, model_backend: backend } : c))}
                           className={`rounded-lg border px-4 py-2.5 text-sm font-medium capitalize transition-colors ${config.model_backend === backend
-                              ? "border-primary bg-primary text-primary-foreground"
-                              : "border-border bg-background text-muted-foreground hover:bg-muted"
+                            ? "border-primary bg-primary text-primary-foreground"
+                            : "border-border bg-background text-muted-foreground hover:bg-muted"
                             }`}
                         >
                           {backend === "claude" ? "Claude (API)" : "Gemini (Free)"}
@@ -269,38 +419,14 @@ export default function SettingsPage() {
                       />
                     </div>
                   </div>
-
-                  <Separator />
-
-                  {/* Gmail Mode */}
-                  <div className="space-y-3">
-                    <label className="text-sm font-medium text-foreground">Gmail Mode</label>
-                    <p className="text-xs text-muted-foreground">
-                      Create drafts for manual review, or send directly on approval
-                    </p>
-                    <div className="flex gap-3">
-                      <button
-                        onClick={() => setConfig((c) => (c ? { ...c, gmail_direct_send: false } : c))}
-                        className={`rounded-lg border px-4 py-2.5 text-sm font-medium transition-colors ${!config.gmail_direct_send
-                            ? "border-primary bg-primary text-primary-foreground"
-                            : "border-border bg-background text-muted-foreground hover:bg-muted"
-                          }`}
-                      >
-                        Drafts Only
-                      </button>
-                      <button
-                        onClick={() => setConfig((c) => (c ? { ...c, gmail_direct_send: true } : c))}
-                        className={`rounded-lg border px-4 py-2.5 text-sm font-medium transition-colors ${config.gmail_direct_send
-                            ? "border-primary bg-primary text-primary-foreground"
-                            : "border-border bg-background text-muted-foreground hover:bg-muted"
-                          }`}
-                      >
-                        Direct Send
-                      </button>
-                    </div>
-                  </div>
+                  {/* Per-user Gmail send preference now lives in the Gmail tab. */}
                 </CardContent>
               </Card>
+            </TabsContent>
+
+            {/* Gmail connection (per-user OAuth) */}
+            <TabsContent value="gmail" className="space-y-6">
+              <GmailConnectionCard />
             </TabsContent>
           </Tabs>
         </div>

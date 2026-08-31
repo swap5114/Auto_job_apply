@@ -1,18 +1,16 @@
 """LangGraph pipeline — full graph definition.
 
-Nodes: find_email → route_channel → research_company → tailor_resume →
-    [draft (outreach) | draft_cover_note (apply)] → review (interrupt) → [send (outreach) | END]
-Cyclic edge: followup_check → draft (for follow-ups, outreach only)
+Nodes: find_email → research_company → tailor_resume → draft →
+    review (interrupt) → [send | END]
+Cyclic edge: followup_check → draft (for follow-ups)
 
 Each node wraps the corresponding skill's core logic. Per-node error handling
 ensures one lead failing doesn't kill the batch. The review node uses
-LangGraph's native interrupt() for human-in-the-loop approval, shared
-between both channels (see review_node's docstring).
+LangGraph's native interrupt() for human-in-the-loop approval.
 
-A lead with both "apply" and "outreach" in Lead.channel gets TWO separate
-graph runs through this same graph, one per channel, each on its own
-thread_id (see make_thread_id's channel param) -- not one run branching
-internally. See route_channel_node's docstring for why.
+v1 note: this is an OUTREACH-ONLY pipeline. The apply channel (channel
+routing, cover-note drafting, the ready_to_apply/mark-applied hand-off) was
+removed to keep the pipeline simple and robust. Leads are always outreach.
 """
 
 import os
@@ -59,10 +57,8 @@ class PipelineState(TypedDict, total=False):
     listing_url: Optional[str]
     domain: Optional[str]
     company_research: Optional[Dict[str, Any]]  # Added for research_company node
-    channel: Optional[List[str]]  # Phase 4.5: Lead.channel array (apply/outreach), copied from the lead row
-    active_channel: Optional[str]  # Phase 4.5: which channel THIS graph run is processing (see route_channel_node)
-    cover_note: Optional[str]  # Phase 5: apply-channel's cover note (draft_cover_note_node's output)
-    keyword_coverage: Optional[float]  # Phase 5: ATS keyword coverage %, surfaced alongside the apply-channel review (5.5)
+    channel: Optional[List[str]]  # Lead.channel array (v1: always ["outreach"]) copied from the lead row
+    keyword_coverage: Optional[float]  # ATS keyword coverage %, surfaced alongside review
 
 # ---------------------------------------------------------------------------
 # Node definitions
@@ -105,57 +101,6 @@ def find_email_node(state: PipelineState) -> Dict[str, Any]:
     except Exception as e:
         print(f"  ❌ find_email_node failed for {company}: {e}")
         return {"status": "email_search_failed"}
-
-def route_channel_node(state: PipelineState) -> Dict[str, Any]:
-    """Determine which channel (apply/outreach) this graph run processes.
-
-    Design decision (Phase 4.5 scaffold, see PHASE_4_PLAN.md 4.5 -- carried
-    forward by Phase 5.2): `Lead.channel` (db/models.py) is an array
-    because a single lead can be BOTH apply and outreach. Rather than have
-    one graph run fork internally to process both channels at once --
-    which would make a single interrupt-based review checkpoint ambiguous
-    about *which* channel's draft/decision it's pausing on -- this graph
-    processes exactly ONE channel per run, tracked in the distinct
-    `active_channel` state field (deliberately separate from the lead's
-    full `channel` array). A dual-channel lead gets TWO separate graph
-    runs, one per channel, each on its own thread_id (see
-    graph.pipeline.make_thread_id's channel param and
-    orchestrator/feed_graph.py's feed_pending_leads, which fans out over
-    `channel` and sets `active_channel` before each invocation) -- not two
-    interrupts inside a single run.
-
-    The caller is expected to set `active_channel` before invoking the
-    graph. If it didn't (e.g. older callers, or tests constructing state
-    by hand), this node defaults it from `channel`, preferring "outreach"
-    when both are present, matching feed_pending_leads' own channel-loop
-    ordering (outreach is iterated first when both are present in
-    Lead.channel, since it's the older/primary channel) for whichever
-    single run this node ends up routing.
-
-    Both "apply" and "outreach" continue into the graph's shared nodes
-    from here (Phase 5 replaces the old apply -> END dead-end) --
-    research_company/tailor_resume diverge downstream per-channel via
-    route_after_research, and review_node itself branches its interrupt
-    payload/resume handling by active_channel (see review_node's
-    docstring). There is no send step for apply (no Gmail send_node
-    target) -- that split happens after review, not here.
-    """
-    active_channel = state.get("active_channel")
-    if not active_channel:
-        channels = state.get("channel") or []
-        if "outreach" in channels:
-            active_channel = "outreach"
-        elif channels:
-            active_channel = channels[0]
-        else:
-            active_channel = "outreach"
-
-    if active_channel not in ("apply", "outreach"):
-        print(f"  ⚠️  route_channel_node: unknown channel '{active_channel}', defaulting to outreach")
-        active_channel = "outreach"
-
-    return {"active_channel": active_channel, "status": state.get("status", "channel_routed")}
-
 
 def research_company_node(state: PipelineState) -> Dict[str, Any]:
     """Research company and generate demo project idea using LLM."""
@@ -232,120 +177,50 @@ def tailor_resume_node(state: PipelineState) -> Dict[str, Any]:
         print(f"  ❌ tailor_resume_node failed for {company}: {e}")
         return {"status": "tailor_failed"}
 
-def draft_cover_note_node(state: PipelineState) -> Dict[str, Any]:
-    """Draft the apply-channel's cover note for a lead (Phase 5.1/5.2).
-
-    Apply-channel counterpart to draft_node -- reuses the same tailored
-    resume (skills/tailor_resume_node already saved it) rather than the
-    base resume, same reasoning draft_node/draft_outreach.py already give
-    for outreach: stay consistent with what's actually being submitted.
-    """
-    from skills.draft_cover_note import draft_cover_note, load_tailored_resume
-
-    company = state.get("company") or ""
-    role = state.get("role") or ""
-    jd_text = state.get("jd_text") or ""
-    resume_version = state.get("resume_version") or ""
-
-    if not resume_version:
-        print(f"  ⚠️  draft_cover_note_node: no resume_version for {company}, skipping")
-        return {"status": "draft_skipped"}
-
-    try:
-        tailored_resume = load_tailored_resume(resume_version)
-    except FileNotFoundError:
-        print(f"  ⚠️  draft_cover_note_node: resume file not found for {company}")
-        return {"status": "draft_skipped"}
-
-    lead = {"company": company, "role": role, "jd_text": jd_text}
-
-    try:
-        note = draft_cover_note(tailored_resume, lead)
-    except Exception as e:
-        print(f"  ❌ draft_cover_note_node failed for {company}: {e}")
-        return {"status": "draft_failed"}
-
-    if note.startswith("NO_HONEST_CONNECTION:"):
-        # The zero-fabrication rule made explicit as a real model refusal
-        # (see skills/draft_cover_note.py's SYSTEM_PROMPT rule 1) -- this
-        # is loud (status: draft_failed), not a silently-skipped lead, per
-        # the project's "never silently skip" rule. The refusal text is
-        # still carried into cover_note so a human reviewer can see why.
-        print(f"  🚫 draft_cover_note_node: model declined for {company} -- {note}")
-        return {"status": "draft_failed", "cover_note": note}
-
-    print(f"  ✍️  draft_cover_note_node: cover note drafted for {company}")
-    return {"cover_note": note, "status": "pending_review"}
-
 def review_node(state: PipelineState) -> Dict[str, Any]:
-    """Interrupt execution for human review checkpoint.
+    """Interrupt execution for human review checkpoint (outreach only).
 
     Pauses graph execution natively via interrupt(). When resumed via
-    Command(resume=...), receives user decision ('approved', 'rejected', or edit dict).
+    Command(resume=...), receives the user decision ('approved', 'rejected',
+    or an edit dict).
 
-    Shared between both channels (Phase 5.2 -- rather than duplicating a
-    near-identical apply-specific review node): the interrupt payload
-    carries both outreach_draft and cover_note fields regardless of
-    active_channel (the irrelevant one is simply None/unset for that
-    channel's run) so callers don't need a separate payload shape per
-    channel, and can still branch their own UI on active_channel.
+    v1 note: this is now outreach-only. The apply channel (cover notes,
+    ready_to_apply, the listing-url hand-off) was removed to keep the
+    outreach pipeline simple and robust, so there is no per-channel
+    branching here anymore.
 
-    Resume contract, per channel:
-    - outreach: Command(resume="approved") / Command(resume="rejected") /
-      Command(resume={"status": "approved", "outreach_draft": "..."})
-      (edit) -- unchanged from pre-Phase-5.
-    - apply: Command(resume="approved") / Command(resume="rejected") /
-      Command(resume={"status": "approved", "cover_note": "..."}) (edit)
-      -- same shape, "cover_note" instead of "outreach_draft".
-
-    On approval, the resulting `status` is channel-dependent: outreach's
-    approved state is "approved" (there's still a send step ahead of it);
-    apply's approved state is "ready_to_apply" (the plan's own
-    state-machine naming: matched -> tailoring -> ready_to_apply ->
-    applied -- there is no send step for apply, the terminal action is a
-    human clicking the listing_url deep link and later hitting "mark
-    applied"). `review_decision` always reflects the raw human decision
-    (approved/rejected) regardless of channel -- it's `status` that
-    encodes the channel-specific resulting pipeline stage.
+    Resume contract:
+    - Command(resume="approved") -> status "approved" (a send step follows)
+    - Command(resume="rejected") -> status "rejected" (routes to END)
+    - Command(resume={"status": "approved", "outreach_draft": "..."}) -> edit
+    `review_decision` reflects the raw human decision (approved/rejected).
     """
-    active_channel = state.get("active_channel") or "outreach"
-
     decision = interrupt({
         "lead_id": state.get("lead_id"),
         "company": state.get("company"),
         "role": state.get("role"),
-        "active_channel": active_channel,
         "resume_version": state.get("resume_version"),
         "keyword_coverage": state.get("keyword_coverage"),
         "listing_url": state.get("listing_url"),
         "outreach_draft": state.get("outreach_draft"),
-        "cover_note": state.get("cover_note"),
         "is_followup": state.get("is_followup", False),
         "followup_count": state.get("followup_count", 0),
     })
 
     new_draft = state.get("outreach_draft")
-    new_cover_note = state.get("cover_note")
 
     if isinstance(decision, dict):
         status_str = decision.get("status", "approved")
         new_draft = decision.get("outreach_draft", new_draft)
-        new_cover_note = decision.get("cover_note", new_cover_note)
     elif decision == "rejected":
         status_str = "rejected"
     else:
         status_str = "approved"
 
-    if status_str == "approved" and active_channel == "apply":
-        final_status = "ready_to_apply"
-    else:
-        final_status = status_str
-
     return {
         "review_decision": status_str,
-        "status": final_status,
+        "status": status_str,
         "outreach_draft": new_draft,
-        "cover_note": new_cover_note,
     }
 
 def send_node(state: PipelineState) -> Dict[str, Any]:
@@ -365,30 +240,39 @@ def send_node(state: PipelineState) -> Dict[str, Any]:
         print(f"  ⚠️  send_node: skipping {company} — missing email or draft")
         return {"status": "send_skipped"}
 
+    user_id = state.get("user_id")
+
     try:
         from skills.send_via_gmail import (
-            get_gmail_service,
+            get_user_send_context,
             extract_subject_and_body,
             create_draft,
             send_email,
             resume_pdf_path,
-            GMAIL_DIRECT_SEND,
-            SENDER_EMAIL,
-            _now_iso,
+            NoGmailConnected,
         )
 
-        service = get_gmail_service()
+        # v1: send from the lead-owner's OWN connected Gmail, using THEIR
+        # send preference. If they haven't connected Gmail, this is a soft,
+        # recoverable state -- the lead stays 'approved' so a later run (after
+        # they connect) picks it up, rather than a hard failure.
+        try:
+            service, sender, send_mode = get_user_send_context(user_id)
+        except NoGmailConnected:
+            print(f"  ⚠️  send_node: {company} approved but user has no Gmail connected")
+            return {"status": "approved_needs_gmail"}
+
         subject, body = extract_subject_and_body(outreach_draft, company, role)
 
         # Attach the tailored resume PDF if available
         attachment = resume_pdf_path({"resume_version": state.get("resume_version")})
 
-        if GMAIL_DIRECT_SEND:
-            result = send_email(service, contact_email, subject, body, attachment)
-            print(f"  ✅ send_node: SENT to {contact_email} ({company})")
+        if send_mode == "direct":
+            send_email(service, contact_email, subject, body, attachment, sender=sender)
+            print(f"  ✅ send_node: SENT to {contact_email} ({company}) from {sender}")
             return {"status": "sent"}
         else:
-            result = create_draft(service, contact_email, subject, body, attachment)
+            create_draft(service, contact_email, subject, body, attachment, sender=sender)
             print(f"  📝 send_node: DRAFT created for {contact_email} ({company})")
             return {"status": "draft_created"}
 
@@ -414,7 +298,7 @@ def followup_check_node(state: PipelineState) -> Dict[str, Any]:
     lead_id = state.get("lead_id", "")
     company = state.get("company", "")
     contact_email = state.get("contact_email") or ""
-    sent_at = state.get("status")  # We'll need sent_at in state
+    user_id = state.get("user_id")
     followup_count = int(state.get("followup_count") or 0)
 
     if followup_count >= MAX_FOLLOWUPS:
@@ -422,7 +306,13 @@ def followup_check_node(state: PipelineState) -> Dict[str, Any]:
         return {"status": "max_followups_reached"}
 
     try:
-        service = get_gmail_service()
+        from skills.send_via_gmail import NoGmailConnected
+        try:
+            # Reply-checking reads the lead-owner's OWN mailbox.
+            service = get_gmail_service(user_id)
+        except NoGmailConnected:
+            print(f"  ⚠️  followup_check: {company} — user has no Gmail connected, skipping")
+            return {"status": "followup_check_skipped"}
         has_reply = check_thread_for_reply(service, contact_email, "")
 
         if has_reply:
@@ -496,29 +386,35 @@ Previous message sent:
 {previous_draft}
 """
 
-    # Add company research context if available (especially the demo project idea)
+    # Add company research context if available (especially the use-case idea)
     research_context = ""
     if company_research:
-        demo_project = company_research.get("demo_project", {})
-        if demo_project:
+        idea = company_research.get("demo_project", {})
+        if idea:
             research_context = f"""
 
-IMPORTANT - DEMO PROJECT TO MENTION:
-The candidate has built/is building a demo project specifically for this company:
-- Title: {demo_project.get('title', 'N/A')}
-- Description: {demo_project.get('description', 'N/A')}
-- Deliverable: {demo_project.get('deliverable', 'N/A')}
+IMPORTANT — A SPECIFIC IDEA TO LEAD WITH:
+The candidate has a concrete, specific idea/use-case for THIS company. Lead the outreach
+with it to show genuine understanding of their problem and real value:
+- Idea: {idea.get('title', 'N/A')}
+- What it is: {idea.get('description', 'N/A')}
+- Why it matters to them: {idea.get('why_it_matters', idea.get('why_impressive', 'N/A'))}
 
-Reference this demo in the outreach! It's the key differentiator. Mention that the candidate 
-built something specifically relevant to their product/problem and offer to share it.
+HONESTY RULES for how to use this idea (critical):
+- Frame it as thinking the candidate has been doing — an angle they'd love to explore or
+  prototype with the team. Something like "one thing I'd be keen to try..." or "I had an idea
+  for how you might...".
+- NEVER claim it is already built, shipped, attached, or demoed. Do NOT say "I built",
+  "I've made", "here's my demo", "please find attached", or anything implying a finished artifact.
+- Keep it to one or two sentences in the message — a hook that shows insight, not a spec dump.
 
-Full company research data:
+Full company research data (context only — do not fabricate beyond it):
 {json.dumps(company_research, indent=2)}
 """
         else:
             research_context = f"""
 
-Company research data (use this to personalize the outreach):
+Company research data (use this to personalize the outreach honestly — do not fabricate):
 {json.dumps(company_research, indent=2)}
 """
 
@@ -556,25 +452,9 @@ Candidate's tailored resume for this lead (JSON):
 # Routing logic
 # ---------------------------------------------------------------------------
 
-def route_after_tailor(state: PipelineState) -> str:
-    """Route after tailoring: outreach → draft (outreach message), apply →
-    draft_cover_note (Phase 5.2). This is the one point the two channels'
-    node chains actually differ, since each channel produces a distinct
-    artifact from the same tailored resume.
-    """
-    if state.get("active_channel") == "apply":
-        return "draft_cover_note"
-    return "draft"
-
-
 def route_after_review(state: PipelineState) -> str:
-    """Route after review: approved (outreach only -- apply's approved
-    state is "ready_to_apply", not "approved", see review_node's
-    docstring) → send; everything else (rejected, ready_to_apply,
-    draft_failed, etc.) → END. There is no send step for the apply
-    channel -- its terminal action is a human clicking the listing_url
-    deep link and later hitting "mark applied," not an automated send.
-    """
+    """Route after review: approved → send; everything else (rejected,
+    draft_failed, etc.) → END."""
     if state.get("status") == "approved":
         return "send"
     return END
@@ -590,46 +470,36 @@ def route_after_followup_check(state: PipelineState) -> str:
 # ---------------------------------------------------------------------------
 
 def build_pipeline_graph(checkpointer=None):
-    """Builds the full pipeline graph with review interrupt and follow-up cycle.
+    """Builds the outreach pipeline graph with review interrupt and follow-up cycle.
 
-    Full flow: START → find_email → route_channel → research_company → tailor_resume →
-        [draft (outreach) | draft_cover_note (apply)] → review → [send (outreach only) | END]
-    Follow-up flow: followup_check → draft → review → send (outreach only -- the apply
-        channel has no follow-up cycle, per PHASE_5_PLAN.md's explicit scope).
+    Full flow: START → find_email → research_company → tailor_resume →
+        draft → review → [send | END]
+    Follow-up flow: followup_check → draft → review → send
 
     Each node handles its own errors gracefully, allowing the graph to continue
     processing other leads even if one fails.
     """
     builder = StateGraph(PipelineState)
 
-    # Nodes
+    # Nodes (v1: outreach-only; the apply channel and its cover-note node
+    # were removed to keep this pipeline simple and robust).
     builder.add_node("find_email", find_email_node)
-    builder.add_node("route_channel", route_channel_node)
     builder.add_node("research_company", research_company_node)
     builder.add_node("tailor_resume", tailor_resume_node)
     builder.add_node("draft", draft_node)
-    builder.add_node("draft_cover_note", draft_cover_note_node)
     builder.add_node("review", review_node)
     builder.add_node("send", send_node)
     builder.add_node("followup_check", followup_check_node)
 
-    # Main flow: START → find_email → route_channel → research → tailor →
-    #   [draft | draft_cover_note] → review → [send | END]
+    # Main flow: START → find_email → research → tailor → draft → review →
+    #   [send | END]
     builder.add_edge(START, "find_email")
-    builder.add_edge("find_email", "route_channel")
-    # Both channels continue into the shared research/tailor flow (Phase
-    # 5.2 replaces the old apply -> END dead-end route_after_channel used
-    # to enforce) -- they diverge downstream at route_after_tailor
-    # (outreach drafts an email/DM, apply drafts a cover note), then
-    # reconverge at the shared review node.
-    builder.add_edge("route_channel", "research_company")
+    builder.add_edge("find_email", "research_company")
     builder.add_edge("research_company", "tailor_resume")
-    builder.add_conditional_edges("tailor_resume", route_after_tailor, ["draft", "draft_cover_note"])
+    builder.add_edge("tailor_resume", "draft")
     builder.add_edge("draft", "review")
-    builder.add_edge("draft_cover_note", "review")
 
-    # After review: route to send (outreach, approved) or END (rejected,
-    # or apply's ready_to_apply -- no send step for apply).
+    # After review: route to send (approved) or END (rejected).
     builder.add_conditional_edges("review", route_after_review, ["send", END])
 
     # After send: done

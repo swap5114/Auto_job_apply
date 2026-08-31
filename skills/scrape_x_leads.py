@@ -75,17 +75,20 @@ def search_tweets(query: str) -> tuple[list, str]:
     return ([], "none")
 
 
-def run(max_leads: int = None):
+def run(max_leads: int = None, user_id: str | None = None):
     """Run X lead scraper.
     
     Args:
         max_leads: Maximum number of leads to add (default: unlimited)
+        user_id: whose leads table to write to. Defaults to the single
+            local operator (db.current_user) for the CLI entry point.
     """
     if not SORSA_API_KEY and not GETX_API_KEY:
         print("Neither SORSA_API_KEY nor GETX_API_KEY set in config/.env -- skipping scrape_x_leads.")
         return
 
-    user_id = get_current_user_id()
+    if user_id is None:
+        user_id = get_current_user_id()
     added = 0
     skipped = 0
     filtered_out = 0

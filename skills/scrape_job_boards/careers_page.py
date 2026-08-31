@@ -47,12 +47,13 @@ def extract_role(markdown: str) -> str:
     return match.group(1) if match else "Unknown Role"
 
 
-def run():
+def run(user_id: str | None = None):
     if not FIRECRAWL_API_KEY:
         print("FIRECRAWL_API_KEY not set in config/.env -- skipping careers_page scrape.")
         return
 
-    user_id = get_current_user_id()
+    if user_id is None:
+        user_id = get_current_user_id()
     added = 0
     skipped = 0
 

@@ -12,14 +12,20 @@ export function Footer() {
           <span className="font-display text-base text-foreground">AutoApply</span>
         </div>
         <p className="text-xs text-muted-foreground">
-          A LangGraph-orchestrated job application pipeline.
+          Personalized cold outreach to YC startups — you approve every message.
         </p>
-        <div className="flex items-center gap-6 text-sm text-muted-foreground">
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm text-muted-foreground">
           <Link href="/dashboard" className="transition-colors hover:text-foreground">
             Dashboard
           </Link>
-          <Link href="#features" className="transition-colors hover:text-foreground">
-            Features
+          <Link href="#faq" className="transition-colors hover:text-foreground">
+            FAQ
+          </Link>
+          <Link href="/privacy" className="transition-colors hover:text-foreground">
+            Privacy
+          </Link>
+          <Link href="/terms" className="transition-colors hover:text-foreground">
+            Terms
           </Link>
         </div>
       </div>

@@ -11,8 +11,9 @@ from skills.relevance_filter import matches_criteria
 URL = "https://jobicy.com/api/v2/remote-jobs"
 
 
-def run():
-    user_id = get_current_user_id()
+def run(user_id: str | None = None):
+    if user_id is None:
+        user_id = get_current_user_id()
     added = 0
     skipped = 0
     filtered_out = 0
