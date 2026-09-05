@@ -59,7 +59,7 @@ def _run_step(label: str, fn, *args, callback=None, **kwargs) -> dict:
 
 def run_sourcing_pipeline(
     sources: list[str] | None = None,
-    yc_max_leads: int = 15,
+    yc_max_leads: int = 5,
     x_max_leads: int = 5,
     csv_path: str | None = None,
     progress_callback=None,
@@ -275,8 +275,8 @@ def run_catalog_refresh(providers: list[str] | None = None, progress_callback=No
     print("=" * 60)
 
     if providers is None:
-        # v1: YC is the primary catalog source for the hero-chat match feed.
-        providers = ["yc", "greenhouse", "lever", "ashby"]
+        # v1: YC is the primary active catalog source for the hero-chat match feed.
+        providers = ["yc"]
 
     cb = progress_callback
     results = []

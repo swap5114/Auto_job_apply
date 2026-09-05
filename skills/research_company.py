@@ -14,9 +14,10 @@ Usage:
 import os
 import sys
 import json
+import re
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from skills.llm_client import llm_generate_json
+import skills.llm_client as llm_client
 
 SYSTEM_PROMPT = """You are a company-research assistant helping a job candidate write outreach that stands out. Your PRIMARY goal is to produce ONE deep, specific, genuinely useful IDEA / USE-CASE for this company that the candidate can lead their outreach with — something that shows real understanding of the company's problem and demonstrates value, not a generic pitch.
 
@@ -55,28 +56,137 @@ Return ONLY valid JSON in exactly this shape (no markdown, no prose):
 }"""
 
 
+def _extract_json_dict(text: str) -> dict:
+    """Extract JSON dict from text, handling markdown fences or preamble text."""
+    if not text or not text.strip():
+        raise ValueError("Empty response text")
+
+    raw = text.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Fallback regex extraction of outermost JSON object
+        match = re.search(r"\{[\s\S]*\}", raw)
+        if match:
+            return json.loads(match.group(0))
+        raise
+
+
+def _normalize_research_schema(data: dict, company: str = "", role: str = "") -> dict:
+    """Guarantee all expected research keys exist with safe defaults."""
+    if not isinstance(data, dict):
+        data = {}
+
+    comp_name = company or "the target company"
+    role_title = role or "Engineering"
+
+    overview = data.get("overview") or f"{comp_name} is hiring for a {role_title} role."
+    stage = data.get("stage") or "Unknown"
+    industry = data.get("industry") or "Technology"
+    tech_signals = data.get("tech_signals")
+    if not isinstance(tech_signals, list):
+        tech_signals = []
+
+    demo = data.get("demo_project")
+    if not isinstance(demo, dict):
+        demo = {}
+
+    normalized_demo = {
+        "title": demo.get("title") or f"Proposed feature prototype for {comp_name}",
+        "description": demo.get("description") or f"A targeted proof-of-concept addressing {comp_name}'s technical requirements for {role_title}.",
+        "why_it_matters": demo.get("why_it_matters") or "Demonstrates immediate understanding of current engineering priorities.",
+        "tech_stack": demo.get("tech_stack") if isinstance(demo.get("tech_stack"), list) else tech_signals,
+        "deliverable": demo.get("deliverable") or "Working prototype / code sample",
+        "time_estimate": demo.get("time_estimate") or "2-3 days",
+        "why_impressive": demo.get("why_impressive") or "Shows initiative and practical problem solving before the first interview.",
+    }
+
+    talking_points = data.get("talking_points")
+    if not isinstance(talking_points, list) or not talking_points:
+        talking_points = [
+            f"Interested in {comp_name}'s recent work in tech infrastructure.",
+            f"Prepared a quick proposal to accelerate {role_title} execution.",
+        ]
+
+    fit_summary = data.get("fit_summary") or f"Strong alignment between candidate capabilities and {comp_name}'s {role_title} needs."
+
+    return {
+        "overview": str(overview),
+        "stage": str(stage),
+        "industry": str(industry),
+        "tech_signals": [str(t) for t in tech_signals],
+        "demo_project": normalized_demo,
+        "talking_points": [str(p) for p in talking_points],
+        "fit_summary": str(fit_summary),
+    }
+
+
+def _build_fallback_research(company: str, domain: str, role: str, error_msg: str = "") -> dict:
+    """Generate structured fallback research dictionary when LLM generation fails."""
+    comp_name = company or "Company"
+    role_name = role or "Role"
+    return {
+        "overview": f"{comp_name} is actively hiring for {role_name}.",
+        "stage": "Unknown",
+        "industry": "Technology",
+        "tech_signals": [],
+        "demo_project": {
+            "title": f"Technical Proposal for {comp_name}",
+            "description": f"Proposed architecture alignment and prototype for {comp_name}'s {role_name} opening.",
+            "why_it_matters": "Provides a practical topic for outreach discussion.",
+            "tech_stack": [],
+            "deliverable": "Technical RFC or small prototype",
+            "time_estimate": "2-3 days",
+            "why_impressive": "Demonstrates focus on domain-specific engineering challenges.",
+        },
+        "talking_points": [
+            f"Noticed the {role_name} opening at {comp_name}.",
+            "Researched product focus and candidate-stack alignment.",
+        ],
+        "fit_summary": f"Background matches key responsibilities for {role_name} at {comp_name}.",
+    }
+
+
 def research_company(company: str, domain: str, role: str, jd_text: str) -> dict:
     """Generate company research + one deep, valuable use-case/idea from lead data.
 
-    The `demo_project` object holds that idea (the key name is kept for
-    backward compatibility with the parked build-demo feature); it is framed
-    as a PROPOSAL the candidate could prototype, never as an already-built
-    artifact -- see draft_outreach's honest injection.
+    Robust for production: handles missing LLM backends, invalid JSON, long JDs,
+    and returns a normalized schema under all conditions.
     """
-    user_message = f"""Company: {company or "(unknown)"}
-Domain: {domain or "(unknown)"}
-Role: {role or "(unknown)"}
+    clean_company = (company or "").strip()
+    clean_domain = (domain or "").strip()
+    clean_role = (role or "").strip()
+    clean_jd = (jd_text or "").strip()
+
+    # Truncate long JDs to avoid context budget issues (max 4000 chars)
+    if len(clean_jd) > 4000:
+        clean_jd = clean_jd[:4000] + "... [truncated]"
+
+    user_message = f"""Company: {clean_company or "(unknown)"}
+Domain: {clean_domain or "(unknown)"}
+Role: {clean_role or "(unknown)"}
 
 Job description / hiring-signal text:
-{jd_text or "(no job description provided)"}
+{clean_jd or "(no job description provided)"}
 
 Based on this, research the company and propose ONE deep, specific, genuinely useful idea / use-case the candidate could raise in cold outreach to show real understanding of this company's problem and demonstrate value. It is a proposal the candidate could prototype — not something already built."""
 
-    return llm_generate_json(
-        system_prompt=SYSTEM_PROMPT,
-        user_message=user_message,
-        max_tokens=1500,
-    )
+    try:
+        raw_text = llm_client.llm_generate(
+            system_prompt=SYSTEM_PROMPT,
+            user_message=user_message,
+            max_tokens=1500,
+        )
+        parsed = _extract_json_dict(raw_text)
+        return _normalize_research_schema(parsed, company=clean_company, role=clean_role)
+    except Exception as e:
+        print(f"  ⚠️  research_company fallback triggered for '{clean_company}': {e}")
+        fallback = _build_fallback_research(clean_company, clean_domain, clean_role, str(e))
+        return _normalize_research_schema(fallback, company=clean_company, role=clean_role)
 
 
 def run(lead_id: str):

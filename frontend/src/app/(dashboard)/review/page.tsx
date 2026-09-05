@@ -9,6 +9,9 @@ import {
   ChevronDown,
   Loader2,
   RefreshCw,
+  Mail,
+  User,
+  Briefcase,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Header } from "@/components/layout/header";
@@ -189,11 +192,19 @@ function OutreachQueue({ leads, onChanged }: { leads: Lead[]; onChanged: () => v
                       {displayName.charAt(lead.company ? 0 : 1).toUpperCase()}
                     </div>
                     <div>
-                      <p className="text-sm font-medium text-foreground">
-                        {displayName}
+                      <p className="text-sm font-medium text-foreground flex items-center gap-2">
+                        <span>{displayName}</span>
                         {lead.role && <span className="text-muted-foreground"> — {lead.role}</span>}
                       </p>
-                      <p className="text-xs text-muted-foreground">from: {lead.source}</p>
+                      <div className="flex items-center gap-3 mt-0.5 text-xs text-muted-foreground">
+                        <span>from: {lead.source}</span>
+                        {lead.contact_email && (
+                          <span className="flex items-center gap-1 font-mono text-emerald-600 font-medium">
+                            <Mail className="h-3 w-3" />
+                            {lead.contact_email}
+                          </span>
+                        )}
+                      </div>
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
@@ -215,6 +226,30 @@ function OutreachQueue({ leads, onChanged }: { leads: Lead[]; onChanged: () => v
                     >
                       <Separator />
                       <CardContent className="space-y-5 p-6">
+                        {/* Lead Contact Info & Designation Header */}
+                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 rounded-xl border bg-muted/30 p-3.5">
+                          <div>
+                            <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Contact Email ID</p>
+                            <p className="mt-0.5 text-xs font-mono font-medium text-emerald-600 flex items-center gap-1 break-all">
+                              <Mail className="h-3 w-3 flex-shrink-0" />
+                              {lead.contact_email || <span className="text-muted-foreground font-sans italic">Not found yet</span>}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Designation / Role</p>
+                            <p className="mt-0.5 text-xs font-medium text-foreground flex items-center gap-1 break-words">
+                              <Briefcase className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+                              {lead.role || "—"}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Contact Person</p>
+                            <p className="mt-0.5 text-xs font-medium text-foreground flex items-center gap-1 break-words">
+                              <User className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+                              {lead.contact_name || "Hiring Manager"}
+                            </p>
+                          </div>
+                        </div>
                         {lead.resume_version && (
                           <div>
                             <p className="mb-2 text-xs font-medium text-muted-foreground">

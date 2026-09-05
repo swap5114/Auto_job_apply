@@ -14,9 +14,12 @@ import {
   Github,
   ExternalLink,
   Rocket,
+  Lock,
+  Sparkles,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { fadeInUp } from "@/lib/motion";
 import { cn, stripAnsi, getActiveBuildId, setActiveBuildId, clearActiveBuildId } from "@/lib/utils";
@@ -507,14 +510,28 @@ export function DemoBuilder({
   return (
     <div className="mt-3 border-t border-accent1/20 pt-3">
       {stage === "idle" && demoProject && (
-        <Button size="sm" className="w-full" onClick={handleStart} disabled={starting}>
-          {starting ? (
-            <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <Hammer className="mr-1.5 h-3.5 w-3.5" />
-          )}
-          Build This Demo
-        </Button>
+        <div className="relative group w-full">
+          <Button
+            size="sm"
+            className="w-full cursor-not-allowed bg-slate-900 text-slate-300 hover:bg-slate-900 border border-slate-700/60 shadow-none font-medium text-xs flex items-center justify-center gap-1.5"
+            disabled
+          >
+            <Lock className="h-3.5 w-3.5 text-amber-400 flex-shrink-0" />
+            <span>Build This Demo</span>
+            <Badge variant="outline" className="ml-1 border-amber-500/40 bg-amber-500/10 text-[10px] text-amber-400 font-semibold px-1.5 py-0">
+              PRO
+            </Badge>
+          </Button>
+
+          {/* Premium Upcoming Feature Hover Tooltip */}
+          <div className="pointer-events-none absolute -top-11 left-1/2 -translate-x-1/2 opacity-0 transition-all duration-200 group-hover:opacity-100 group-hover:-top-12 z-50">
+            <div className="flex items-center gap-1.5 rounded-lg bg-slate-950 px-3 py-1.5 text-xs font-semibold text-amber-300 shadow-2xl border border-amber-500/40 whitespace-nowrap">
+              <Sparkles className="h-3.5 w-3.5 text-amber-400 animate-pulse" />
+              <span>Premium upcoming feature</span>
+            </div>
+            <div className="mx-auto h-2 w-2 -translate-y-1 rotate-45 bg-slate-950 border-r border-b border-amber-500/40" />
+          </div>
+        </div>
       )}
 
       <AnimatePresence mode="wait">

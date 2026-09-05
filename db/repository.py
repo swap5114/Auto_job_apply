@@ -939,3 +939,22 @@ def delete_gmail_account(user_id: str) -> bool:
             return False
         session.delete(acct)
         return True
+
+
+def get_companies() -> list[dict]:
+    """Return all shared companies across all tenants."""
+    with get_session() as session:
+        rows = session.scalars(select(Company)).all()
+        return [_to_dict(r) for r in rows]
+
+
+def get_jobs(open_only: bool = False) -> list[dict]:
+    """Return all shared jobs across all tenants."""
+    with get_session() as session:
+        stmt = select(Job)
+        if open_only:
+            stmt = stmt.where(Job.is_open.is_(True))
+        rows = session.scalars(stmt).all()
+        return [_to_dict(r) for r in rows]
+
+

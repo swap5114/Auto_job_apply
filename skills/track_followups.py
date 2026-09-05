@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "config", ".env"))
 
 FOLLOWUP_DAYS = int(os.getenv("FOLLOWUP_DAYS", "5"))
-MAX_FOLLOWUPS = int(os.getenv("MAX_FOLLOWUPS", "2"))
+MAX_FOLLOWUPS = int(os.getenv("MAX_FOLLOWUPS", "1"))
 
 
 def get_gmail_service(user_id: str | None = None):

@@ -19,6 +19,40 @@ export function stripAnsi(text: string): string {
   return text.replace(ANSI_PATTERN, "");
 }
 
+/**
+ * Strips HTML tags and unescapes common HTML entities to render clean plain text.
+ */
+export function stripHtmlToText(html: string | null | undefined): string {
+  if (!html) return "";
+  let text = html.trim();
+  // Quick return if text has no HTML tags or entities
+  if (!/<[a-z][\s\S]*>/i.test(text) && !/&[a-z0-9#]+;/i.test(text)) {
+    return text;
+  }
+
+  // Handle common block elements and line breaks
+  text = text
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|h[1-6]|div|li|tr|section|article)>/gi, "\n\n")
+    .replace(/<li[^>]*>/gi, "• ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&ndash;/gi, "–")
+    .replace(/&mdash;/gi, "—");
+
+  // Remove remaining HTML tags
+  text = text.replace(/<[^>]+>/g, "");
+
+  // Clean up excess vertical whitespace
+  text = text.replace(/\n{3,}/g, "\n\n").trim();
+
+  return text;
+}
+
 // ---------------------------------------------------------------------------
 // Active demo-build tracking (per lead)
 // ---------------------------------------------------------------------------

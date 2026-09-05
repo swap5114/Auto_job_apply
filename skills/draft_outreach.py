@@ -75,17 +75,34 @@ Job description / hiring-signal text:
 Candidate's tailored resume for this lead (JSON):
 {json.dumps(tailored_resume, indent=2)}"""
 
-    raw_text = llm_generate(
-        system_prompt=SYSTEM_PROMPT,
-        user_message=user_message,
-        max_tokens=1024,
-    )
+    try:
+        raw_text = llm_generate(
+            system_prompt=SYSTEM_PROMPT,
+            user_message=user_message,
+            max_tokens=1024,
+        )
+        if raw_text.startswith("```"):
+            raw_text = re.sub(r"^```\w*\s*", "", raw_text)
+            raw_text = re.sub(r"\s*```$", "", raw_text)
+        return raw_text
+    except Exception as e:
+        print(f"  ⚠️  draft_outreach_message LLM call failed ({e}); using template fallback.")
+        greeting = f"Hi {contact_name}" if contact_name else f"Hi {company} team"
+        candidate_name = tailored_resume.get("name") or "Candidate"
+        if source == "x":
+            return (
+                f"Hi @{x_handle or 'there'}, I saw your post regarding the {role} role at {company}. "
+                f"With my experience in software engineering and modern tech stacks, I'd love to learn more and see if my background is a fit!"
+            )
+        else:
+            return (
+                f"Subject: Interested in {role} role at {company}\n\n"
+                f"{greeting},\n\n"
+                f"I'm writing to express my interest in the {role} position at {company}. "
+                f"My experience aligns well with your team's engineering focus, and I'd welcome the chance to connect.\n\n"
+                f"Best regards,\n{candidate_name}"
+            )
 
-    if raw_text.startswith("```"):
-        raw_text = re.sub(r"^```\w*\s*", "", raw_text)
-        raw_text = re.sub(r"\s*```$", "", raw_text)
-
-    return raw_text
 
 
 def run(user_id: str | None = None):

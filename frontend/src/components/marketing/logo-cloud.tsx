@@ -2,25 +2,25 @@
 // Uses text wordmarks instead of real brand assets to avoid trademark issues.
 
 const companies = [
-  "Arbeitnow",
-  "Jobicy",
-  "Greenhouse",
-  "Lever",
-  "Ashby",
-  "Workable",
+  "Y Combinator",
+  "YC W26",
+  "YC S25",
+  "YC W25",
+  "YC S24",
+  "YC Startups",
 ];
 
 export function LogoCloud() {
   return (
     <div className="mx-auto flex max-w-5xl flex-col items-center gap-6 px-6 md:flex-row md:justify-between">
-      <p className="max-w-[180px] text-sm leading-snug text-muted-foreground">
-        Sourcing leads from the boards you already trust
+      <p className="max-w-[200px] text-sm leading-snug text-muted-foreground">
+        Matching resumes with active hiring YC startups
       </p>
       <div className="flex flex-wrap items-center justify-center gap-x-8 gap-y-4">
         {companies.map((name) => (
           <span
             key={name}
-            className="text-lg font-semibold tracking-tight text-foreground/70 grayscale transition-opacity hover:opacity-100"
+            className="text-lg font-semibold tracking-tight text-foreground/70 transition-opacity hover:opacity-100"
           >
             {name}
           </span>

@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { Save, X, Loader2, RefreshCw, FileText, Star } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Save, X, Loader2, RefreshCw, FileText, Star, Upload, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { Header } from "@/components/layout/header";
 import { PageTransition } from "@/components/layout/page-transition";
@@ -116,6 +116,25 @@ export default function ProfilePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  async function handleUploadResumeFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      await api.profile.uploadResume(file);
+      toast.success("Resume uploaded & search criteria updated!");
+      await load();
+    } catch (err: any) {
+      toast.error(err?.message || "Failed to upload resume");
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
   function updateList(key: keyof ProfileSearchCriteria, updater: (list: string[]) => string[]) {
     setCriteria((c) => (c ? { ...c, [key]: updater((c[key] as string[]) || []) } : c));
   }
@@ -228,7 +247,33 @@ export default function ProfilePage() {
           </Card>
 
           <div>
-            <h2 className="mb-3 text-sm font-semibold text-foreground">Resume Versions</h2>
+            <div className="mb-3 flex items-center justify-between">
+              <div>
+                <h2 className="text-sm font-semibold text-foreground">Resume Versions</h2>
+                <p className="text-xs text-muted-foreground">Upload or update your primary resume PDF/DOCX version</p>
+              </div>
+              <input
+                type="file"
+                ref={fileInputRef}
+                onChange={handleUploadResumeFile}
+                accept=".pdf,.docx,.txt"
+                className="hidden"
+              />
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={uploading}
+                onClick={() => fileInputRef.current?.click()}
+                className="border-accent1/30 text-accent1 hover:bg-accent1/10 font-medium"
+              >
+                {uploading ? (
+                  <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Upload className="mr-1.5 h-3.5 w-3.5" />
+                )}
+                Upload New Resume
+              </Button>
+            </div>
             {resumes.length === 0 ? (
               <p className="text-sm text-muted-foreground">
                 No resumes saved yet. Upload one from the landing page to get started.

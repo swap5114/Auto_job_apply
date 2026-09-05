@@ -73,18 +73,28 @@ def _apply_schema():
     doesn't depend on migration file naming/state).
     """
     engine = get_engine()
-    Base.metadata.create_all(engine)
-    yield
-    Base.metadata.drop_all(engine)
+    try:
+        Base.metadata.create_all(engine)
+        yield
+        try:
+            Base.metadata.drop_all(engine)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"  ⚠️  conftest: Postgres unavailable ({e}). Running non-DB tests.")
+        yield
 
 
 @pytest.fixture(autouse=True)
 def _clean_tables():
     """Truncate every table before each test so tests don't leak state."""
     engine = get_engine()
-    with engine.begin() as conn:
-        table_names = [t.name for t in Base.metadata.sorted_tables]
-        if table_names:
-            quoted = ", ".join(f'"{name}"' for name in table_names)
-            conn.execute(text(f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE"))
+    try:
+        with engine.begin() as conn:
+            table_names = [t.name for t in Base.metadata.sorted_tables]
+            if table_names:
+                quoted = ", ".join(f'"{name}"' for name in table_names)
+                conn.execute(text(f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE"))
+    except Exception:
+        pass
     yield

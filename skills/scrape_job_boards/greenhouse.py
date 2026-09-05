@@ -54,10 +54,14 @@ def _load_seed_tokens() -> list[str]:
     return data.get("greenhouse", [])
 
 
-def _strip_html(html: str) -> str:
-    if not html:
+import html
+
+
+def _strip_html(raw_html: str) -> str:
+    if not raw_html:
         return ""
-    return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
+    unescaped = html.unescape(raw_html)
+    return BeautifulSoup(unescaped, "html.parser").get_text(separator="\n\n", strip=True)
 
 
 def _parse_posted_at(value: str | None) -> datetime | None:

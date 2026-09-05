@@ -10,7 +10,8 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
-import { Mail, CheckCircle2 } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Mail, CheckCircle2, AlertCircle, Clock, Sparkles, FileText, Wand2 } from "lucide-react";
 import { api, type SearchCriteria, type PipelineConfig } from "@/lib/api";
 
 type GmailStatus = { connected: boolean; email: string | null; send_mode: "draft" | "direct" };
@@ -156,6 +157,54 @@ function GmailConnectionCard() {
             </Button>
           </>
         )}
+
+        {/* Google OAuth Testing Guidelines Notice */}
+        <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50/80 p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900/60">
+          <div className="flex items-start gap-3.5">
+            <div className="mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-400">
+              <AlertCircle className="h-4 w-4" />
+            </div>
+            <div className="space-y-3 text-xs">
+              <div className="flex items-center gap-2 flex-wrap">
+                <p className="font-display font-semibold text-slate-900 dark:text-slate-100 text-sm">
+                  Google Cloud Connector — OAuth Testing Guidelines (100 Test Users Cap)
+                </p>
+                <Badge variant="outline" className="border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400 font-mono text-[10px]">
+                  Testing Mode
+                </Badge>
+              </div>
+
+              {/* Prominent Highlight Badge for 24-48 hrs wait time */}
+              <div className="rounded-xl border border-amber-300 bg-amber-100/80 p-3.5 text-amber-950 dark:border-amber-700/60 dark:bg-amber-950/80 dark:text-amber-200 shadow-xs">
+                <div className="flex items-center gap-2 font-bold text-xs text-amber-950 dark:text-amber-100">
+                  <Clock className="h-4 w-4 text-amber-700 dark:text-amber-400 flex-shrink-0 animate-pulse" />
+                  <span>Important Notice: Wait 24–48 Hours for Tester Access Approval</span>
+                </div>
+                <p className="mt-1.5 text-xs font-medium text-amber-900 dark:text-amber-200 leading-relaxed">
+                  After your Google email address is submitted to the workspace administrator for inclusion in Google Cloud Console, <strong>please allow up to 24–48 hours for Google OAuth test user authorization to propagate</strong> before connecting your Gmail inbox.
+                </p>
+              </div>
+
+              <div className="space-y-2 pt-1 text-slate-700 dark:text-slate-300 leading-relaxed">
+                <p className="font-semibold text-slate-900 dark:text-slate-200">Guidelines for Users &amp; Administrators:</p>
+                <ul className="space-y-1.5 list-none pl-0">
+                  <li className="flex items-start gap-2">
+                    <span className="mt-1.5 h-1.5 w-1.5 rounded-full bg-slate-500 dark:bg-slate-400 flex-shrink-0" />
+                    <span><strong>Authorized Accounts Only:</strong> Only Google accounts explicitly added to the Google Cloud Console OAuth Consent Screen test list can connect successfully.</span>
+                  </li>
+                  <li className="flex items-start gap-2">
+                    <span className="mt-1.5 h-1.5 w-1.5 rounded-full bg-slate-500 dark:bg-slate-400 flex-shrink-0" />
+                    <span><strong>Unapproved Accounts Prompt:</strong> Attempting to connect an unapproved Google account will display Google&apos;s <em>&quot;Access blocked: App has not completed verification&quot;</em> error prompt.</span>
+                  </li>
+                  <li className="flex items-start gap-2">
+                    <span className="mt-1.5 h-1.5 w-1.5 rounded-full bg-slate-500 dark:bg-slate-400 flex-shrink-0" />
+                    <span><strong>Adding Test Users:</strong> Workspace admins can add user email addresses in <strong>Google Cloud Console &rarr; APIs &amp; Services &rarr; OAuth consent screen &rarr; Test users</strong>.</span>
+                  </li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
       </CardContent>
     </Card>
   );
@@ -260,6 +309,21 @@ export default function SettingsPage() {
     }
   }
 
+  const [autoFilling, setAutoFilling] = useState(false);
+
+  async function handleAutoFillFromResume() {
+    setAutoFilling(true);
+    try {
+      const updated = await api.settings.autoFillFromResume();
+      setCriteria(updated);
+      toast.success("Search criteria auto-filled from your active resume!");
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to auto-fill search criteria from resume");
+    } finally {
+      setAutoFilling(false);
+    }
+  }
+
   // Helpers to update criteria arrays immutably
   function updateList(key: keyof SearchCriteria, updater: (list: string[]) => string[]) {
     setCriteria((c) => (c ? { ...c, [key]: updater((c[key] as string[]) || []) } : c));
@@ -306,6 +370,40 @@ export default function SettingsPage() {
 
             {/* Search Criteria */}
             <TabsContent value="criteria" className="space-y-6">
+              {/* Resume Auto-Sync Card Header */}
+              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 rounded-2xl border border-accent1/20 bg-accent1/5 p-4 sm:p-5">
+                <div className="flex items-start gap-3">
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl accent-gradient text-white">
+                    <Sparkles className="h-4 w-4" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="text-sm font-semibold text-foreground">Resume Reference Auto-Sync</p>
+                      <Badge variant="outline" className="border-accent1/40 bg-accent1/10 text-accent1 font-mono text-[10px]">
+                        Active Resume Reference
+                      </Badge>
+                    </div>
+                    <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
+                      Role keywords, tech stack, and location filters are referenced directly from your uploaded resume. You can customize criteria below or auto-fill directly from your active resume.
+                    </p>
+                  </div>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleAutoFillFromResume}
+                  disabled={autoFilling || loading}
+                  className="shrink-0 border-accent1/30 text-accent1 hover:bg-accent1/10 font-medium"
+                >
+                  {autoFilling ? (
+                    <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Wand2 className="mr-2 h-3.5 w-3.5 text-accent1" />
+                  )}
+                  Auto-Fill from My Resume
+                </Button>
+              </div>
+
               <Card>
                 <CardContent className="space-y-6 p-6">
                   <TagInput

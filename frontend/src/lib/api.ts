@@ -22,8 +22,9 @@ async function request<T>(
   path: string,
   options?: RequestInit
 ): Promise<T> {
+  const isFormData = options?.body instanceof FormData;
   const headers: Record<string, string> = {
-    "Content-Type": "application/json",
+    ...(isFormData ? {} : { "Content-Type": "application/json" }),
     ...(options?.headers as Record<string, string> | undefined),
   };
 
@@ -328,8 +329,8 @@ export const api = {
       return URL.createObjectURL(blob);
     },
 
-    research: (id: string) =>
-      request<CompanyResearch>(`/leads/${id}/research`, { method: "POST" }),
+    research: (id: string, forceFresh = false) =>
+      request<CompanyResearch>(`/leads/${id}/research${forceFresh ? "?force_fresh=true" : ""}`, { method: "POST" }),
 
     // Retry a stuck/failed lead -- clears its failure and re-runs processing.
     retry: (id: string) =>
@@ -509,6 +510,9 @@ export const api = {
         body: JSON.stringify(data),
       }),
 
+    autoFillFromResume: () =>
+      request<SearchCriteria>("/settings/auto-fill-from-resume", { method: "POST" }),
+
     getPipelineConfig: () => request<PipelineConfig>("/settings/pipeline-config"),
 
     updatePipelineConfig: (data: Partial<PipelineConfig>) =>
@@ -564,5 +568,14 @@ export const api = {
       }),
 
     getResumes: () => request<ProfileResume[]>("/profile/resumes"),
+
+    uploadResume: (file: File) => {
+      const formData = new FormData();
+      formData.append("file", file);
+      return request<ProfileResume>("/profile/upload-resume", {
+        method: "POST",
+        body: formData,
+      });
+    },
   },
 };

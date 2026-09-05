@@ -123,9 +123,9 @@ def verify_state(state: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _client_config() -> dict:
-    client_id = os.getenv("GMAIL_CLIENT_ID")
-    client_secret = os.getenv("GMAIL_CLIENT_SECRET")
-    redirect_uri = os.getenv("GMAIL_OAUTH_REDIRECT_URI")
+    client_id = (os.getenv("GMAIL_CLIENT_ID") or "").strip()
+    client_secret = (os.getenv("GMAIL_CLIENT_SECRET") or "").strip()
+    redirect_uri = (os.getenv("GMAIL_OAUTH_REDIRECT_URI") or "").strip()
     missing = [
         name for name, val in [
             ("GMAIL_CLIENT_ID", client_id),
@@ -133,6 +133,7 @@ def _client_config() -> dict:
             ("GMAIL_OAUTH_REDIRECT_URI", redirect_uri),
         ] if not val
     ]
+
     if missing:
         raise GmailOAuthConfigError(
             f"Missing Gmail OAuth config in config/.env: {', '.join(missing)}. "
@@ -153,11 +154,13 @@ def _client_config() -> dict:
 def _build_flow():
     from google_auth_oauthlib.flow import Flow
 
+    redirect_uri = (os.getenv("GMAIL_OAUTH_REDIRECT_URI") or "").strip()
     return Flow.from_client_config(
         _client_config(),
         scopes=SCOPES,
-        redirect_uri=os.getenv("GMAIL_OAUTH_REDIRECT_URI"),
+        redirect_uri=redirect_uri,
     )
+
 
 
 def build_consent_url(user_id: str, send_mode: str = "draft") -> str:

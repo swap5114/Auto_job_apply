@@ -1,3 +1,4 @@
+import html
 import os
 import sys
 import requests
@@ -26,8 +27,8 @@ def run(user_id: str | None = None):
         jobs = payload.get("jobs", [])
 
         for job in jobs:
-            raw_description = job.get("jobDescription", "")
-            jd_text = BeautifulSoup(raw_description, "html.parser").get_text(separator=" ", strip=True)
+            raw_description = html.unescape(job.get("jobDescription", ""))
+            jd_text = BeautifulSoup(raw_description, "html.parser").get_text(separator="\n\n", strip=True)
 
             lead = {
                 "source": "jobicy",

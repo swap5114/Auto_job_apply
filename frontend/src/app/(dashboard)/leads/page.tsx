@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
-import { FileText, ChevronRight, Sparkles, Loader2, RefreshCw, Search } from "lucide-react";
+import { FileText, ChevronRight, Sparkles, Loader2, RefreshCw, Search, Mail, User, Briefcase } from "lucide-react";
 import { toast } from "sonner";
 import { Header } from "@/components/layout/header";
 import { PageTransition } from "@/components/layout/page-transition";
@@ -23,6 +23,7 @@ import { ResearchPanel } from "@/components/leads/research-panel";
 import { RunPipelineDialog } from "@/components/pipeline/run-pipeline-dialog";
 import { staggerContainer, slideInLeft } from "@/lib/motion";
 import { api, type Lead } from "@/lib/api";
+import { stripHtmlToText } from "@/lib/utils";
 
 const statusVariantMap: Record<string, "new" | "review" | "approved" | "sent" | "replied" | "rejected"> = {
   new: "new", pending_review: "review", in_review: "review", approved: "approved",
@@ -245,7 +246,8 @@ function LeadsPageInner() {
               <tr className="border-b bg-muted/40">
                 <th className="px-5 py-3 text-left text-xs font-medium text-muted-foreground">Source</th>
                 <th className="px-5 py-3 text-left text-xs font-medium text-muted-foreground">Company</th>
-                <th className="px-5 py-3 text-left text-xs font-medium text-muted-foreground">Role</th>
+                <th className="px-5 py-3 text-left text-xs font-medium text-muted-foreground">Designation / Role</th>
+                <th className="px-5 py-3 text-left text-xs font-medium text-muted-foreground">Contact Email</th>
                 <th className="px-5 py-3 text-left text-xs font-medium text-muted-foreground">Status</th>
                 <th className="px-5 py-3 text-left text-xs font-medium text-muted-foreground">Date</th>
                 <th className="w-10 px-5 py-3" />
@@ -271,13 +273,23 @@ function LeadsPageInner() {
                       {lead.company || `@${lead.x_handle || "—"}`}
                     </td>
                     <td className="px-5 py-3.5 text-sm text-muted-foreground">{lead.role || "—"}</td>
+                    <td className="px-5 py-3.5 text-xs font-mono">
+                      {lead.contact_email ? (
+                        <span className="inline-flex items-center gap-1.5 text-emerald-600 font-medium">
+                          <Mail className="h-3 w-3" />
+                          {lead.contact_email}
+                        </span>
+                      ) : (
+                        <span className="text-muted-foreground/60">—</span>
+                      )}
+                    </td>
                     <td className="px-5 py-3.5">
                       <span className="inline-flex items-center gap-1.5">
                         <span className={`h-1.5 w-1.5 rounded-full ${statusDot[lead.status] || "bg-slate-400"}`} />
                         <Badge variant={statusVariantMap[lead.status] || "new"}>
                           {statusLabel(lead.status)}
                         </Badge>
-                        {(lead.channel || []).map((ch) => (
+                        {(lead.channel || []).filter((ch) => ch !== "apply").map((ch) => (
                           <Badge key={ch} variant="outline" className="text-[10px] capitalize">
                             {ch}
                           </Badge>
@@ -319,7 +331,7 @@ function LeadsPageInner() {
                   <Badge variant={statusVariantMap[selectedLead.status] || "new"}>
                     {statusLabel(selectedLead.status)}
                   </Badge>
-                  {(selectedLead.channel || []).map((ch) => (
+                  {(selectedLead.channel || []).filter((ch) => ch !== "apply").map((ch) => (
                     <Badge key={ch} variant="outline" className="text-[10px] capitalize">
                       {ch}
                     </Badge>
@@ -357,12 +369,33 @@ function LeadsPageInner() {
                       </Button>
                     </div>
                   )}
-                  {selectedLead.contact_email && (
-                    <div className="rounded-xl border bg-card p-4">
-                      <p className="text-xs font-medium text-muted-foreground">Contact</p>
-                      <p className="mt-1 text-sm text-foreground">{selectedLead.contact_email}</p>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="rounded-xl border bg-card p-3.5">
+                      <p className="text-xs font-medium text-muted-foreground">Contact Email ID</p>
+                      <p className="mt-1 font-mono text-xs font-medium text-emerald-600 flex items-center gap-1.5 truncate">
+                        <Mail className="h-3.5 w-3.5 flex-shrink-0" />
+                        {selectedLead.contact_email || "Not found yet"}
+                      </p>
+                    </div>
+                    <div className="rounded-xl border bg-card p-3.5">
+                      <p className="text-xs font-medium text-muted-foreground">Designation / Role</p>
+                      <p className="mt-1 text-xs font-medium text-foreground truncate">
+                        {selectedLead.role || "—"}
+                      </p>
+                    </div>
+                  </div>
+
+                  {selectedLead.contact_name && (
+                    <div className="rounded-xl border bg-card p-3.5">
+                      <p className="text-xs font-medium text-muted-foreground">Contact Person</p>
+                      <p className="mt-1 text-xs font-medium text-foreground flex items-center gap-1.5">
+                        <User className="h-3.5 w-3.5 text-muted-foreground" />
+                        {selectedLead.contact_name}
+                      </p>
                     </div>
                   )}
+
                   {selectedLead.resume_version && (
                     <div className="rounded-xl border bg-card p-4">
                       <p className="text-xs font-medium text-muted-foreground">Tailored Resume</p>
@@ -400,14 +433,46 @@ function LeadsPageInner() {
                 {/* Job Description */}
                 <TabsContent value="jd" className="mt-4">
                   <div className="rounded-xl border bg-muted/20 p-4">
-                    <p className="whitespace-pre-wrap text-sm leading-relaxed text-muted-foreground">
-                      {selectedLead.jd_text || "No job description available."}
+                    <p className="whitespace-pre-wrap font-sans text-sm leading-relaxed text-muted-foreground">
+                      {stripHtmlToText(selectedLead.jd_text) || "No job description available."}
                     </p>
                   </div>
                 </TabsContent>
 
                 {/* Outreach */}
                 <TabsContent value="outreach" className="mt-4">
+                  <div className="mb-4 space-y-2 rounded-xl border bg-card p-3.5 text-xs shadow-sm">
+                    <div className="flex items-start gap-2.5 min-w-0">
+                      <div className="mt-0.5 flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40">
+                        <Mail className="h-3.5 w-3.5" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Recipient Email</p>
+                        <p className="mt-0.5 font-mono text-xs font-medium text-emerald-600 dark:text-emerald-400 break-all">
+                          {selectedLead.contact_email ? (
+                            selectedLead.contact_name ? `${selectedLead.contact_name} <${selectedLead.contact_email}>` : selectedLead.contact_email
+                          ) : (
+                            <span className="font-sans italic text-muted-foreground">No email address found</span>
+                          )}
+                        </p>
+                      </div>
+                    </div>
+
+                    <Separator className="bg-border/60" />
+
+                    <div className="flex items-start gap-2.5 min-w-0">
+                      <div className="mt-0.5 flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                        <Briefcase className="h-3.5 w-3.5" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Target Designation</p>
+                        <p className="mt-0.5 text-xs font-medium text-foreground leading-snug break-words">
+                          {selectedLead.role || "—"}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+
                   {editing ? (
                     <div className="space-y-3">
                       <Textarea

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Sparkles,
@@ -123,20 +123,47 @@ export function ResearchPanel({
   const [state, setState] = useState<"idle" | "loading" | "done">("idle");
   const [research, setResearch] = useState<CompanyResearch | null>(null);
 
-  async function runResearch() {
+  async function runResearch(forceFresh = false) {
     setState("loading");
     try {
-      // Real LLM-backed research from the API
-      const data = await api.leads.research(lead.id);
+      // Real LLM-backed research from the API (uses DB cache unless forceFresh is true)
+      const data = await api.leads.research(lead.id, forceFresh);
       setResearch(data);
+      if (typeof window !== "undefined") {
+        localStorage.setItem(`company_research_${lead.id}`, JSON.stringify(data));
+      }
     } catch (e: any) {
       // Graceful fallback so the panel still shows something useful
-      toast.error(e?.message || "Live research failed — showing a generated draft");
-      setResearch(generateResearch(lead));
+      const fallback = generateResearch(lead);
+      setResearch(fallback);
+      if (typeof window !== "undefined") {
+        localStorage.setItem(`company_research_${lead.id}`, JSON.stringify(fallback));
+      }
     } finally {
       setState("done");
     }
   }
+
+  // Load cached research on mount or lead.id change
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const key = `company_research_${lead.id}`;
+    const cachedStr = localStorage.getItem(key);
+    if (cachedStr) {
+      try {
+        const cachedData = JSON.parse(cachedStr);
+        if (cachedData && cachedData.overview) {
+          setResearch(cachedData);
+          setState("done");
+          return;
+        }
+      } catch (e) {
+        // ignore parse error
+      }
+    }
+    // Automatically load research from API (backend DB cache) on first view
+    runResearch(false);
+  }, [lead.id]);
 
   // Rendered unconditionally, ABOVE the idle/loading early returns below.
   // Why: DemoBuilder checks localStorage on mount to recover a build that
@@ -162,7 +189,7 @@ export function ResearchPanel({
             Generate AI-powered insights, tech-stack signals, and tailored
             talking points for your outreach.
           </p>
-          <Button size="sm" className="mt-4" onClick={runResearch}>
+          <Button size="sm" className="mt-4" onClick={() => runResearch(true)}>
             <Sparkles className="mr-1.5 h-3.5 w-3.5" />
             Run Research
           </Button>
@@ -366,9 +393,9 @@ export function ResearchPanel({
         <p className="text-sm leading-relaxed text-foreground">{research.fit_summary}</p>
       </motion.div>
 
-      <Button variant="outline" size="sm" className="w-full" onClick={runResearch}>
-        <Sparkles className="mr-1.5 h-3.5 w-3.5" />
-        Regenerate
+      <Button variant="outline" size="sm" className="w-full" onClick={() => runResearch(true)}>
+        <Sparkles className="mr-1.5 h-3.5 w-3.5 text-accent1" />
+        Regenerate New Idea &amp; Research
       </Button>
     </motion.div>
   );

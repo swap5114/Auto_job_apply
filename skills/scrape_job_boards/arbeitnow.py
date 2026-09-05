@@ -1,3 +1,4 @@
+import html
 import os
 import sys
 import requests
@@ -27,8 +28,8 @@ def run(user_id: str | None = None):
         jobs = payload.get("data", [])
 
         for job in jobs:
-            raw_description = job.get("description", "")
-            jd_text = BeautifulSoup(raw_description, "html.parser").get_text(separator=" ", strip=True)
+            raw_description = html.unescape(job.get("description", ""))
+            jd_text = BeautifulSoup(raw_description, "html.parser").get_text(separator="\n\n", strip=True)
 
             created_at = job.get("created_at")
             if created_at:

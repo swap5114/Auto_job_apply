@@ -283,13 +283,18 @@ def run(max_leads: int = 20, user_id: str | None = None):
 
 def _gather_candidates(max_count: int) -> list[dict]:
     """Shared candidate-gathering: hiring + recent-batch, tech-first, deduped,
-    topped up from recent batches until we have up to max_count companies.
+    topped up from all hiring companies / recent batches until we have up to max_count companies.
     Used by both run() (per-user leads) and run_catalog() (shared catalog)."""
     hiring = fetch_hiring_companies()
     recent = [c for c in hiring if is_recent_batch(c.get("batch", ""))]
-    tech = [c for c in recent if is_tech_company(c)]
-    non_tech = [c for c in recent if not is_tech_company(c)]
-    candidates = tech + non_tech
+    other_hiring = [c for c in hiring if not is_recent_batch(c.get("batch", ""))]
+
+    tech_recent = [c for c in recent if is_tech_company(c)]
+    non_tech_recent = [c for c in recent if not is_tech_company(c)]
+    tech_other = [c for c in other_hiring if is_tech_company(c)]
+    non_tech_other = [c for c in other_hiring if not is_tech_company(c)]
+
+    candidates = tech_recent + non_tech_recent + tech_other + non_tech_other
 
     if len(candidates) < max_count:
         seen_ids = {c.get("id") for c in candidates}
@@ -301,7 +306,7 @@ def _gather_candidates(max_count: int) -> list[dict]:
     return candidates
 
 
-def run_catalog(max_companies: int = 50) -> dict:
+def run_catalog(max_companies: int = 500) -> dict:
     """Sync YC startups into the SHARED catalog (companies/jobs), NOT per-user
     leads -- this is what makes YC startups matchable by skills/match_jobs.py
     for the hero-chat onboarding (v1 Task 8).

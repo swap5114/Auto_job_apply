@@ -91,7 +91,10 @@ _allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "").strip()
 if _allowed_origins_env:
     ALLOWED_ORIGINS = [o.strip() for o in _allowed_origins_env.split(",") if o.strip()]
 else:
-    ALLOWED_ORIGINS = ["http://localhost:3000"]
+    ALLOWED_ORIGINS = [
+        "http://localhost:3000",
+        "https://auto-job-apply-frontend-831721132982.us-central1.run.app",
+    ]
 
 app.add_middleware(
     CORSMiddleware,
@@ -611,7 +614,11 @@ def edit_lead(lead_id: str, body: EditRequest, user_id: str = Depends(get_authen
 
 
 @app.post("/api/leads/{lead_id}/research", response_model=ResearchResponse)
-def research_lead(lead_id: str, user_id: str = Depends(get_authenticated_user_id)):
+def research_lead(
+    lead_id: str,
+    force_fresh: bool = Query(False),
+    user_id: str = Depends(get_authenticated_user_id),
+):
     """Generate structured company research with demo project idea for a lead."""
     leads = _get_all_leads_cached(user_id)
     lead = next((l for l in leads if str(l.get("id", "")) == lead_id), None)
@@ -627,7 +634,7 @@ def research_lead(lead_id: str, user_id: str = Depends(get_authenticated_user_id
         # other user reuses it instead of spending another LLM call.
         job_id = (lead.get("job_id") or "").strip() or None
         result = None
-        if job_id:
+        if job_id and not force_fresh:
             cached = repo.get_cached_research(job_id)
             if cached and cached.get("result_json"):
                 result = cached["result_json"]
@@ -1068,7 +1075,7 @@ def _now_iso() -> str:
 
 class RunPipelineRequest(BaseModel):
     sources: Optional[list[str]] = None
-    yc_max_leads: int = 15
+    yc_max_leads: int = 5
     x_max_leads: int = 5
     csv_path: Optional[str] = None
 
@@ -1145,9 +1152,10 @@ def run_pipeline(body: RunPipelineRequest, user_id: str = Depends(get_authentica
     run = repo.create_pipeline_run(user_id)
     # v1: YC is the only automated source (all other boards parked).
     sources = body.sources or ["yc"]
+    yc_max = min(max(1, body.yc_max_leads or 5), 15)
     threading.Thread(
         target=_run_pipeline_bg,
-        args=(user_id, run["id"], sources, body.yc_max_leads, body.x_max_leads, body.csv_path),
+        args=(user_id, run["id"], sources, yc_max, body.x_max_leads, body.csv_path),
         daemon=True,
     ).start()
 
@@ -1424,7 +1432,8 @@ def gmail_callback(code: str = Query(None), state: str = Query(None), error: str
     """
     from api import gmail_oauth
 
-    frontend = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+    frontend = (os.getenv("FRONTEND_URL") or os.getenv("NEXT_PUBLIC_FRONTEND_URL") or "https://auto-job-apply-frontend-831721132982.us-central1.run.app").rstrip("/")
+
 
     if error:
         return RedirectResponse(f"{frontend}/settings?gmail=error")
@@ -1541,13 +1550,68 @@ def update_search_criteria(body: SettingsUpdateRequest, user_id: str = Depends(g
     return {"status": "updated", "data": data}
 
 
+@app.post("/api/settings/auto-fill-from-resume")
+def auto_fill_search_criteria_from_resume(user_id: str = Depends(get_authenticated_user_id)):
+    """Auto-fill search criteria from calling user's active parsed resume."""
+    active_resume = repo.get_active_resume(user_id)
+    parsed = None
+    if active_resume:
+        parsed = active_resume.get("parsed") or active_resume
+    else:
+        user = repo.get_user(user_id)
+        if user and user.get("parsed_resume"):
+            parsed = user["parsed_resume"]
+
+    if not parsed:
+        # Fallback to reading default resume.json if local single user mode
+        resume_json_path = os.path.join(PROJECT_ROOT, "config", "resume.json")
+        if os.path.exists(resume_json_path):
+            try:
+                with open(resume_json_path, encoding="utf-8") as f:
+                    parsed = json.load(f)
+            except Exception:
+                pass
+
+    if not parsed:
+        raise HTTPException(status_code=404, detail="No active resume found for this user. Please upload a resume first.")
+
+    from skills.infer_criteria import infer_criteria
+    inferred = infer_criteria(parsed)
+
+    path = _get_search_criteria_path()
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = {}
+
+    if inferred.get("roles"):
+        data["role_keywords"] = inferred["roles"]
+    if inferred.get("tech_stack"):
+        data["tech_stack_keywords"] = inferred["tech_stack"]
+    if inferred.get("locations"):
+        data["location_keywords"] = inferred["locations"]
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    return {
+        "role_keywords": data.get("role_keywords", []),
+        "tech_stack_keywords": data.get("tech_stack_keywords", []),
+        "seniority_exclude_keywords": data.get("seniority_exclude_keywords", []),
+        "non_tech_exclude_keywords": data.get("non_tech_exclude_keywords", []),
+        "years_experience_threshold": data.get("years_experience_threshold", 1),
+        "location_keywords": data.get("location_keywords", []),
+    }
+
+
 @app.get("/api/settings/pipeline-config", response_model=PipelineConfigResponse)
 def get_pipeline_config(user_id: str = Depends(get_authenticated_user_id)):
     """Get pipeline configuration from .env."""
     return PipelineConfigResponse(
         model_backend=_read_env_value("MODEL_BACKEND", "claude"),
         followup_days=int(_read_env_value("FOLLOWUP_DAYS", "5")),
-        max_followups=int(_read_env_value("MAX_FOLLOWUPS", "2")),
+        max_followups=int(_read_env_value("MAX_FOLLOWUPS", "1")),
         gmail_direct_send=_read_env_value("GMAIL_DIRECT_SEND", "false").lower() == "true",
     )
 
@@ -2210,6 +2274,64 @@ def list_profile_resumes(user_id: str = Depends(get_authenticated_user_id)):
         )
         for r in resumes
     ]
+
+
+@app.post("/api/profile/upload-resume", response_model=ProfileResumeResponse)
+async def profile_upload_resume(
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Upload a new resume version for the authenticated user, parse it, set it
+    as primary resume, and infer updated search criteria.
+    """
+    filename = file.filename or ""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext and ext not in ALLOWED_RESUME_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Allowed: .pdf, .docx, .txt",
+        )
+
+    content = await file.read()
+    if len(content) > MAX_RESUME_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large (max {MAX_RESUME_UPLOAD_BYTES // (1024 * 1024)}MB)",
+        )
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    from skills.parse_resume import (
+        ResumeParseError,
+        UnsupportedFileTypeError,
+        parse_resume_cached,
+    )
+
+    try:
+        parsed_resume, _raw_text = parse_resume_cached(
+            content, filename, file.content_type or ""
+        )
+    except UnsupportedFileTypeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ResumeParseError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    from skills.infer_criteria import infer_criteria
+    inferred = infer_criteria(parsed_resume)
+    inferred["inferred_from_resume"] = True
+
+    new_resume = repo.add_resume(user_id, file_ref=filename, parsed_json=parsed_resume, is_primary=True)
+    repo.upsert_search_criteria(user_id, inferred)
+
+    created_iso = new_resume["created_at"].isoformat() if hasattr(new_resume.get("created_at"), "isoformat") else str(new_resume.get("created_at") or "")
+
+    return ProfileResumeResponse(
+        id=str(new_resume["id"]),
+        file_ref=filename,
+        parsed_json=parsed_resume,
+        is_primary=True,
+        created_at=created_iso,
+    )
 
 
 # ---------------------------------------------------------------------------

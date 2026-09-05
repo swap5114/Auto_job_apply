@@ -438,7 +438,7 @@ export default function DashboardPage() {
                           <p className="text-sm text-foreground">{a.text}</p>
                           <div className="flex items-center gap-1.5">
                             <p className="text-xs text-muted-foreground">{a.meta}</p>
-                            {a.channel.map((ch) => (
+                            {a.channel.filter((ch) => ch !== "apply").map((ch) => (
                               <span
                                 key={ch}
                                 className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium capitalize text-muted-foreground"

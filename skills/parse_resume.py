@@ -173,6 +173,58 @@ def text_hash(text: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _heuristic_resume_fallback(raw_text: str) -> dict:
+    """Fallback parser when LLM provider is unavailable or returns an error."""
+    lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+    name = lines[0] if lines else "Candidate"
+    
+    emails = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', raw_text)
+    email = emails[0] if emails else ""
+    
+    phones = re.findall(r'\+?\d[\d\s\-\(\)]{8,}\d', raw_text)
+    phone = phones[0] if phones else ""
+    
+    linkedin = ""
+    github = ""
+    urls = re.findall(r'https?://[^\s]+', raw_text)
+    for url in urls:
+        if "linkedin" in url.lower():
+            linkedin = url
+        elif "github" in url.lower():
+            github = url
+
+    known_tech = [
+        "python", "react", "javascript", "typescript", "node", "nodejs", "node.js",
+        "fastapi", "django", "flask", "java", "c++", "c#", "go", "golang", "rust",
+        "aws", "gcp", "azure", "docker", "kubernetes", "sql", "postgresql", "mongodb",
+        "redis", "graphql", "rest", "api", "html", "css", "tailwind", "next.js", "nextjs",
+        "express", "vue", "angular", "svelte", "ruby", "rails"
+    ]
+    found_skills = []
+    text_lower = raw_text.lower()
+    for tech in known_tech:
+        if re.search(r'\b' + re.escape(tech) + r'\b', text_lower):
+            found_skills.append(tech)
+
+    return {
+        "name": name,
+        "contact": {
+            "location": "",
+            "phone": phone,
+            "email": email,
+            "linkedin": linkedin,
+            "github": github,
+            "portfolio": ""
+        },
+        "summary": lines[1] if len(lines) > 1 else "",
+        "education": [],
+        "experience": [],
+        "projects": [],
+        "skills": {"Skills": found_skills},
+        "certifications": []
+    }
+
+
 def structure_resume_text(raw_text: str) -> dict:
     """The one LLM call in this module: raw extracted text -> structured
     resume JSON. Callers should go through parse_resume_cached() instead
@@ -182,22 +234,22 @@ def structure_resume_text(raw_text: str) -> dict:
     if not raw_text or not raw_text.strip():
         raise ResumeParseError("No text to parse (empty input).")
 
-    # A resume that's absurdly short (e.g. a one-line paste, or a PDF that
-    # extracted almost nothing) is not worth an LLM call -- it can't
-    # produce a meaningful structured resume, and per SYSTEM_PROMPT rule 4
-    # the model would just return a near-empty shape anyway. Fail fast and
-    # cheaply instead.
     if len(raw_text.strip()) < 50:
         raise ResumeParseError(
             "Extracted text is too short to be a resume (fewer than 50 characters)."
         )
 
-    result = llm_generate_json(
-        system_prompt=SYSTEM_PROMPT,
-        user_message=f"Resume text:\n\n{raw_text}",
-        max_tokens=4096,
-    )
-    return result
+    try:
+        result = llm_generate_json(
+            system_prompt=SYSTEM_PROMPT,
+            user_message=f"Resume text:\n\n{raw_text}",
+            max_tokens=4096,
+        )
+        return result
+    except Exception as e:
+        print(f"  ⚠️  structure_resume_text LLM call failed ({e}); falling back to heuristic parser.")
+        return _heuristic_resume_fallback(raw_text)
+
 
 
 # In-memory cache: text_hash -> parsed resume dict. Shared across all

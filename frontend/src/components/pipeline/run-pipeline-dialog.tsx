@@ -27,14 +27,10 @@ import { Input } from "@/components/ui/input";
 import { api } from "@/lib/api";
 import { usePipelineStatus } from "@/lib/use-pipeline-status";
 
-type SourceKey = "arbeitnow" | "jobicy" | "yc" | "x" | "careers_page";
+type SourceKey = "yc";
 
-const SOURCES: { key: SourceKey; label: string; desc: string; icon: typeof Briefcase }[] = [
-  { key: "arbeitnow", label: "Arbeitnow", desc: "Public job board API (free)", icon: Briefcase },
-  { key: "jobicy", label: "Jobicy", desc: "Remote-job API (free)", icon: Globe },
-  { key: "yc", label: "Y Combinator", desc: "Startups hiring + recently funded", icon: Rocket },
-  { key: "x", label: "X / Twitter", desc: "Hiring-signal leads", icon: Twitter },
-  { key: "careers_page", label: "Careers Pages", desc: "Firecrawl of configured companies", icon: Building2 },
+const SOURCES: { key: SourceKey; label: string; desc: string; icon: typeof Rocket }[] = [
+  { key: "yc", label: "Y Combinator Startups", desc: "Active hiring YC startups catalog (v1 focus)", icon: Rocket },
 ];
 
 export function RunPipelineDialog({
@@ -45,14 +41,9 @@ export function RunPipelineDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const [selected, setSelected] = useState<Record<SourceKey, boolean>>({
-    arbeitnow: true,
-    jobicy: true,
     yc: true,
-    x: false,
-    careers_page: false,
   });
-  const [ycMax, setYcMax] = useState(15);
-  const [xMax, setXMax] = useState(5);
+  const [ycMax, setYcMax] = useState(5);
   const [starting, setStarting] = useState(false);
   const [uploading, setUploading] = useState(false);
   const fileInput = useRef<HTMLInputElement | null>(null);
@@ -72,7 +63,7 @@ export function RunPipelineDialog({
     }
     setStarting(true);
     try {
-      await api.pipeline.run({ sources, yc_max_leads: ycMax, x_max_leads: xMax });
+      await api.pipeline.run({ sources, yc_max_leads: ycMax });
       toast.success("Pipeline started");
       await refresh();
     } catch (e: any) {
@@ -145,37 +136,19 @@ export function RunPipelineDialog({
           })}
         </div>
 
-        {/* Caps for yc / x */}
-        {(selected.yc || selected.x) && (
-          <div className="flex gap-4">
-            {selected.yc && (
-              <div className="flex items-center gap-2">
-                <label className="text-xs text-muted-foreground">YC max leads</label>
-                <Input
-                  type="number"
-                  value={ycMax}
-                  onChange={(e) => setYcMax(Number(e.target.value))}
-                  min={1}
-                  max={50}
-                  className="h-8 w-20"
-                  disabled={running}
-                />
-              </div>
-            )}
-            {selected.x && (
-              <div className="flex items-center gap-2">
-                <label className="text-xs text-muted-foreground">X max leads</label>
-                <Input
-                  type="number"
-                  value={xMax}
-                  onChange={(e) => setXMax(Number(e.target.value))}
-                  min={1}
-                  max={50}
-                  className="h-8 w-20"
-                  disabled={running}
-                />
-              </div>
-            )}
+        {/* Caps for YC */}
+        {selected.yc && (
+          <div className="flex items-center gap-2">
+            <label className="text-xs font-medium text-muted-foreground">YC max leads per run</label>
+            <Input
+              type="number"
+              value={ycMax}
+              onChange={(e) => setYcMax(Number(e.target.value))}
+              min={1}
+              max={15}
+              className="h-8 w-20"
+              disabled={running}
+            />
           </div>
         )}
 

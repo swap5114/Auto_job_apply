@@ -55,6 +55,7 @@ def _ensure_firebase_app() -> None:
             return
 
         cred_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
+        project_id = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("FIREBASE_PROJECT_ID") or "auto-job-apply-1859b"
         if cred_path:
             if not os.path.exists(cred_path):
                 raise RuntimeError(
@@ -62,11 +63,12 @@ def _ensure_firebase_app() -> None:
                     "file doesn't exist. Fix the path in config/.env, or unset it to "
                     "fall back to Application Default Credentials."
                 )
-            firebase_admin.initialize_app(credentials.Certificate(cred_path))
+            firebase_admin.initialize_app(credentials.Certificate(cred_path), options={"projectId": project_id})
         else:
-            firebase_admin.initialize_app()
+            firebase_admin.initialize_app(options={"projectId": project_id})
 
         _initialized = True
+
 
 
 def get_current_firebase_user(request: Request) -> dict:

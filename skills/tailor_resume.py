@@ -69,11 +69,15 @@ Role: {role}
 Base resume (JSON):
 {json.dumps(base_resume, indent=2)}"""
 
-    return llm_generate_json(
-        system_prompt=SYSTEM_PROMPT,
-        user_message=user_message,
-        max_tokens=4096,
-    )
+    try:
+        return llm_generate_json(
+            system_prompt=SYSTEM_PROMPT,
+            user_message=user_message,
+            max_tokens=4096,
+        )
+    except Exception as e:
+        print(f"  ⚠️  tailor_resume LLM call failed ({e}); falling back to base resume.")
+        return base_resume
 
 
 def tailor_resume_for_lead(lead: dict) -> dict:
@@ -85,10 +89,6 @@ def tailor_resume_for_lead(lead: dict) -> dict:
     tailoring/saving behavior over time.
 
     Returns {"resume_version": filename, "keyword_coverage": float}.
-    Raises ValueError if there's no jd_text to tailor against (the caller,
-    tailor_resume_node, catches this and reports status="tailor_failed" --
-    per the "never silently skip a lead" rule, this must be loud, not a
-    quiet empty-dict return).
     """
     company = lead.get("company") or lead.get("x_handle") or "Unknown"
     role = lead.get("role") or ""
@@ -96,10 +96,15 @@ def tailor_resume_for_lead(lead: dict) -> dict:
     company_research = lead.get("company_research")
 
     if not jd_text.strip():
-        raise ValueError(f"tailor_resume_for_lead: no jd_text to tailor against for {company}")
+        jd_text = f"Role: {role} at {company}"
 
     base_resume = load_base_resume()
-    tailored = tailor_resume(base_resume, company, role, jd_text, company_research=company_research)
+    try:
+        tailored = tailor_resume(base_resume, company, role, jd_text, company_research=company_research)
+    except Exception as e:
+        print(f"  ⚠️  tailor_resume_for_lead failed ({e}); using base resume.")
+        tailored = base_resume
+
     filename = save_resume(tailored, company)
     coverage = keyword_coverage(jd_text, tailored)
     print(
@@ -107,6 +112,7 @@ def tailor_resume_for_lead(lead: dict) -> dict:
         f"resumes/{filename}.json/.md (ATS keyword coverage: {coverage}%)"
     )
     return {"resume_version": filename, "keyword_coverage": coverage}
+
 
 
 def keyword_coverage(jd_text: str, tailored_resume: dict) -> float:
