@@ -7,6 +7,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   LayoutDashboard,
   FileText,
+  Hammer,
   CheckCircle2,
   Settings,
   Zap,
@@ -61,11 +62,11 @@ export function TopBar() {
   const leadsBadge = stats?.total ?? null;
   const reviewBadge = stats ? (stats.pending_review ?? 0) + (stats.in_review ?? 0) : null;
 
-  // v1 nav: Matches + Builds are parked (the hero chat is the entry point,
-  // and the demo builder is an upcoming feature), so they're not linked here.
+  // v1 nav: Matches is parked, Builds is active!
   const navigation = [
     { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard, badge: null as number | null },
     { name: "Leads", href: "/leads", icon: FileText, badge: leadsBadge },
+    { name: "Builds", href: "/builds", icon: Hammer, badge: null as number | null },
     { name: "Review", href: "/review", icon: CheckCircle2, badge: reviewBadge },
     { name: "Profile", href: "/profile", icon: UserRound, badge: null as number | null },
     { name: "Settings", href: "/settings", icon: Settings, badge: null as number | null },

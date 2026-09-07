@@ -11,7 +11,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
 import { Badge } from "@/components/ui/badge";
-import { Mail, CheckCircle2, AlertCircle, Clock, Sparkles, FileText, Wand2 } from "lucide-react";
+import { Mail, CheckCircle2, AlertCircle, Clock, Sparkles, FileText, Wand2, Github, Zap, ExternalLink } from "lucide-react";
 import { api, type SearchCriteria, type PipelineConfig } from "@/lib/api";
 
 type GmailStatus = { connected: boolean; email: string | null; send_mode: "draft" | "direct" };
@@ -265,6 +265,223 @@ function TagInput({
   );
 }
 
+function ProviderKeysCard() {
+  const [keys, setKeys] = useState<{ has_github_token: boolean; has_vercel_token: boolean; has_render_api_key: boolean } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [githubBusy, setGithubBusy] = useState(false);
+  const [vercelBusy, setVercelBusy] = useState(false);
+  const [githubToken, setGithubToken] = useState("");
+  const [vercelToken, setVercelToken] = useState("");
+  const [renderKey, setRenderKey] = useState("");
+
+  async function load() {
+    setLoading(true);
+    try {
+      setKeys(await api.user.getProviderKeys());
+    } catch {
+      setKeys({ has_github_token: false, has_vercel_token: false, has_render_api_key: false });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+    const params = new URLSearchParams(window.location.search);
+    const gh = params.get("github");
+    const vc = params.get("vercel");
+    if (gh === "connected") toast.success("GitHub connected via 1-Click OAuth!");
+    else if (gh === "error") toast.error("Failed to connect GitHub via OAuth — set GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET or paste token manually");
+    if (vc === "connected") toast.success("Vercel connected via 1-Click OAuth!");
+    else if (vc === "error") toast.error("Failed to connect Vercel via OAuth — set VERCEL_CLIENT_ID / VERCEL_CLIENT_SECRET or paste token manually");
+    if (gh || vc) window.history.replaceState({}, "", window.location.pathname);
+  }, []);
+
+  async function connectGithubOAuth() {
+    setGithubBusy(true);
+    try {
+      const { auth_url } = await api.user.getGithubOAuthUrl();
+      window.location.href = auth_url;
+    } catch (e: any) {
+      toast.error(e?.message || "GitHub OAuth not configured on server");
+      setGithubBusy(false);
+    }
+  }
+
+  async function connectVercelOAuth() {
+    setVercelBusy(true);
+    try {
+      const { auth_url } = await api.user.getVercelOAuthUrl();
+      window.location.href = auth_url;
+    } catch (e: any) {
+      toast.error(e?.message || "Vercel OAuth not configured on server");
+      setVercelBusy(false);
+    }
+  }
+
+  async function save() {
+    setSaving(true);
+    try {
+      const res = await api.user.updateProviderKeys({
+        github_token: githubToken || undefined,
+        vercel_token: vercelToken || undefined,
+        render_api_key: renderKey || undefined,
+      });
+      setKeys({
+        has_github_token: res.has_github_token,
+        has_vercel_token: res.has_vercel_token,
+        has_render_api_key: res.has_render_api_key,
+      });
+      setGithubToken("");
+      setVercelToken("");
+      setRenderKey("");
+      toast.success("Provider keys updated!");
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to update provider keys");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (loading) {
+    return (
+      <Card>
+        <CardContent className="flex items-center gap-2 p-6 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" /> Loading integration settings…
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card>
+      <CardContent className="space-y-6 p-6">
+        <div>
+          <h3 className="font-display text-base text-foreground">Cloud Deployment Accounts</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Connect your GitHub, Vercel, and Render accounts via 1-click OAuth or personal access tokens to deploy interactive lead demos directly under your own cloud accounts.
+          </p>
+        </div>
+
+        <div className="space-y-5">
+          {/* GitHub Card */}
+          <div className="rounded-xl border p-4 space-y-3 bg-card/60">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-foreground/10 text-foreground">
+                  <Github className="h-4 w-4" />
+                </div>
+                <div>
+                  <p className="font-semibold text-sm text-foreground">GitHub Integration</p>
+                  <p className="text-xs text-muted-foreground">Used for code repository exports and commit history.</p>
+                </div>
+              </div>
+              {keys?.has_github_token ? (
+                <Badge variant="sent">Connected</Badge>
+              ) : (
+                <Badge variant="outline" className="text-muted-foreground">Not Connected</Badge>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3 pt-1">
+              <Button size="sm" onClick={connectGithubOAuth} disabled={githubBusy}>
+                {githubBusy ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <Github className="mr-2 h-3.5 w-3.5" />}
+                1-Click Connect GitHub
+              </Button>
+            </div>
+
+            <div className="pt-2 border-t border-border/40">
+              <label className="text-xs font-medium text-muted-foreground">Or paste Personal Access Token manually:</label>
+              <Input
+                type="password"
+                placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+                value={githubToken}
+                onChange={(e) => setGithubToken(e.target.value)}
+                className="mt-1 h-9"
+              />
+            </div>
+          </div>
+
+          {/* Vercel Card */}
+          <div className="rounded-xl border p-4 space-y-3 bg-card/60">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-foreground/10 text-foreground">
+                  <Zap className="h-4 w-4" />
+                </div>
+                <div>
+                  <p className="font-semibold text-sm text-foreground">Vercel Integration</p>
+                  <p className="text-xs text-muted-foreground">Used for 1-click frontend deployments and live previews.</p>
+                </div>
+              </div>
+              {keys?.has_vercel_token ? (
+                <Badge variant="sent">Connected</Badge>
+              ) : (
+                <Badge variant="outline" className="text-muted-foreground">Not Connected</Badge>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3 pt-1">
+              <Button size="sm" onClick={connectVercelOAuth} disabled={vercelBusy}>
+                {vercelBusy ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <Zap className="mr-2 h-3.5 w-3.5" />}
+                1-Click Connect Vercel
+              </Button>
+            </div>
+
+            <div className="pt-2 border-t border-border/40">
+              <label className="text-xs font-medium text-muted-foreground">Or paste Vercel API Token manually:</label>
+              <Input
+                type="password"
+                placeholder="vercel_tok_xxxxxxxx"
+                value={vercelToken}
+                onChange={(e) => setVercelToken(e.target.value)}
+                className="mt-1 h-9"
+              />
+            </div>
+          </div>
+
+          {/* Render Card */}
+          <div className="rounded-xl border p-4 space-y-3 bg-card/60">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-foreground/10 text-foreground">
+                  <ExternalLink className="h-4 w-4" />
+                </div>
+                <div>
+                  <p className="font-semibold text-sm text-foreground">Render Integration</p>
+                  <p className="text-xs text-muted-foreground">Used for automated backend microservice deployments.</p>
+                </div>
+              </div>
+              {keys?.has_render_api_key ? (
+                <Badge variant="sent">Connected</Badge>
+              ) : (
+                <Badge variant="outline" className="text-muted-foreground">Not Connected</Badge>
+              )}
+            </div>
+
+            <div>
+              <label className="text-xs font-medium text-muted-foreground">Render API Key:</label>
+              <Input
+                type="password"
+                placeholder="rnd_xxxxxxxxxxxxxxxx"
+                value={renderKey}
+                onChange={(e) => setRenderKey(e.target.value)}
+                className="mt-1 h-9"
+              />
+            </div>
+          </div>
+        </div>
+
+        <Button onClick={save} disabled={saving} className="w-full">
+          {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
+          Save Manual Provider Tokens
+        </Button>
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function SettingsPage() {
   const [criteria, setCriteria] = useState<SearchCriteria | null>(null);
   const [config, setConfig] = useState<PipelineConfig | null>(null);
@@ -366,6 +583,7 @@ export default function SettingsPage() {
               <TabsTrigger value="criteria">Search Criteria</TabsTrigger>
               <TabsTrigger value="pipeline">Pipeline Config</TabsTrigger>
               <TabsTrigger value="gmail">Gmail</TabsTrigger>
+              <TabsTrigger value="providers">Cloud Keys</TabsTrigger>
             </TabsList>
 
             {/* Search Criteria */}
@@ -525,6 +743,11 @@ export default function SettingsPage() {
             {/* Gmail connection (per-user OAuth) */}
             <TabsContent value="gmail" className="space-y-6">
               <GmailConnectionCard />
+            </TabsContent>
+
+            {/* Provider Integration Keys */}
+            <TabsContent value="providers" className="space-y-6">
+              <ProviderKeysCard />
             </TabsContent>
           </Tabs>
         </div>

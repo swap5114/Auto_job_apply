@@ -25,12 +25,16 @@ TASK_TYPE_SOURCING_PIPELINE = "sourcing_pipeline"
 TASK_TYPE_FOLLOWUP_PIPELINE = "followup_pipeline"
 TASK_TYPE_FEED_GRAPH = "feed_graph"
 TASK_TYPE_CHECK_FOLLOWUPS = "check_followups"
+TASK_TYPE_DEMO_BUILD = "demo_build"
+TASK_TYPE_DEMO_REFINE = "demo_refine"
 
 VALID_TASK_TYPES = {
     TASK_TYPE_SOURCING_PIPELINE,
     TASK_TYPE_FOLLOWUP_PIPELINE,
     TASK_TYPE_FEED_GRAPH,
     TASK_TYPE_CHECK_FOLLOWUPS,
+    TASK_TYPE_DEMO_BUILD,
+    TASK_TYPE_DEMO_REFINE,
 }
 
 
@@ -91,6 +95,110 @@ def dispatch_task(user_id: str, task_type: str, payload: Optional[dict] = None) 
         count = check_and_queue_followups(user_id=user_id)
         return {"task_type": task_type, "result": {"followups_queued": count}}
 
-    # Unreachable given the VALID_TASK_TYPES check above, but keeps mypy/
-    # readers honest that every branch returns.
+    if task_type == TASK_TYPE_DEMO_BUILD:
+        return _dispatch_demo_build(user_id, payload)
+
+    if task_type == TASK_TYPE_DEMO_REFINE:
+        return _dispatch_demo_refine(user_id, payload)
+
     raise UnknownTaskTypeError(f"Unknown task_type: {task_type!r}")
+
+
+def _dispatch_demo_build(user_id: str, payload: dict) -> dict:
+    from db import repository
+    from sandbox import orchestrator
+
+    build_id = payload.get("build_id", "")
+    demo_project = payload.get("demo_project", {})
+    company = payload.get("company", "")
+    project_type = payload.get("project_type", "fullstack")
+
+    keys = repository.get_user_provider_keys(user_id)
+    repository.update_demo_build_status(user_id, build_id, stage="building", deploy_stage="exporting")
+
+    state = orchestrator.start_build(demo_project, company=company, max_attempts=3)
+    state.build_id = build_id
+
+    repository.update_demo_build_status(
+        user_id, build_id,
+        stage=state.stage,
+        error=state.error,
+    )
+
+    if state.stage == "success":
+        try:
+            state.project_dir = orchestrator.export_build_output(state)
+            orchestrator.deploy_build(
+                state,
+                demo_project=demo_project,
+                company=company,
+                github_token=keys.get("github_token"),
+                vercel_token=keys.get("vercel_token"),
+                render_api_key=keys.get("render_api_key"),
+                project_type=project_type,
+            )
+        finally:
+            orchestrator.stop_build(state)
+
+        repository.update_demo_build_status(
+            user_id, build_id,
+            stage=state.stage,
+            deploy_stage=state.deploy_stage,
+            repo_url=state.repo_url,
+            frontend_url=state.frontend_url,
+            backend_url=state.backend_url,
+            deploy_error=state.deploy_error,
+        )
+
+    return {"build_id": build_id, "stage": state.stage, "deploy_stage": state.deploy_stage}
+
+
+def _dispatch_demo_refine(user_id: str, payload: dict) -> dict:
+    from db import repository
+    from sandbox import orchestrator
+
+    build_id = payload.get("build_id", "")
+    refinement_prompt = payload.get("prompt", "")
+
+    keys = repository.get_user_provider_keys(user_id)
+    demo_row = repository.get_demo_build(user_id, build_id)
+    demo_project = demo_row.get("spec_json", {})
+    company = demo_row.get("company_name", "")
+    project_type = demo_row.get("project_type", "fullstack")
+
+    repository.add_refinement_turn(user_id, build_id, refinement_prompt, stage="building")
+
+    # In a refinement turn, append the refinement instruction to demo_project description
+    refined_project = dict(demo_project)
+    existing_desc = refined_project.get("description", "")
+    refined_project["description"] = f"{existing_desc}\n\n[REFINEMENT REVISION REQUEST]: {refinement_prompt}"
+
+    state = orchestrator.start_build(refined_project, company=company, max_attempts=3)
+    state.build_id = build_id
+
+    if state.stage == "success":
+        try:
+            state.project_dir = orchestrator.export_build_output(state)
+            orchestrator.deploy_build(
+                state,
+                demo_project=refined_project,
+                company=company,
+                github_token=keys.get("github_token"),
+                vercel_token=keys.get("vercel_token"),
+                render_api_key=keys.get("render_api_key"),
+                project_type=project_type,
+            )
+        finally:
+            orchestrator.stop_build(state)
+
+    repository.update_demo_build_status(
+        user_id, build_id,
+        stage=state.stage,
+        deploy_stage=state.deploy_stage,
+        repo_url=state.repo_url or demo_row.get("repo_url"),
+        frontend_url=state.frontend_url or demo_row.get("frontend_url"),
+        backend_url=state.backend_url or demo_row.get("backend_url"),
+        deploy_error=state.deploy_error,
+    )
+
+    return {"build_id": build_id, "stage": state.stage, "deploy_stage": state.deploy_stage}

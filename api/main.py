@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
             start_scheduler()
             scheduler_started = True
         except Exception as e:
-            print(f"⚠️  Failed to start scheduler: {e}")
+            print(f"[WARNING] Failed to start scheduler: {e}")
 
     yield
 
@@ -69,7 +69,7 @@ async def lifespan(app: FastAPI):
             from orchestrator.scheduler import stop_scheduler
             stop_scheduler()
         except Exception as e:
-            print(f"⚠️  Failed to stop scheduler cleanly: {e}")
+            print(f"[WARNING] Failed to stop scheduler cleanly: {e}")
 
 
 app = FastAPI(
@@ -232,13 +232,25 @@ class BuildDemoRequest(BaseModel):
     max_attempts: Optional[int] = None
 
 
+class StandaloneDemoBuildRequest(BaseModel):
+    title: str
+    description: str
+    company_name: Optional[str] = None
+    project_type: Optional[str] = "fullstack"
+    max_attempts: Optional[int] = None
+
+
+class RefineDemoRequest(BaseModel):
+    prompt: str
+
+
 class ProvideSecretsRequest(BaseModel):
     secrets: dict[str, str]
 
 
 class DemoBuildStatusResponse(BaseModel):
     build_id: str
-    lead_id: str
+    lead_id: Optional[str] = "standalone"
     running: bool
     stage: str
     attempt: int
@@ -256,19 +268,21 @@ class DemoBuildStatusResponse(BaseModel):
 
 
 class DemoBuildSummary(BaseModel):
-    """Lightweight summary for the Builds list page — omits the full log
-    transcript so listing many builds stays cheap.
-    """
+    """Summary for the Builds list page."""
     build_id: str
-    lead_id: str
-    company: str
-    demo_title: str
+    lead_id: Optional[str] = "standalone"
+    company: Optional[str] = ""
+    company_name: Optional[str] = ""
+    demo_title: Optional[str] = ""
+    title: Optional[str] = ""
+    project_type: Optional[str] = "fullstack"
     running: bool
     stage: str
     deploy_stage: Optional[str] = None
     attempt: int
     max_attempts: int
-    started_at: str
+    started_at: Optional[str] = ""
+    repo_url: Optional[str] = None
     frontend_url: Optional[str] = None
     backend_url: Optional[str] = None
 
@@ -722,23 +736,8 @@ def _get_build_entry(build_id: str) -> Optional[dict]:
         return _demo_builds.get(build_id)
 
 
-def _finish_build_and_deploy(entry: dict, demo_project: dict, company: str) -> None:
-    """Shared tail end for both _run_build_bg and _resume_build_bg.
-
-    IMPORTANT ORDERING (this is the bug fix from Task 8 planning): the
-    project must be exported from the container BEFORE the container is
-    stopped. The previous version called stop_build() immediately on
-    success, which destroys the container — by the time a deploy step tried
-    to read files from it, there would be nothing left to export. The fix:
-    finalize_success() (export) always runs first, stop_build() second,
-    and only then does deploy_build() push to GitHub/Vercel/Render — none
-    of which need the container anymore since they work off the exported
-    directory on the host filesystem.
-
-    A build that ends in needs_secrets deliberately leaves its container
-    running (see orchestrator.start_build's docstring) — this function
-    no-ops for that case, since there's nothing to finalize or deploy yet.
-    """
+def _finish_build_and_deploy(entry: dict, demo_project: dict, company: str, github_token: Optional[str] = None) -> None:
+    """Shared tail end for both _run_build_bg and _resume_build_bg."""
     from sandbox import orchestrator
 
     state = entry["state"]
@@ -750,28 +749,33 @@ def _finish_build_and_deploy(entry: dict, demo_project: dict, company: str) -> N
         orchestrator.stop_build(state)  # container no longer needed either way
 
     if state.stage == "success" and state.project_dir:
-        orchestrator.deploy_build(state, demo_project, company)
+        orchestrator.deploy_build(state, demo_project, company, github_token=github_token)
 
 
-def _run_build_bg(build_id: str, demo_project: dict, company: str, max_attempts: int):
-    """Background worker: runs the (blocking) build loop, then marks it done.
-
-    Any exception here is caught and stored on the state object rather than
-    left to crash a daemon thread silently — otherwise a bug would leave the
-    build stuck at "running": True forever from the API's point of view.
-    """
-    from sandbox import orchestrator
+def _run_build_bg(build_id: str, demo_project: dict, company: str, max_attempts: int, github_token: Optional[str] = None):
+    """Background worker: runs the (blocking) build loop, then marks it done."""
+    from sandbox import orchestrator, gcp_job_executor
 
     entry = _get_build_entry(build_id)
     state = entry["state"]
     try:
-        orchestrator.start_build(
-            demo_project=demo_project,
-            company=company,
-            max_attempts=max_attempts,
-            state=state,  # mutate the SAME object callers are already polling
-        )
-        _finish_build_and_deploy(entry, demo_project, company)
+        if gcp_job_executor.is_gcp_sandbox_enabled():
+            gcp_job_executor.launch_gcp_cloud_run_job(
+                build_id=build_id,
+                demo_project=demo_project,
+                company=company,
+                github_token=github_token,
+                max_attempts=max_attempts,
+            )
+            state.stage = "building"
+        else:
+            orchestrator.start_build(
+                demo_project=demo_project,
+                company=company,
+                max_attempts=max_attempts,
+                state=state,  # mutate the SAME object callers are already polling
+            )
+            _finish_build_and_deploy(entry, demo_project, company, github_token=github_token)
     except Exception as e:
         state.stage = "failed"
         state.error = f"Unexpected orchestrator error: {e}"
@@ -805,9 +809,14 @@ def build_demo(lead_id: str, body: BuildDemoRequest, user_id: str = Depends(get_
 
     Returns immediately with build_id="..." and stage="pending"; poll
     GET /api/leads/{lead_id}/build-demo/{build_id}/status for progress.
+    Capped at 5 demo builds per user per 24 hours.
     """
     from sandbox.orchestrator import BuildState
     from sandbox.config import DEFAULT_MAX_ATTEMPTS
+    from api.rate_limit import demo_build_limiter
+
+    # Enforce 5 demos/day quota per user
+    demo_build_limiter.check(f"user_demo:{user_id}")
 
     leads = _get_all_leads_cached(user_id)
     lead = next((l for l in leads if str(l.get("id", "")) == lead_id), None)
@@ -966,6 +975,137 @@ def list_builds(user_id: str = Depends(get_authenticated_user_id)):
 
     summaries.sort(key=lambda s: s.started_at, reverse=True)
     return summaries
+
+
+@app.get("/api/demos", response_model=list[DemoBuildSummary])
+def list_demos(user_id: str = Depends(get_authenticated_user_id)):
+    """List all demo builds for the Demo Studio page."""
+    with _demo_builds_registry_lock:
+        entries = list(_demo_builds.items())
+
+    summaries = []
+    for build_id, entry in entries:
+        state = entry["state"]
+        with entry["lock"]:
+            running = entry["running"]
+        company_val = entry.get("company", "") or entry.get("company_name", "")
+        title_val = entry.get("demo_title", "") or entry.get("title", "")
+        summaries.append(DemoBuildSummary(
+            build_id=build_id,
+            lead_id=entry.get("lead_id", "standalone"),
+            company=company_val,
+            company_name=company_val,
+            demo_title=title_val,
+            title=title_val,
+            project_type=entry.get("project_type", "fullstack"),
+            running=running,
+            stage=state.stage,
+            deploy_stage=state.deploy_stage,
+            attempt=state.attempt,
+            max_attempts=state.max_attempts,
+            started_at=entry.get("started_at", ""),
+            repo_url=state.repo_url,
+            frontend_url=state.frontend_url,
+            backend_url=state.backend_url,
+        ))
+
+    summaries.sort(key=lambda s: s.started_at, reverse=True)
+    return summaries
+
+
+@app.get("/api/demos/quota")
+def get_demos_quota(user_id: str = Depends(get_authenticated_user_id)):
+    """Get the current user's daily demo quota usage."""
+    from api.rate_limit import demo_build_limiter
+    now = time.monotonic()
+    key = f"user_demo:{user_id}"
+    with demo_build_limiter._lock:
+        hits = demo_build_limiter._hits.get(key, deque())
+        while hits and now - hits[0] > demo_build_limiter.window_seconds:
+            hits.popleft()
+        used = len(hits)
+
+    today = datetime.date.today().isoformat()
+    limit = 5
+    return {
+        "date": today,
+        "used": used,
+        "limit": limit,
+        "remaining": max(0, limit - used)
+    }
+
+
+@app.post("/api/demos/build", response_model=DemoBuildStatusResponse)
+def build_standalone_demo(body: StandaloneDemoBuildRequest, user_id: str = Depends(get_authenticated_user_id)):
+    """Start a standalone demo build from the AI Demo Studio page."""
+    from sandbox.orchestrator import BuildState
+    from sandbox.config import DEFAULT_MAX_ATTEMPTS
+    from api.rate_limit import demo_build_limiter
+
+    demo_build_limiter.check(f"user_demo:{user_id}")
+
+    max_attempts = body.max_attempts or DEFAULT_MAX_ATTEMPTS
+    state = BuildState(build_id=str(uuid.uuid4())[:8], max_attempts=max_attempts)
+    demo_project_dict = {
+        "title": body.title,
+        "description": body.description,
+        "company_name": body.company_name or "",
+        "project_type": body.project_type or "fullstack",
+    }
+
+    _register_build(
+        state.build_id, "standalone", state,
+        company=body.company_name or "", demo_title=body.title, demo_project=demo_project_dict,
+    )
+    threading.Thread(
+        target=_run_build_bg,
+        args=(state.build_id, demo_project_dict, body.company_name or "", max_attempts),
+        daemon=True,
+    ).start()
+
+    return DemoBuildStatusResponse(
+        build_id=state.build_id,
+        lead_id="standalone",
+        running=True,
+        stage=state.stage,
+        attempt=state.attempt,
+        max_attempts=state.max_attempts,
+    )
+
+
+@app.post("/api/demos/{build_id}/refine", response_model=DemoBuildStatusResponse)
+def refine_demo(build_id: str, body: RefineDemoRequest, user_id: str = Depends(get_authenticated_user_id)):
+    """Request AI refinements/updates for an existing demo build."""
+    entry = _get_build_entry(build_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Build {build_id} not found")
+
+    state = entry["state"]
+    demo_project = entry.get("demo_project", {})
+    company = entry.get("company", "")
+
+    demo_project["description"] = f"{demo_project.get('description', '')}\n\nRefinement Request: {body.prompt}"
+
+    with entry["lock"]:
+        entry["running"] = True
+
+    threading.Thread(
+        target=_run_build_bg,
+        args=(build_id, demo_project, company, state.max_attempts),
+        daemon=True,
+    ).start()
+
+    return DemoBuildStatusResponse(
+        build_id=build_id,
+        lead_id=entry.get("lead_id", "standalone"),
+        running=True,
+        stage="building",
+        attempt=state.attempt,
+        max_attempts=state.max_attempts,
+        repo_url=state.repo_url,
+        frontend_url=state.frontend_url,
+        backend_url=state.backend_url,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2332,6 +2472,239 @@ async def profile_upload_resume(
         is_primary=True,
         created_at=created_iso,
     )
+
+
+# ---------------------------------------------------------------------------
+# Demo Code Generation, Docker Sandboxing & Multi-Cloud Deployment Routes
+# ---------------------------------------------------------------------------
+
+class DemoBuildRequest(BaseModel):
+    title: str
+    description: str
+    company_name: Optional[str] = None
+    tech_stack: Optional[list[str]] = None
+    project_type: Optional[str] = "fullstack"  # fullstack | frontend_only | backend_only
+
+
+class DemoRefineRequest(BaseModel):
+    prompt: str
+
+
+class ProviderKeysRequest(BaseModel):
+    github_token: Optional[str] = None
+    vercel_token: Optional[str] = None
+    render_api_key: Optional[str] = None
+
+
+@app.post("/api/demos/build")
+def start_demo_build_route(
+    body: DemoBuildRequest,
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Trigger an AI demo code generation, Docker sandbox build, and multi-cloud deploy.
+    Quota rate-limiting is temporarily bypassed for development.
+    """
+    # repo.check_and_increment_demo_quota(user_id, max_daily=5) — Bypassed per request
+
+    build_id = f"demo-{uuid.uuid4().hex[:8]}"
+    demo_spec = {
+        "title": body.title,
+        "description": body.description,
+        "tech_stack": body.tech_stack or ["React", "FastAPI"],
+        "deliverable": "a working build",
+    }
+
+    demo_row = repo.create_demo_build(
+        user_id=user_id,
+        build_id=build_id,
+        title=body.title,
+        company_name=body.company_name,
+        project_type=body.project_type or "fullstack",
+        spec_json=demo_spec,
+    )
+
+    from api.tasks import enqueue_pipeline_task
+    from orchestrator.task_dispatch import TASK_TYPE_DEMO_BUILD
+
+    enqueue_pipeline_task(
+        user_id=user_id,
+        task_type=TASK_TYPE_DEMO_BUILD,
+        payload={
+            "build_id": build_id,
+            "demo_project": demo_spec,
+            "company": body.company_name or "",
+            "project_type": body.project_type or "fullstack",
+        },
+    )
+
+    return demo_row
+
+
+@app.post("/api/demos/build/{build_id}/refine")
+def refine_demo_build_route(
+    build_id: str,
+    body: DemoRefineRequest,
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Submit a refinement turn prompt to modify an existing demo build and re-deploy."""
+    if not body.prompt.strip():
+        raise HTTPException(status_code=400, detail="Refinement prompt cannot be empty")
+
+    demo_row = repo.get_demo_build(user_id, build_id)
+
+    from api.tasks import enqueue_pipeline_task
+    from orchestrator.task_dispatch import TASK_TYPE_DEMO_REFINE
+
+    enqueue_pipeline_task(
+        user_id=user_id,
+        task_type=TASK_TYPE_DEMO_REFINE,
+        payload={
+            "build_id": build_id,
+            "prompt": body.prompt,
+        },
+    )
+
+    return repo.add_refinement_turn(user_id, build_id, body.prompt, stage="building")
+
+
+@app.get("/api/demos/build/{build_id}")
+def get_demo_build_route(
+    build_id: str,
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Fetch status, stage, repo_url, frontend_url, backend_url for a demo build."""
+    try:
+        return repo.get_demo_build(user_id, build_id)
+    except repo.NotFoundError:
+        raise HTTPException(status_code=404, detail="Demo build not found")
+
+
+@app.get("/api/demos/list")
+def list_demo_builds_route(
+    limit: int = Query(20, ge=1, le=100),
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """List all recent demo builds for user."""
+    return repo.list_user_demo_builds(user_id, limit=limit)
+
+
+@app.get("/api/demos/quota")
+def get_demo_quota_route(
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Check remaining demo build quota for today."""
+    usage = repo.get_daily_demo_usage(user_id, max_daily=5)
+    return {
+        "date": usage["date"],
+        "used": usage["used"],
+        "limit": 999,
+        "remaining": 999,
+    }
+
+
+@app.get("/api/user/provider-keys")
+def get_provider_keys_route(
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Retrieve saved provider keys status."""
+    keys = repo.get_user_provider_keys(user_id)
+    return {
+        "has_github_token": bool(keys.get("github_token")),
+        "has_vercel_token": bool(keys.get("vercel_token")),
+        "has_render_api_key": bool(keys.get("render_api_key")),
+    }
+
+
+@app.post("/api/user/provider-keys")
+def update_provider_keys_route(
+    body: ProviderKeysRequest,
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Update user's connected provider API tokens."""
+    updated = repo.update_user_provider_keys(
+        user_id,
+        github_token=body.github_token,
+        vercel_token=body.vercel_token,
+        render_api_key=body.render_api_key,
+    )
+    return {
+        "status": "updated",
+        "has_github_token": bool(updated.get("github_token")),
+        "has_vercel_token": bool(updated.get("vercel_token")),
+        "has_render_api_key": bool(updated.get("render_api_key")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GitHub & Vercel 1-Click OAuth Connect Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/api/auth/github/connect")
+def github_oauth_connect(user_id: str = Depends(get_authenticated_user_id)):
+    """Generate 1-click GitHub OAuth authorization URL."""
+    try:
+        from api.provider_oauth import get_github_auth_url, ProviderOAuthConfigError
+        url = get_github_auth_url(user_id)
+        return {"auth_url": url}
+    except ProviderOAuthConfigError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/auth/github/callback")
+async def github_oauth_callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+):
+    """Callback for GitHub OAuth authorization."""
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    if error or not code or not state:
+        err_msg = error or "missing_code_or_state"
+        return RedirectResponse(url=f"{frontend_url}/settings?github=error&msg={err_msg}")
+
+    try:
+        from api.provider_oauth import verify_provider_state, exchange_github_code
+        user_id = verify_provider_state(state, expected_provider="github")
+        token = await exchange_github_code(code)
+        repo.update_user_provider_keys(user_id, github_token=token)
+        return RedirectResponse(url=f"{frontend_url}/settings?github=connected")
+    except Exception as e:
+        print(f"[GitHub OAuth Error] {e}")
+        return RedirectResponse(url=f"{frontend_url}/settings?github=error")
+
+
+@app.get("/api/auth/vercel/connect")
+def vercel_oauth_connect(user_id: str = Depends(get_authenticated_user_id)):
+    """Generate 1-click Vercel OAuth authorization URL."""
+    try:
+        from api.provider_oauth import get_vercel_auth_url, ProviderOAuthConfigError
+        url = get_vercel_auth_url(user_id)
+        return {"auth_url": url}
+    except ProviderOAuthConfigError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/auth/vercel/callback")
+async def vercel_oauth_callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+):
+    """Callback for Vercel OAuth authorization."""
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    if error or not code or not state:
+        err_msg = error or "missing_code_or_state"
+        return RedirectResponse(url=f"{frontend_url}/settings?vercel=error&msg={err_msg}")
+
+    try:
+        from api.provider_oauth import verify_provider_state, exchange_vercel_code
+        user_id = verify_provider_state(state, expected_provider="vercel")
+        token = await exchange_vercel_code(code)
+        repo.update_user_provider_keys(user_id, vercel_token=token)
+        return RedirectResponse(url=f"{frontend_url}/settings?vercel=connected")
+    except Exception as e:
+        print(f"[Vercel OAuth Error] {e}")
+        return RedirectResponse(url=f"{frontend_url}/settings?vercel=error")
 
 
 # ---------------------------------------------------------------------------

@@ -179,6 +179,7 @@ def deploy_to_github(
     company: str = "",
     build_id: str = "",
     private: Optional[bool] = None,
+    github_token: Optional[str] = None,
 ) -> DeployRepoResult:
     """Push an exported demo project directory to a brand-new GitHub repo.
 
@@ -191,6 +192,7 @@ def deploy_to_github(
         build_id: The build's short ID, appended to the repo name to avoid
             collisions if the same company gets demoed twice.
         private: Override DEMO_REPO_PRIVATE for this call.
+        github_token: User's connected GitHub OAuth token.
 
     Returns:
         DeployRepoResult with the repo's URL, owner, and name.
@@ -235,12 +237,41 @@ def deploy_to_github(
     visibility_flag = "--private" if is_private else "--public"
     description = demo_project.get("description", "")[:350]  # GitHub caps repo descriptions
 
-    create_result = _run(
+    env_vars = os.environ.copy()
+    if github_token:
+        env_vars["GH_TOKEN"] = github_token
+        env_vars["GITHUB_TOKEN"] = github_token
+
+    # Use gh CLI with optional user token env override
+    result = subprocess.run(
         ["gh", "repo", "create", repo_name, visibility_flag,
          "--source=.", "--push", "--description", description],
         cwd=project_dir,
+        capture_output=True,
+        text=True,
         timeout=GIT_COMMAND_TIMEOUT,
+        env=env_vars,
     )
+
+    if result.returncode != 0 and github_token:
+        # Fallback to direct GitHub REST API creation + git push via token if gh CLI fails or user token differs
+        import httpx
+        headers = {"Authorization": f"Bearer {github_token}", "Accept": "application/vnd.github+json"}
+        res = httpx.post("https://api.github.com/user/repos", json={"name": repo_name, "private": is_private, "description": description}, headers=headers, timeout=30.0)
+        if res.status_code in (201, 422): # 201 Created, 422 Already exists
+            user_res = httpx.get("https://api.github.com/user", headers=headers, timeout=15.0)
+            username = user_res.json().get("login", "")
+            if username:
+                remote_url = f"https://x-access-token:{github_token}@github.com/{username}/{repo_name}.git"
+                _run(["git", "remote", "add", "origin", remote_url], cwd=project_dir)
+                _run(["git", "push", "-u", "origin", "main"], cwd=project_dir)
+                repo_url = f"https://github.com/{username}/{repo_name}"
+                return DeployRepoResult(repo_name=repo_name, repo_url=repo_url, owner=username)
+
+    if result.returncode != 0:
+        raise RuntimeError(f"gh repo create failed:\nstdout: {result.stdout}\nstderr: {result.stderr}")
+
+    create_result = result
 
     # `gh repo create` prints "https://github.com/<owner>/<repo>" on its
     # first output line — parse that rather than making a second API call.
@@ -252,13 +283,14 @@ def deploy_to_github(
 
     if not repo_url:
         # Fall back to asking gh directly if the output format ever changes.
-        view_result = _run(["gh", "repo", "view", repo_name, "--json", "url", "-q", ".url"], cwd=project_dir)
+        view_result = subprocess.run(["gh", "repo", "view", repo_name, "--json", "url", "-q", ".url"], cwd=project_dir, capture_output=True, text=True, timeout=GIT_COMMAND_TIMEOUT, env=env_vars)
         repo_url = view_result.stdout.strip()
 
     owner = repo_url.rstrip("/").split("/")[-2] if repo_url else ""
 
     print(f"  ✅ Pushed to {repo_url}")
     return DeployRepoResult(repo_name=repo_name, repo_url=repo_url, owner=owner)
+
 
 
 # ---------------------------------------------------------------------------

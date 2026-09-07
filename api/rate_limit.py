@@ -90,3 +90,7 @@ resume_upload_limiter = RateLimiter(max_requests=10, window_seconds=3600)
 # Anonymous tailored preview: also one LLM call, per job clicked -- same
 # per-hour cap, tracked independently so exhausting one doesn't block the other.
 preview_limiter = RateLimiter(max_requests=10, window_seconds=3600)
+
+# User demo build limiter: max 5 demo builds per user per 24 hours (86400 seconds).
+demo_build_limiter = RateLimiter(max_requests=5, window_seconds=86400)
+

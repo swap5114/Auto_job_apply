@@ -77,20 +77,16 @@ class RenderDeployResult:
     error: Optional[str] = None
 
 
-def _headers() -> dict:
-    if not RENDER_API_KEY:
-        raise RuntimeError("RENDER_API_KEY is not set in config/.env")
-    return {"Authorization": f"Bearer {RENDER_API_KEY}", "Content-Type": "application/json"}
+def _headers(api_key: Optional[str] = None) -> dict:
+    key = api_key or RENDER_API_KEY
+    if not key:
+        raise RuntimeError("RENDER_API_KEY is not set in config/.env and no user render_api_key provided")
+    return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
 
-def get_default_owner_id() -> str:
-    """Look up the account's workspace/owner ID.
-
-    Every service-creation call needs an ownerId. Render's docs call this
-    a "workspace" in the dashboard but "owner" in the API — fetched fresh
-    rather than hardcoded from a specific account.
-    """
-    resp = requests.get(f"{RENDER_API_BASE}/owners", headers=_headers(), timeout=RENDER_HTTP_TIMEOUT)
+def get_default_owner_id(api_key: Optional[str] = None) -> str:
+    """Look up the account's workspace/owner ID."""
+    resp = requests.get(f"{RENDER_API_BASE}/owners", headers=_headers(api_key), timeout=RENDER_HTTP_TIMEOUT)
     if resp.status_code != 200:
         raise RuntimeError(f"Failed to fetch Render owners ({resp.status_code}): {resp.text}")
     owners = resp.json()
@@ -214,27 +210,10 @@ def deploy_to_render(
     start_command: Optional[str] = None,
     env_vars: Optional[dict[str, str]] = None,
     owner_id: Optional[str] = None,
+    render_api_key: Optional[str] = None,
 ) -> RenderDeployResult:
-    """Deploy a backend from a GitHub repo to a free Render web service.
-
-    Args:
-        repo_url: Full GitHub URL, e.g. "https://github.com/owner/repo".
-        service_name: Render service name. Must be unique in the workspace.
-        branch: Git branch to deploy.
-        tech_stack: Used to pick a runtime (Python/Node) if build_command
-            and start_command aren't explicitly given.
-        build_command / start_command: Override the auto-detected defaults.
-            Kiro's own .build_status.json is the preferred source for these
-            when available — pass its values in directly.
-        env_vars: Environment variables to set on the service (e.g. user
-            secrets a full-stack demo's backend needs at runtime).
-        owner_id: Override the auto-detected default workspace.
-
-    Returns:
-        RenderDeployResult with the live URL if the deploy succeeded, or
-        status="build_failed"/"TIMEOUT" etc. and an error message if not.
-    """
-    owner_id = owner_id or get_default_owner_id()
+    """Deploy a backend from a GitHub repo to a free Render web service."""
+    owner_id = owner_id or get_default_owner_id(api_key=render_api_key)
     runtime_defaults = _detect_runtime(tech_stack or [])
     runtime = runtime_defaults["env"]
     build_command = build_command or runtime_defaults["buildCommand"]

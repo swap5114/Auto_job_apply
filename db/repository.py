@@ -30,6 +30,8 @@ from sqlalchemy.orm import Session
 
 from db.models import (
     Company,
+    DemoBuild,
+    DemoUsageDaily,
     EnrichmentCache,
     GmailAccount,
     Job,
@@ -956,5 +958,195 @@ def get_jobs(open_only: bool = False) -> list[dict]:
             stmt = stmt.where(Job.is_open.is_(True))
         rows = session.scalars(stmt).all()
         return [_to_dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Demo Build & Rate Limit Repository Methods
+# ---------------------------------------------------------------------------
+
+def check_and_increment_demo_quota(user_id: str, max_daily: int = 5) -> bool:
+    """Atomically check and increment user's daily demo creation quota.
+
+    Returns True if allowed (count <= max_daily), False if limit reached.
+    """
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with get_session() as session:
+        usage = session.scalar(
+            select(DemoUsageDaily).where(
+                DemoUsageDaily.user_id == user_id,
+                DemoUsageDaily.usage_date == today_str,
+            )
+        )
+        if not usage:
+            usage = DemoUsageDaily(user_id=user_id, usage_date=today_str, count=1)
+            session.add(usage)
+            session.flush()
+            return True
+
+        if usage.count >= max_daily:
+            return False
+
+        usage.count += 1
+        session.flush()
+        return True
+
+
+def get_daily_demo_usage(user_id: str, max_daily: int = 5) -> dict:
+    """Return today's demo usage stats for user."""
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with get_session() as session:
+        usage = session.scalar(
+            select(DemoUsageDaily).where(
+                DemoUsageDaily.user_id == user_id,
+                DemoUsageDaily.usage_date == today_str,
+            )
+        )
+        used = usage.count if usage else 0
+        return {
+            "date": today_str,
+            "used": used,
+            "limit": max_daily,
+            "remaining": max(0, max_daily - used),
+        }
+
+
+def create_demo_build(
+    user_id: str,
+    build_id: str,
+    title: str,
+    company_name: Optional[str] = None,
+    project_type: str = "fullstack",
+    spec_json: Optional[dict] = None,
+) -> dict:
+    """Create a new DemoBuild tracking row for user."""
+    with get_session() as session:
+        demo = DemoBuild(
+            user_id=user_id,
+            build_id=build_id,
+            title=title,
+            company_name=company_name,
+            project_type=project_type,
+            spec_json=spec_json or {},
+            stage="pending",
+            deploy_stage="exporting",
+            turn_count=1,
+            refinements=[],
+        )
+        session.add(demo)
+        session.flush()
+        return _to_dict(demo)
+
+
+def get_demo_build(user_id: str, build_id: str) -> dict:
+    """Get a specific DemoBuild row scoped to user_id."""
+    with get_session() as session:
+        demo = session.scalar(
+            select(DemoBuild).where(
+                DemoBuild.user_id == user_id,
+                DemoBuild.build_id == build_id,
+            )
+        )
+        if not demo:
+            raise NotFoundError(f"No demo build found with build_id: {build_id!r}")
+        return _to_dict(demo)
+
+
+def update_demo_build_status(user_id: str, build_id: str, **fields) -> dict:
+    """Update fields on a DemoBuild row scoped to user_id."""
+    with get_session() as session:
+        demo = session.scalar(
+            select(DemoBuild).where(
+                DemoBuild.user_id == user_id,
+                DemoBuild.build_id == build_id,
+            )
+        )
+        if not demo:
+            raise NotFoundError(f"No demo build found with build_id: {build_id!r}")
+
+        for key, value in fields.items():
+            if hasattr(demo, key):
+                setattr(demo, key, value)
+
+        demo.updated_at = datetime.now(timezone.utc)
+        session.flush()
+        return _to_dict(demo)
+
+
+def add_refinement_turn(user_id: str, build_id: str, prompt: str, stage: str = "building") -> dict:
+    """Append a refinement prompt turn to a DemoBuild."""
+    with get_session() as session:
+        demo = session.scalar(
+            select(DemoBuild).where(
+                DemoBuild.user_id == user_id,
+                DemoBuild.build_id == build_id,
+            )
+        )
+        if not demo:
+            raise NotFoundError(f"No demo build found with build_id: {build_id!r}")
+
+        refinements = list(demo.refinements or [])
+        refinements.append({
+            "prompt": prompt,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "stage": stage,
+        })
+        demo.refinements = refinements
+        demo.turn_count = (demo.turn_count or 1) + 1
+        demo.stage = stage
+        demo.updated_at = datetime.now(timezone.utc)
+        session.flush()
+        return _to_dict(demo)
+
+
+def list_user_demo_builds(user_id: str, limit: int = 20) -> list[dict]:
+    """List recent demo builds for a tenant."""
+    with get_session() as session:
+        rows = session.scalars(
+            select(DemoBuild)
+            .where(DemoBuild.user_id == user_id)
+            .order_by(DemoBuild.created_at.desc())
+            .limit(limit)
+        ).all()
+        return [_to_dict(r) for r in rows]
+
+
+def get_user_provider_keys(user_id: str) -> dict:
+    """Retrieve saved provider keys (GitHub, Vercel, Render) for user."""
+    with get_session() as session:
+        user = session.scalar(select(User).where(User.id == user_id))
+        if not user:
+            raise NotFoundError(f"User not found: {user_id}")
+        return {
+            "github_token": user.github_token,
+            "vercel_token": user.vercel_token,
+            "render_api_key": user.render_api_key,
+        }
+
+
+def update_user_provider_keys(
+    user_id: str,
+    github_token: Optional[str] = None,
+    vercel_token: Optional[str] = None,
+    render_api_key: Optional[str] = None,
+) -> dict:
+    """Update saved provider keys for user."""
+    with get_session() as session:
+        user = session.scalar(select(User).where(User.id == user_id))
+        if not user:
+            raise NotFoundError(f"User not found: {user_id}")
+
+        if github_token is not None:
+            user.github_token = github_token.strip() or None
+        if vercel_token is not None:
+            user.vercel_token = vercel_token.strip() or None
+        if render_api_key is not None:
+            user.render_api_key = render_api_key.strip() or None
+
+        session.flush()
+        return {
+            "github_token": user.github_token,
+            "vercel_token": user.vercel_token,
+            "render_api_key": user.render_api_key,
+        }
 
 

@@ -28,6 +28,7 @@ apscheduler
 
 # Sandbox (Docker-based demo builder)
 docker
+google-cloud-run
 
 # --- Phase 0: Production Foundation (Postgres multi-tenant backend) ---
 sqlalchemy==2.0.36

@@ -510,28 +510,19 @@ export function DemoBuilder({
   return (
     <div className="mt-3 border-t border-accent1/20 pt-3">
       {stage === "idle" && demoProject && (
-        <div className="relative group w-full">
-          <Button
-            size="sm"
-            className="w-full cursor-not-allowed bg-slate-900 text-slate-300 hover:bg-slate-900 border border-slate-700/60 shadow-none font-medium text-xs flex items-center justify-center gap-1.5"
-            disabled
-          >
-            <Lock className="h-3.5 w-3.5 text-amber-400 flex-shrink-0" />
-            <span>Build This Demo</span>
-            <Badge variant="outline" className="ml-1 border-amber-500/40 bg-amber-500/10 text-[10px] text-amber-400 font-semibold px-1.5 py-0">
-              PRO
-            </Badge>
-          </Button>
-
-          {/* Premium Upcoming Feature Hover Tooltip */}
-          <div className="pointer-events-none absolute -top-11 left-1/2 -translate-x-1/2 opacity-0 transition-all duration-200 group-hover:opacity-100 group-hover:-top-12 z-50">
-            <div className="flex items-center gap-1.5 rounded-lg bg-slate-950 px-3 py-1.5 text-xs font-semibold text-amber-300 shadow-2xl border border-amber-500/40 whitespace-nowrap">
-              <Sparkles className="h-3.5 w-3.5 text-amber-400 animate-pulse" />
-              <span>Premium upcoming feature</span>
-            </div>
-            <div className="mx-auto h-2 w-2 -translate-y-1 rotate-45 bg-slate-950 border-r border-b border-amber-500/40" />
-          </div>
-        </div>
+        <Button
+          size="sm"
+          className="w-full bg-accent1 text-white hover:bg-accent1/90 font-medium text-xs flex items-center justify-center gap-1.5"
+          onClick={handleStart}
+          disabled={starting}
+        >
+          {starting ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <Hammer className="h-3.5 w-3.5 flex-shrink-0" />
+          )}
+          <span>Build This Demo</span>
+        </Button>
       )}
 
       <AnimatePresence mode="wait">
@@ -571,7 +562,7 @@ export function DemoBuilder({
               <>
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
                   <Loader2 className="h-4 w-4 animate-spin text-accent1" />
-                  {stage === "pending" ? "Spinning up sandbox…" : "Kiro is building your demo…"}
+                  {stage === "pending" ? "Spinning up sandbox…" : "AI is building your demo…"}
                 </div>
                 {status?.logs_tail && <LogViewer text={status.logs_tail} />}
                 <Button variant="ghost" size="sm" className="w-full text-muted-foreground" onClick={handleCancel}>

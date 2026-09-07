@@ -158,7 +158,7 @@ def start_scheduler() -> BackgroundScheduler:
             return _scheduler
         _scheduler = build_scheduler()
         _scheduler.start()
-        print("✅ Scheduler started.")
+        print("[Scheduler] Started.")
         _print_jobs(_scheduler)
         return _scheduler
 
@@ -169,7 +169,7 @@ def stop_scheduler():
     with _lock:
         if _scheduler and _scheduler.running:
             _scheduler.shutdown(wait=False)
-            print("🛑 Scheduler stopped.")
+            print("[Scheduler] Stopped.")
         _scheduler = None
 
 
@@ -219,7 +219,7 @@ def _print_jobs(scheduler: BackgroundScheduler):
     print("\n  Scheduled jobs:")
     for job in jobs:
         nxt = job.next_run_time.isoformat() if job.next_run_time else "n/a"
-        print(f"    • {job.name} ({job.id}) — next run: {nxt}")
+        print(f"    - {job.name} ({job.id}) - next run: {nxt}")
     print()
 
 

@@ -265,18 +265,21 @@ export interface DemoBuildStatus {
 
 export interface DemoBuildSummary {
   build_id: string;
-  lead_id: string;
-  company: string;
-  demo_title: string;
+  lead_id?: string;
+  title: string;
+  company_name?: string;
+  project_type?: "fullstack" | "frontend_only" | "backend_only";
   running: boolean;
   stage: DemoBuildStage;
   deploy_stage: DemoDeployStage | null;
   attempt: number;
   max_attempts: number;
-  started_at: string;
-  frontend_url: string | null;
-  backend_url: string | null;
+  repo_url?: string | null;
+  frontend_url?: string | null;
+  backend_url?: string | null;
 }
+
+export type DemoBuildItem = DemoBuildSummary;
 
 // ---------------------------------------------------------------------------
 // Leads
@@ -358,7 +361,52 @@ export const api = {
   },
 
   builds: {
-    list: () => request<DemoBuildSummary[]>("/builds"),
+    list: () => request<DemoBuildSummary[]>("/demos/list"),
+  },
+
+  demos: {
+    build: (data: {
+      title: string;
+      description: string;
+      company_name?: string;
+      tech_stack?: string[];
+      project_type?: "fullstack" | "frontend_only" | "backend_only";
+    }) => request<DemoBuildStatus>("/demos/build", { method: "POST", body: JSON.stringify(data) }),
+
+    refine: (buildId: string, prompt: string) =>
+      request<DemoBuildStatus>(`/demos/build/${buildId}/refine`, {
+        method: "POST",
+        body: JSON.stringify({ prompt }),
+      }),
+
+    get: (buildId: string) => request<DemoBuildStatus>(`/demos/build/${buildId}`),
+
+    list: () => request<DemoBuildSummary[]>("/demos/list"),
+
+    quota: () =>
+      request<{ date: string; used: number; limit: number; remaining: number }>("/demos/quota"),
+  },
+
+  user: {
+    getProviderKeys: () =>
+      request<{ has_github_token: boolean; has_vercel_token: boolean; has_render_api_key: boolean }>(
+        "/user/provider-keys"
+      ),
+
+    updateProviderKeys: (data: {
+      github_token?: string;
+      vercel_token?: string;
+      render_api_key?: string;
+    }) =>
+      request<{
+        status: string;
+        has_github_token: boolean;
+        has_vercel_token: boolean;
+        has_render_api_key: boolean;
+      }>("/user/provider-keys", { method: "POST", body: JSON.stringify(data) }),
+
+    getGithubOAuthUrl: () => request<{ auth_url: string }>("/auth/github/connect"),
+    getVercelOAuthUrl: () => request<{ auth_url: string }>("/auth/vercel/connect"),
   },
 
   jobs: {
@@ -577,5 +625,24 @@ export const api = {
         body: formData,
       });
     },
+  },
+
+  demos: {
+    list: () => request<DemoBuildItem[]>("/demos"),
+
+    quota: () =>
+      request<{ date: string; used: number; limit: number; remaining: number }>("/demos/quota"),
+
+    build: (data: { title: string; description: string; company_name?: string; project_type?: string }) =>
+      request<DemoBuildStatus>("/demos/build", {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
+
+    refine: (build_id: string, prompt: string) =>
+      request<DemoBuildStatus>(`/demos/${build_id}/refine`, {
+        method: "POST",
+        body: JSON.stringify({ prompt }),
+      }),
   },
 };

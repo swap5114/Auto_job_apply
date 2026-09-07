@@ -52,38 +52,54 @@ class VercelDeployResult:
     error: Optional[str] = None
 
 
-def _headers() -> dict:
-    if not VERCEL_TOKEN:
-        raise RuntimeError("VERCEL_TOKEN is not set in config/.env")
-    return {"Authorization": f"Bearer {VERCEL_TOKEN}", "Content-Type": "application/json"}
+def _headers(token: Optional[str] = None) -> dict:
+    t = token or VERCEL_TOKEN
+    if not t:
+        raise RuntimeError("VERCEL_TOKEN is not set in config/.env and no user vercel_token provided")
+    return {"Authorization": f"Bearer {t}", "Content-Type": "application/json"}
 
 
-def _request(method: str, path: str, team_id: str, **kwargs) -> requests.Response:
+def _request(method: str, path: str, team_id: str, token: Optional[str] = None, **kwargs) -> requests.Response:
     """Thin wrapper around requests that always scopes calls to the given
-    team and raises with the response body on failure (Vercel's error JSON
-    is far more useful than a bare status code).
+    team and raises with the response body on failure.
     """
     url = f"{VERCEL_API_BASE}{path}"
     params = kwargs.pop("params", {}) or {}
-    params["teamId"] = team_id
-    resp = requests.request(method, url, headers=_headers(), params=params, timeout=VERCEL_HTTP_TIMEOUT, **kwargs)
+    if team_id:
+        params["teamId"] = team_id
+    resp = requests.request(method, url, headers=_headers(token), params=params, timeout=VERCEL_HTTP_TIMEOUT, **kwargs)
     return resp
 
 
-def get_default_team_id() -> str:
-    """Look up the account's default team ID.
-
-    Vercel scopes nearly every API call to a team (even for personal/Hobby
-    accounts, which have a single implicit team). We fetch this fresh each
-    time rather than hardcoding a team ID from a specific account.
-    """
-    resp = requests.get(f"{VERCEL_API_BASE}/v2/user", headers=_headers(), timeout=VERCEL_HTTP_TIMEOUT)
+def get_default_team_id(token: Optional[str] = None) -> str:
+    """Look up the account's default team ID."""
+    resp = requests.get(f"{VERCEL_API_BASE}/v2/user", headers=_headers(token), timeout=VERCEL_HTTP_TIMEOUT)
     if resp.status_code != 200:
         raise RuntimeError(f"Failed to fetch Vercel user info ({resp.status_code}): {resp.text}")
-    team_id = resp.json().get("user", {}).get("defaultTeamId")
-    if not team_id:
-        raise RuntimeError("No defaultTeamId found on Vercel account — is VERCEL_TOKEN valid?")
+    team_id = resp.json().get("user", {}).get("defaultTeamId") or ""
     return team_id
+
+
+def set_project_env_var(
+    project_id_or_name: str,
+    key: str,
+    value: str,
+    team_id: Optional[str] = None,
+    token: Optional[str] = None,
+    target: list[str] = None,
+) -> bool:
+    """Inject an environment variable (e.g. NEXT_PUBLIC_API_URL) into a Vercel project."""
+    target = target or ["production", "preview", "development"]
+    body = [
+        {
+            "key": key,
+            "value": value,
+            "type": "plain",
+            "target": target,
+        }
+    ]
+    resp = _request("POST", f"/v10/projects/{project_id_or_name}/env", team_id, token=token, json=body)
+    return resp.status_code in (200, 201)
 
 
 def _create_or_get_project(project_name: str, owner: str, repo: str, team_id: str) -> str:
@@ -178,23 +194,10 @@ def deploy_to_vercel(
     project_name: Optional[str] = None,
     branch: str = "main",
     team_id: Optional[str] = None,
+    vercel_token: Optional[str] = None,
 ) -> VercelDeployResult:
-    """Link a GitHub repo to Vercel and deploy it, waiting for the result.
-
-    Args:
-        owner: GitHub username/org that owns the repo (e.g. "swap5114").
-        repo: GitHub repo name (e.g. "demo-mspilot-c02a129c").
-        project_name: Vercel project name. Defaults to `repo` — Vercel
-            project names must be <= 100 chars and repo names already fit
-            that, so this is safe without extra slugifying.
-        branch: Git branch to deploy. github_deploy.py always pushes "main".
-        team_id: Override the auto-detected default team.
-
-    Returns:
-        VercelDeployResult with the live URL if the deploy succeeded, or
-        readyState="ERROR"/"TIMEOUT" and an error message if not.
-    """
-    team_id = team_id or get_default_team_id()
+    """Link a GitHub repo to Vercel and deploy it, waiting for the result."""
+    team_id = team_id or get_default_team_id(token=vercel_token)
     project_name = project_name or repo
 
     project_id = _create_or_get_project(project_name, owner, repo, team_id)

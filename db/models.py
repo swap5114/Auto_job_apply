@@ -124,6 +124,9 @@ class User(Base):
     firebase_uid = Column(String, nullable=False, unique=True, index=True)
     email = Column(String, nullable=False, unique=True, index=True)
     plan = Column(String, nullable=False, default="free")  # free | pro | power
+    github_token = Column(String, nullable=True)
+    vercel_token = Column(String, nullable=True)
+    render_api_key = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
 
@@ -135,6 +138,8 @@ class User(Base):
     usage_counters = relationship("UsageCounter", back_populates="user", cascade="all, delete-orphan")
     notifications = relationship("Notification", back_populates="user", cascade="all, delete-orphan")
     pipeline_runs = relationship("PipelineRun", back_populates="user", cascade="all, delete-orphan")
+    demo_builds = relationship("DemoBuild", back_populates="user", cascade="all, delete-orphan")
+    demo_usages = relationship("DemoUsageDaily", back_populates="user", cascade="all, delete-orphan")
 
 
 class Resume(Base):
@@ -368,6 +373,57 @@ class Notification(Base):
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
     user = relationship("User", back_populates="notifications")
+
+
+class DemoBuild(Base):
+    """Tracks one demo build execution (including generation, sandboxing,
+    and multi-cloud deployment) per user.
+    """
+    __tablename__ = "demo_builds"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    build_id = Column(String, nullable=False, unique=True, index=True)
+    title = Column(String, nullable=False)
+    company_name = Column(String, nullable=True)
+    project_type = Column(String, nullable=False, default="fullstack")  # fullstack | frontend_only | backend_only
+    spec_json = Column(JSONB, nullable=True)
+    stage = Column(String, nullable=False, default="pending")  # pending | building | needs_secrets | success | failed
+    deploy_stage = Column(String, nullable=True)  # exporting | pushing_github | deploying_vercel | deploying_render | deployed | deploy_failed
+    repo_url = Column(String, nullable=True)
+    frontend_url = Column(String, nullable=True)
+    backend_url = Column(String, nullable=True)
+    error = Column(Text, nullable=True)
+    deploy_error = Column(Text, nullable=True)
+    turn_count = Column(Integer, nullable=False, default=1)
+    refinements = Column(JSONB, nullable=False, default=list)  # [{prompt, timestamp, stage}]
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    user = relationship("User", back_populates="demo_builds")
+
+    __table_args__ = (
+        Index("ix_demo_builds_user_created", "user_id", "created_at"),
+    )
+
+
+class DemoUsageDaily(Base):
+    """Tracks daily demo build attempts per user for strict rate limiting (5 demos/day)."""
+    __tablename__ = "demo_usage_daily"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    usage_date = Column(String, nullable=False)  # YYYY-MM-DD
+    count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    user = relationship("User", back_populates="demo_usages")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "usage_date", name="uq_demo_usage_user_date"),
+    )
+
 
 
 # ---------------------------------------------------------------------------

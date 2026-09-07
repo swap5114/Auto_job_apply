@@ -113,7 +113,7 @@ def build_image(force_rebuild: bool = False) -> str:
                 if line:
                     print(f"    {line}")
 
-        print(f"  ✅ Image built successfully: {IMAGE_FULL}")
+        print(f"  [OK] Image built successfully: {IMAGE_FULL}")
         return IMAGE_FULL
 
     except Exception as e:
@@ -176,7 +176,7 @@ def start_container(
         labels={"app": "autoapply-sandbox"},
     )
 
-    print(f"  ✅ Container started: {container.short_id}")
+    print(f"  [OK] Container started: {container.short_id}")
     return container.id
 
 def run_command(
@@ -343,7 +343,7 @@ def stop_container(container_id: str, remove: bool = True) -> None:
 
     if remove:
         container.remove(force=True)
-        print(f"  ✅ Container {container.short_id} removed.")
+        print(f"  [OK] Container {container.short_id} removed.")
     else:
         print(f"  Container {container.short_id} stopped (not removed).")
 
@@ -412,7 +412,7 @@ def copy_files_from_container(
             os.rename(src_item, dst_item)
         os.rmdir(wrapped_dir)
 
-    print(f"  ✅ Files copied to: {dest_path}")
+    print(f"  [OK] Files copied to: {dest_path}")
     return dest_path
 
 def cleanup_all_sandbox_containers() -> int:
@@ -434,7 +434,7 @@ def cleanup_all_sandbox_containers() -> int:
         count += 1
 
     if count:
-        print(f"  ✅ Removed {count} sandbox container(s).")
+        print(f"  [OK] Removed {count} sandbox container(s).")
     else:
         print(f"  No sandbox containers found.")
 
@@ -484,7 +484,7 @@ def _test():
             print(f"       stderr={stderr.strip()}")
             print("       ⚠️  Kiro CLI auth may have failed. Check KIRO_API_KEY in config/.env.")
         else:
-            print(f"       ✅ Kiro CLI authenticated and responded correctly.")
+            print(f"       [OK] Kiro CLI authenticated and responded correctly.")
 
         # 5. Verify Python
         print("\n[5/5] Running 'python --version' inside container...")
@@ -493,7 +493,7 @@ def _test():
         assert exit_code == 0, f"python --version failed: {stderr}"
 
         print("\n" + "=" * 60)
-        print("  ✅ ALL CHECKS PASSED")
+        print("  [OK] ALL CHECKS PASSED")
         print("=" * 60)
 
     finally:
