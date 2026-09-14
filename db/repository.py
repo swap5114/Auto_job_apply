@@ -1070,75 +1070,87 @@ def check_and_increment_demo_quota(user_id: str, max_daily: int = 5) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Outreach quota (per-user, per calendar month)
+# Credits (per-user, LIFETIME — no reset)
 #
-# The metered resource is "outreach sent" — a lead moving to status 'sent' or
-# 'draft_created' (both stamp sent_at). The monthly allowance is a function of
-# the user's plan. This is the single backend source of truth for the quota;
-# the frontend reads it via GET /api/outreach/quota and no longer guesses.
+# The metered resource is a "completed-pipeline lead" — a lead that made it
+# all the way through the pipeline to an actual outreach action (status
+# 'sent' or 'draft_created', both stamp sent_at). Each such lead costs 1
+# credit. The free tier gets 25 credits for the LIFETIME of the account (no
+# monthly reset); paid plans get more. This is the single backend source of
+# truth; the frontend reads it via GET /api/outreach/quota.
+#
+# A lead that never completes the pipeline (no contact email, tailoring/draft
+# failed, rejected at review) never reaches sent/draft_created, so it never
+# costs a credit -- exactly the "1 credit per completed-pipeline lead" rule.
 # ---------------------------------------------------------------------------
 
-# Monthly outreach allowance per plan. Keep in sync with the copy shown in the
-# UI (frontend/src/lib/quota.ts falls back to these same numbers offline).
-PLAN_OUTREACH_LIMIT: dict[str, int] = {
+# Lifetime credit allowance per plan (1 credit = 1 completed-pipeline lead).
+# Keep in sync with the copy shown in the UI (frontend/src/lib/quota.ts falls
+# back to these same numbers offline).
+PLAN_CREDIT_LIMIT: dict[str, int] = {
     "free": 25,
     "pro": 250,
     "power": 1000,
 }
 
-# Outreach outcomes that consume quota (both put a message in the world).
+# Back-compat alias -- older references to PLAN_OUTREACH_LIMIT still resolve.
+PLAN_OUTREACH_LIMIT = PLAN_CREDIT_LIMIT
+
+# Outcomes that consume a credit (a completed-pipeline lead that produced a
+# real outreach action -- both put a message in the world).
 _OUTREACH_SENT_STATUSES = ("sent", "draft_created")
 
 
-def _month_start_utc() -> datetime:
-    """First instant of the current UTC calendar month."""
-    now = datetime.now(timezone.utc)
-    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-
 def count_outreach_used(user_id: str, since: Optional[datetime] = None) -> int:
-    """Count outreach this user has sent (status sent/draft_created) since
-    `since` (default: start of the current UTC month), by sent_at.
+    """Count credits this user has consumed = leads that completed the
+    pipeline to an outreach action (status sent/draft_created).
+
+    LIFETIME by default (no reset): every such lead the user has ever had
+    counts. `since` is retained for callers that still want a windowed
+    count, but the credit system no longer passes it.
     """
     from sqlalchemy import func
 
-    window_start = since or _month_start_utc()
     with get_session() as session:
-        return int(
-            session.scalar(
-                select(func.count())
-                .select_from(Lead)
-                .where(
-                    Lead.user_id == user_id,
-                    Lead.status.in_(_OUTREACH_SENT_STATUSES),
-                    Lead.sent_at.is_not(None),
-                    Lead.sent_at >= window_start,
-                )
+        stmt = (
+            select(func.count())
+            .select_from(Lead)
+            .where(
+                Lead.user_id == user_id,
+                Lead.status.in_(_OUTREACH_SENT_STATUSES),
+                Lead.sent_at.is_not(None),
             )
-            or 0
         )
+        if since is not None:
+            stmt = stmt.where(Lead.sent_at >= since)
+        return int(session.scalar(stmt) or 0)
 
 
 def get_outreach_quota(user_id: str) -> dict:
-    """Return this user's outreach quota for the current month:
+    """Return this user's LIFETIME credit balance:
     {plan, used, limit, remaining, reset} — the backend source of truth.
+
+    - used:      credits consumed (completed-pipeline leads, lifetime)
+    - limit:     the plan's lifetime credit allowance
+    - remaining: credits left (never below 0)
+    - reset:     null -- credits are lifetime and never reset
+
+    The key/response shape is unchanged so the existing frontend + the
+    OutreachQuotaResponse model keep working; only the semantics moved from
+    "per month" to "lifetime".
     """
     user = get_user(user_id)
     plan = (user or {}).get("plan") or "free"
-    if plan not in PLAN_OUTREACH_LIMIT:
+    if plan not in PLAN_CREDIT_LIMIT:
         plan = "free"
-    limit = PLAN_OUTREACH_LIMIT[plan]
-    used = count_outreach_used(user_id)
-    # Reset is the first of next month (UTC).
-    ms = _month_start_utc()
-    reset = (ms.replace(year=ms.year + 1, month=1) if ms.month == 12
-             else ms.replace(month=ms.month + 1))
+    limit = PLAN_CREDIT_LIMIT[plan]
+    used = count_outreach_used(user_id)  # lifetime
     return {
         "plan": plan,
         "used": used,
         "limit": limit,
         "remaining": max(0, limit - used),
-        "reset": reset.isoformat(),
+        "reset": None,  # lifetime credits never reset
     }
 
 

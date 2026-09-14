@@ -1,9 +1,13 @@
+substitutions:
+  _TAG: latest
 steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
       - '--platform'
       - 'linux/amd64'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/auto-job-apply-1859b/auto-job-apply/frontend:${_TAG}'
       - '-t'
       - 'us-central1-docker.pkg.dev/auto-job-apply-1859b/auto-job-apply/frontend:latest'
       - '-f'
@@ -24,4 +28,5 @@ steps:
       - 'NEXT_PUBLIC_API_URL=https://auto-job-apply-api-831721132982.us-central1.run.app'
       - '.'
 images:
+  - 'us-central1-docker.pkg.dev/auto-job-apply-1859b/auto-job-apply/frontend:${_TAG}'
   - 'us-central1-docker.pkg.dev/auto-job-apply-1859b/auto-job-apply/frontend:latest'

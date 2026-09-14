@@ -440,3 +440,71 @@ def test_get_job_with_company_unknown_id_returns_none():
 
 def test_get_job_with_company_malformed_id_returns_none_not_error():
     assert repo.get_job_with_company("not-a-uuid") is None
+
+
+# ---------------------------------------------------------------------------
+# Credits (lifetime, no reset) -- 1 credit per completed-pipeline lead
+# ---------------------------------------------------------------------------
+
+
+def _mark_sent(user_id: str, lead_id: str, status: str = "sent"):
+    """Move a lead to a credit-consuming terminal state (stamps sent_at)."""
+    from datetime import datetime, timezone
+    repo.update_lead(user_id, lead_id, {"status": status, "sent_at": datetime.now(timezone.utc)})
+
+
+def test_credits_free_plan_has_25_lifetime_and_no_reset():
+    user = _make_user("credits-free")
+    q = repo.get_outreach_quota(user["id"])
+    assert q["plan"] == "free"
+    assert q["limit"] == 25
+    assert q["used"] == 0
+    assert q["remaining"] == 25
+    # Lifetime credits never reset.
+    assert q["reset"] is None
+
+
+def test_credit_consumed_only_by_completed_pipeline_lead():
+    user = _make_user("credits-consume")
+    uid = user["id"]
+
+    # A raw matched lead (never completed the pipeline) costs NOTHING.
+    raw = repo.add_lead(uid, {"company": "Raw Co", "role": "Engineer"})
+    assert repo.get_outreach_quota(uid)["used"] == 0
+
+    # A lead that reaches 'sent' costs 1 credit.
+    sent_lead = repo.add_lead(uid, {"company": "Sent Co", "role": "Engineer"})
+    _mark_sent(uid, sent_lead["id"], "sent")
+    assert repo.get_outreach_quota(uid)["used"] == 1
+
+    # A lead that reaches 'draft_created' also costs 1 credit.
+    draft_lead = repo.add_lead(uid, {"company": "Draft Co", "role": "Engineer"})
+    _mark_sent(uid, draft_lead["id"], "draft_created")
+    q = repo.get_outreach_quota(uid)
+    assert q["used"] == 2
+    assert q["remaining"] == 23  # 25 - 2
+
+
+def test_credits_are_lifetime_not_windowed():
+    """A completed lead sent long ago still counts -- credits never reset."""
+    from datetime import datetime, timezone
+    user = _make_user("credits-lifetime")
+    uid = user["id"]
+    old = repo.add_lead(uid, {"company": "Old Co", "role": "Engineer"})
+    # Stamp sent_at a year in the past; a monthly window would have excluded it.
+    repo.update_lead(uid, old["id"], {
+        "status": "sent",
+        "sent_at": datetime(2020, 1, 1, tzinfo=timezone.utc),
+    })
+    assert repo.get_outreach_quota(uid)["used"] == 1
+
+
+def test_credits_are_per_tenant_isolated():
+    a = _make_user("credits-a")
+    b = _make_user("credits-b")
+    la = repo.add_lead(a["id"], {"company": "A Co", "role": "Eng"})
+    _mark_sent(a["id"], la["id"], "sent")
+    # A consumed 1 credit; B's balance is untouched.
+    assert repo.get_outreach_quota(a["id"])["used"] == 1
+    assert repo.get_outreach_quota(b["id"])["used"] == 0
+    assert repo.get_outreach_quota(b["id"])["remaining"] == 25

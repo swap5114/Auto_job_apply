@@ -167,7 +167,7 @@ class OutreachQuotaResponse(BaseModel):
     used: int
     limit: int
     remaining: int
-    reset: str  # ISO timestamp of when the monthly allowance resets
+    reset: Optional[str] = None  # null for lifetime credits (no reset); ISO ts otherwise
 
 
 class EditRequest(BaseModel):
@@ -1300,9 +1300,11 @@ def get_stats(user_id: str = Depends(get_authenticated_user_id)):
 
 @app.get("/api/outreach/quota", response_model=OutreachQuotaResponse)
 def get_outreach_quota_route(user_id: str = Depends(get_authenticated_user_id)):
-    """The caller's outreach quota for the current month — the single source
-    of truth for the "outreach left" card. `used` counts leads sent this
-    month; `limit` is derived from the user's plan."""
+    """The caller's LIFETIME credit balance — the single source of truth for
+    the "credits left" card. 1 credit = 1 completed-pipeline lead (reached
+    sent/draft_created). `used` counts those leads for the lifetime of the
+    account; `limit` is the plan's lifetime allowance (free=25); `reset` is
+    null because credits never reset."""
     q = repo.get_outreach_quota(user_id)
     return OutreachQuotaResponse(**q)
 

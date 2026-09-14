@@ -3,11 +3,12 @@ import type { Stats } from "@/lib/api";
 /**
  * Outreach quota.
  *
- * The backend is the source of truth: GET /api/outreach/quota returns
- * { plan, used, limit, remaining, reset } computed from the user's plan and
- * the leads they've sent this month. Use `quotaFromApi` to shape that
- * response for the UI. `deriveQuota` (from stats) remains only as an offline
- * fallback if the quota request fails.
+ * Credits (lifetime, no reset). The backend is the source of truth: GET
+ * /api/outreach/quota returns { plan, used, limit, remaining, reset } where
+ * 1 credit = 1 completed-pipeline lead (reached sent/draft_created), used is
+ * the lifetime count, and reset is null (credits never reset). Use
+ * `quotaFromApi` to shape that response for the UI. `deriveQuota` (from
+ * stats) remains only as an offline fallback if the quota request fails.
  */
 
 export type Plan = "free" | "pro" | "power";
@@ -49,18 +50,16 @@ function normalizePlan(plan?: string | null): Plan {
   return "free";
 }
 
-/** Label for the first of next month, e.g. "Resets Jul 1". */
-function nextResetLabel(): string {
-  const now = new Date();
-  const next = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-  return `Resets ${next.toLocaleDateString(undefined, { month: "short", day: "numeric" })}`;
-}
-
-/** "Resets Jul 1" from a backend ISO reset timestamp. */
-function resetLabelFrom(iso?: string): string {
-  if (!iso) return nextResetLabel();
+/**
+ * Label for the credit allowance. Credits are now LIFETIME (no reset), so a
+ * null/empty reset from the backend renders as "Lifetime credits" rather
+ * than a fake future reset date. A real ISO timestamp (should not happen for
+ * lifetime credits) still renders as a reset date for forward-compat.
+ */
+function resetLabelFrom(iso?: string | null): string {
+  if (!iso) return "Lifetime credits";
   const d = new Date(iso);
-  if (isNaN(d.getTime())) return nextResetLabel();
+  if (isNaN(d.getTime())) return "Lifetime credits";
   return `Resets ${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })}`;
 }
 
@@ -73,7 +72,7 @@ export function quotaFromApi(res: {
   used: number;
   limit: number;
   remaining: number;
-  reset: string;
+  reset?: string | null;
 }): OutreachQuota {
   const p = normalizePlan(res.plan);
   const limit = res.limit;
@@ -113,6 +112,6 @@ export function deriveQuota(stats: Stats | null, plan?: string | null): Outreach
     pct,
     nearLimit: remaining > 0 && pct >= 0.8,
     exhausted: remaining <= 0,
-    resetLabel: nextResetLabel(),
+    resetLabel: "Lifetime credits",
   };
 }
