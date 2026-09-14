@@ -149,3 +149,46 @@ def test_contact_email_cache_is_cross_user(monkeypatch):
 
     assert repo.get_lead(user_a["id"], lead_a["id"])["contact_email"] == "founder@acme.com"
     assert repo.get_lead(user_b["id"], lead_b["id"])["contact_email"] == "founder@acme.com"
+
+
+def test_tailor_resume_and_base_resume_multi_tenant_isolation(monkeypatch):
+    """User A and User B have separate primary resumes in DB.
+    load_base_resume(user_id) must return each user's own profile, and
+    tailor_resume_for_lead must use the correct user's profile and user-scoped file prefix.
+    """
+    import skills.tailor_resume as tr
+
+    user_a = _make_user("resume-a")
+    user_b = _make_user("resume-b")
+
+    resume_a_data = {
+        "name": "User Alpha",
+        "contact": {"email": "alpha@example.com", "github": "https://github.com/alphauser"},
+        "summary": "Alpha developer",
+    }
+    resume_b_data = {
+        "name": "User Beta",
+        "contact": {"email": "beta@example.com", "github": "https://github.com/betauser"},
+        "summary": "Beta developer",
+    }
+
+    repo.add_resume(user_a["id"], file_ref="alpha.pdf", parsed_json=resume_a_data, is_primary=True)
+    repo.add_resume(user_b["id"], file_ref="beta.pdf", parsed_json=resume_b_data, is_primary=True)
+
+    # 1. Verify load_base_resume loads correct user profile
+    assert tr.load_base_resume(user_a["id"])["name"] == "User Alpha"
+    assert tr.load_base_resume(user_b["id"])["name"] == "User Beta"
+
+    # 2. Verify tailor_resume_for_lead uses lead's user_id and creates user-prefixed filename
+    monkeypatch.setattr(tr, "llm_generate_json", lambda system_prompt, user_message, max_tokens: resume_a_data if "Alpha" in user_message else resume_b_data)
+
+    lead_a = {"user_id": user_a["id"], "company": "Mux", "role": "Engineer", "jd_text": "Engineering role"}
+    res_a = tr.tailor_resume_for_lead(lead_a)
+
+    lead_b = {"user_id": user_b["id"], "company": "Mux", "role": "Engineer", "jd_text": "Engineering role"}
+    res_b = tr.tailor_resume_for_lead(lead_b)
+
+    assert tr.slugify(user_a["id"]) in res_a["resume_version"]
+    assert tr.slugify(user_b["id"]) in res_b["resume_version"]
+    assert res_a["resume_version"] != res_b["resume_version"]
+

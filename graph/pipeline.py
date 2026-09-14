@@ -52,6 +52,7 @@ class PipelineState(TypedDict, total=False):
     outreach_draft: Optional[str]
     review_decision: Optional[str]
     status: str
+    sent_at: Optional[str]  # ISO timestamp the outreach was sent (for reply-window scoping, M-1)
     is_followup: bool
     followup_count: int
     listing_url: Optional[str]
@@ -88,15 +89,33 @@ def find_email_node(state: PipelineState) -> Dict[str, Any]:
         }
         result = find_contact_email_for_lead(lead)
         
-        if result.get("contact_email"):
-            print(f"  📧 find_email_node: found email for {company}")
+        user_id = state.get("user_id")
+        email = result.get("contact_email")
+        name = result.get("contact_name")
+        if email:
+            print(f"  📧 find_email_node: found email for {company}: {email}")
+            if user_id and lead_id:
+                try:
+                    from db import repository as repo
+                    fields = {"contact_email": email, "failure_reason": None}
+                    if name:
+                        fields["contact_name"] = name
+                    repo.update_lead(user_id, lead_id, fields)
+                except Exception as db_err:
+                    print(f"  ⚠️  find_email_node: failed to persist email to DB: {db_err}")
             return {
-                "contact_email": result["contact_email"],
-                "contact_name": result.get("contact_name"),
+                "contact_email": email,
+                "contact_name": name,
                 "status": "email_found",
             }
         else:
             print(f"  ⚠️  find_email_node: no email found for {company}")
+            if user_id and lead_id:
+                try:
+                    from db import repository as repo
+                    repo.update_lead(user_id, lead_id, {"failure_reason": "no_contact_found"})
+                except Exception:
+                    pass
             return {"status": "email_not_found"}
     except Exception as e:
         print(f"  ❌ find_email_node failed for {company}: {e}")
@@ -154,8 +173,9 @@ def tailor_resume_node(state: PipelineState) -> Dict[str, Any]:
         return {"status": "tailor_skipped"}
     
     try:
-        # Mock lead dict for the skill function
         lead = {
+            "id": state.get("lead_id", ""),
+            "user_id": state.get("user_id"),
             "company": company,
             "role": role,
             "jd_text": jd_text,
@@ -290,8 +310,7 @@ def followup_check_node(state: PipelineState) -> Dict[str, Any]:
         get_gmail_service,
         check_thread_for_reply,
         days_since_sent,
-        FOLLOWUP_DAYS,
-        MAX_FOLLOWUPS,
+        get_max_followups,
         _now_iso,
     )
 
@@ -301,7 +320,8 @@ def followup_check_node(state: PipelineState) -> Dict[str, Any]:
     user_id = state.get("user_id")
     followup_count = int(state.get("followup_count") or 0)
 
-    if followup_count >= MAX_FOLLOWUPS:
+    # H-2: read the cap live so a Settings change is honored without restart.
+    if followup_count >= get_max_followups():
         print(f"  ⏭️  followup_check: {company} — max follow-ups reached")
         return {"status": "max_followups_reached"}
 
@@ -313,7 +333,10 @@ def followup_check_node(state: PipelineState) -> Dict[str, Any]:
         except NoGmailConnected:
             print(f"  ⚠️  followup_check: {company} — user has no Gmail connected, skipping")
             return {"status": "followup_check_skipped"}
-        has_reply = check_thread_for_reply(service, contact_email, "")
+        sent_at = state.get("sent_at") or ""
+        if not isinstance(sent_at, str):
+            sent_at = str(sent_at) if sent_at else ""
+        has_reply = check_thread_for_reply(service, contact_email, sent_at)
 
         if has_reply:
             print(f"  💬 followup_check: {company} — reply detected!")

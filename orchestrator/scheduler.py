@@ -50,20 +50,43 @@ def load_schedule_config() -> dict:
 # ---------------------------------------------------------------------------
 
 def _sourcing_job(params: dict | None = None):
-    """Scheduled sourcing job."""
+    """Scheduled sourcing job — runs the sourcing pipeline for EVERY tenant.
+
+    Fix (C-2): a scheduled sweep has no single "current user"; it must
+    iterate all users and run each one scoped to their own user_id, or the
+    old db.current_user fallback silently collapsed every tenant's
+    scheduled sourcing onto one operator account.
+    """
+    from db import repository as repo
+
     params = params or {}
-    print(f"\n🕐 [SCHEDULER] Triggering sourcing pipeline at {datetime.now().isoformat()}")
-    run_sourcing_pipeline(
-        sources=params.get("sources"),
-        yc_max_leads=params.get("yc_max_leads", 15),
-        x_max_leads=params.get("x_max_leads", 5),
-    )
+    print(f"\n🕐 [SCHEDULER] Triggering sourcing pipeline for all tenants at {datetime.now().isoformat()}")
+    user_ids = repo.get_all_user_ids()
+    print(f"  [SCHEDULER] sourcing sweep over {len(user_ids)} user(s)")
+    for user_id in user_ids:
+        try:
+            run_sourcing_pipeline(
+                sources=params.get("sources"),
+                yc_max_leads=params.get("yc_max_leads", 15),
+                x_max_leads=params.get("x_max_leads", 5),
+                user_id=user_id,
+            )
+        except Exception as e:
+            print(f"  ❌ [SCHEDULER] sourcing failed for user {user_id}: {e}")
 
 
 def _followup_job():
-    """Scheduled follow-up job."""
-    print(f"\n🕐 [SCHEDULER] Triggering follow-up pipeline at {datetime.now().isoformat()}")
-    run_followup_pipeline()
+    """Scheduled follow-up job — checks follow-ups for EVERY tenant (C-2)."""
+    from db import repository as repo
+
+    print(f"\n🕐 [SCHEDULER] Triggering follow-up pipeline for all tenants at {datetime.now().isoformat()}")
+    user_ids = repo.get_all_user_ids()
+    print(f"  [SCHEDULER] follow-up sweep over {len(user_ids)} user(s)")
+    for user_id in user_ids:
+        try:
+            run_followup_pipeline(user_id=user_id)
+        except Exception as e:
+            print(f"  ❌ [SCHEDULER] follow-up failed for user {user_id}: {e}")
 
 
 def _catalog_refresh_job(params: dict | None = None):

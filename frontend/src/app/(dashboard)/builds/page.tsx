@@ -70,17 +70,20 @@ export default function BuildsPage() {
         api.demos.list().catch(() => []),
         api.demos.quota().catch(() => ({ date: "", used: 0, limit: 5, remaining: 5 })),
       ]);
-      setBuilds(listData as any[]);
+      const list = (listData as any[]) || [];
+      setBuilds(list);
       setQuota(quotaData);
       setError(null);
 
-      // If active build is running, update activeBuild reference
-      if (activeBuild) {
-        const updated = (listData as any[]).find((b) => b.build_id === activeBuild.build_id);
-        if (updated) setActiveBuild(updated);
-      } else if ((listData as any[]).length > 0 && !activeBuild) {
-        setActiveBuild((listData as any[])[0]);
-      }
+      // Prioritize updating activeBuild or selecting an in-progress build
+      setActiveBuild((prev) => {
+        if (prev) {
+          const updated = list.find((b) => b.build_id === prev.build_id);
+          if (updated) return updated;
+        }
+        const inProgress = list.find((b) => b.running || b.stage === "building" || b.stage === "pending");
+        return inProgress || list[0] || null;
+      });
     } catch (e: any) {
       setError(e?.message || "Failed to load builds");
     } finally {
@@ -90,9 +93,9 @@ export default function BuildsPage() {
 
   useEffect(() => {
     loadData();
-    const interval = setInterval(loadData, 4000);
+    const interval = setInterval(loadData, 3000);
     return () => clearInterval(interval);
-  }, [activeBuild?.build_id]);
+  }, []);
 
   async function handleStartBuild(e: React.FormEvent) {
     e.preventDefault();
@@ -144,10 +147,10 @@ export default function BuildsPage() {
   return (
     <PageTransition>
       <Header
-        title="AI Demo Studio & Deployment Sandbox"
-        description="Generate, verify in Docker, export to GitHub, and deploy live full-stack apps"
+        title="Demo Studio"
+        description="Generate a working demo for a company, then deploy it live to share in your outreach"
         action={
-          <div className="flex items-center gap-3">
+          <>
             {quota && (
               <Badge variant="outline" className="px-3 py-1 text-xs">
                 Quota: {quota.used} / {quota.limit} demos used today
@@ -157,7 +160,7 @@ export default function BuildsPage() {
               <Plus className="mr-2 h-4 w-4" />
               Build New Demo Idea
             </Button>
-          </div>
+          </>
         }
       />
 
@@ -166,6 +169,22 @@ export default function BuildsPage() {
           {error} — check if FastAPI server is running on port 8000.
         </div>
       )}
+
+      {/* Cloud Account Deploy Banner */}
+      <div className="mb-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 rounded-xl border border-accent1/20 bg-accent1/5 px-4 py-3 text-xs text-muted-foreground">
+        <div className="flex items-center gap-2">
+          <Sparkles className="h-4 w-4 text-accent1 shrink-0" />
+          <span>
+            Demos are automatically created under your own <strong>GitHub</strong> repository and deployed live to your <strong>Vercel</strong> &amp; <strong>Render</strong> accounts.
+          </span>
+        </div>
+        <Link
+          href="/settings"
+          className="font-medium text-accent1 hover:underline whitespace-nowrap self-start sm:self-auto"
+        >
+          Manage Cloud Accounts &rarr;
+        </Link>
+      </div>
 
       {/* New Build Modal/Card */}
       {showNewForm && (
@@ -209,11 +228,10 @@ export default function BuildsPage() {
                       key={type}
                       type="button"
                       onClick={() => setProjectType(type)}
-                      className={`rounded-lg border px-3 py-2 text-xs font-medium capitalize transition-colors ${
-                        projectType === type
-                          ? "border-primary bg-primary text-primary-foreground"
-                          : "border-border bg-background text-muted-foreground hover:bg-muted"
-                      }`}
+                      className={`rounded-lg border px-3 py-2 text-xs font-medium capitalize transition-colors ${projectType === type
+                        ? "border-primary bg-primary text-primary-foreground"
+                        : "border-border bg-background text-muted-foreground hover:bg-muted"
+                        }`}
                     >
                       {type.replace("_", " ")}
                     </button>
@@ -256,8 +274,8 @@ export default function BuildsPage() {
                         activeBuild.stage === "success" && activeBuild.deploy_stage === "deployed"
                           ? "sent"
                           : activeBuild.stage === "failed" || activeBuild.deploy_stage === "deploy_failed"
-                          ? "rejected"
-                          : "review"
+                            ? "rejected"
+                            : "review"
                       }
                     >
                       {activeBuild.deploy_stage || activeBuild.stage}
@@ -394,15 +412,25 @@ export default function BuildsPage() {
                 )}
               </div>
 
-              <div className="flex-1 bg-background min-h-[500px]">
+              <div className="flex-1 bg-background min-h-[60vh] lg:min-h-[500px]">
                 {activeBuild.frontend_url || activeBuild.backend_url ? (
                   <iframe
                     src={activeBuild.frontend_url || activeBuild.backend_url || undefined}
                     className="h-full w-full border-0"
                     title="Live Demo Preview"
                   />
+                ) : activeBuild.stage === "failed" || activeBuild.deploy_stage === "deploy_failed" ? (
+                  <div className="flex h-full min-h-[60vh] flex-col items-center justify-center text-center p-6 lg:min-h-[500px]">
+                    <div className="flex h-12 w-12 items-center justify-center rounded-full bg-red-500/10 mb-3">
+                      <XCircle className="h-6 w-6 text-red-500" />
+                    </div>
+                    <p className="text-sm font-semibold text-foreground">Build or Deployment Failed</p>
+                    <p className="text-xs text-muted-foreground mt-1 max-w-md">
+                      {activeBuild.deploy_error || activeBuild.error || "The sandbox build or deployment encountered an error. You can submit revisions via Refine & Edit Demo."}
+                    </p>
+                  </div>
                 ) : (
-                  <div className="flex h-full min-h-[500px] flex-col items-center justify-center text-center p-6">
+                  <div className="flex h-full min-h-[60vh] flex-col items-center justify-center text-center p-6 lg:min-h-[500px]">
                     <Loader2 className="h-8 w-8 animate-spin text-accent1 mb-3" />
                     <p className="text-sm font-medium text-foreground">Building & Deploying Sandbox...</p>
                     <p className="text-xs text-muted-foreground mt-1 max-w-sm">
@@ -429,7 +457,7 @@ export default function BuildsPage() {
             No demo builds generated yet. Click &quot;Build New Demo Idea&quot; above to create one.
           </div>
         ) : (
-          <div className="overflow-hidden rounded-2xl border bg-card shadow-elevation-low">
+          <div className="overflow-hidden rounded-2xl border border-border/70 bg-card shadow-card">
             <table className="w-full">
               <thead>
                 <tr className="border-b bg-muted/40">
@@ -444,9 +472,8 @@ export default function BuildsPage() {
                 {builds.map((b) => (
                   <tr
                     key={b.build_id}
-                    className={`border-b border-border/60 transition-colors last:border-0 hover:bg-muted/30 ${
-                      activeBuild?.build_id === b.build_id ? "bg-accent1/5" : ""
-                    }`}
+                    className={`border-b border-border/60 transition-colors last:border-0 hover:bg-muted/30 ${activeBuild?.build_id === b.build_id ? "bg-accent1/5" : ""
+                      }`}
                   >
                     <td className="px-5 py-3.5">
                       <p className="text-sm font-medium text-foreground">{b.title || "Untitled Demo"}</p>

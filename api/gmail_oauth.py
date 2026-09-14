@@ -31,11 +31,16 @@ import uuid
 
 from cryptography.fernet import Fernet, InvalidToken
 
-# Restricted scopes: create drafts + send. openid/email let us read which
-# Gmail address the user actually connected (stored for display + as sender).
+# Google often returns additional scopes (e.g. userinfo.profile) beyond what
+# we request.  Without this flag oauthlib treats the mismatch as a fatal error.
+os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
+
+# Restricted scopes: create drafts + send. openid/email/profile let us read
+# which Gmail address the user actually connected (stored for display + as sender).
 SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/gmail.send",
 ]
@@ -86,10 +91,11 @@ def decrypt_token(ciphertext: str) -> str:
 # OAuth `state` signing (carries user_id + send_mode through the redirect)
 # ---------------------------------------------------------------------------
 
-def sign_state(user_id: str, send_mode: str) -> str:
+def sign_state(user_id: str, send_mode: str, code_verifier: str = "") -> str:
     payload = json.dumps({
         "user_id": user_id,
         "send_mode": send_mode,
+        "code_verifier": code_verifier,
         "nonce": uuid.uuid4().hex,
         "ts": int(time.time()),
     })
@@ -115,7 +121,7 @@ def verify_state(state: str) -> dict:
         raise GmailOAuthStateError("OAuth state expired -- please reconnect")
     if not data.get("user_id"):
         raise GmailOAuthStateError("OAuth state missing user_id")
-    return {"user_id": data["user_id"], "send_mode": data.get("send_mode", "draft")}
+    return {"user_id": data["user_id"], "send_mode": data.get("send_mode", "draft"), "code_verifier": data.get("code_verifier", "")}
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +161,11 @@ def _build_flow():
     from google_auth_oauthlib.flow import Flow
 
     redirect_uri = (os.getenv("GMAIL_OAUTH_REDIRECT_URI") or "").strip()
+    if redirect_uri.startswith("http://"):
+        os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+    # Google often returns extra scopes (e.g. userinfo.profile) beyond what we
+    # requested. Without this flag oauthlib treats the mismatch as an error.
+    os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
     return Flow.from_client_config(
         _client_config(),
         scopes=SCOPES,
@@ -167,13 +178,25 @@ def build_consent_url(user_id: str, send_mode: str = "draft") -> str:
     """Build the Google consent URL for a user to connect their Gmail.
 
     access_type=offline + prompt=consent guarantees Google returns a refresh
-    token (not just an access token), which is what we persist."""
+    token (not just an access token), which is what we persist.
+
+    PKCE: google_auth_oauthlib auto-generates a code_verifier when calling
+    authorization_url().  We embed it in the encrypted state so the callback
+    can restore it on a fresh Flow before fetch_token()."""
     flow = _build_flow()
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
-        state=sign_state(user_id, send_mode),
+    )
+    # Capture the PKCE code_verifier the library generated
+    code_verifier = getattr(flow, "code_verifier", "") or ""
+    # Re-generate auth_url with our signed state that carries the code_verifier
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+        state=sign_state(user_id, send_mode, code_verifier),
     )
     return auth_url
 
@@ -186,10 +209,29 @@ def exchange_code_for_account(code: str, state: str) -> dict:
     verified = verify_state(state)
 
     flow = _build_flow()
+    # Restore the PKCE code_verifier from the signed state so Google accepts
+    # the token exchange.
+    code_verifier = verified.get("code_verifier", "")
+    if code_verifier:
+        flow.code_verifier = code_verifier
     flow.fetch_token(code=code)
     creds = flow.credentials
 
-    if not creds.refresh_token:
+    refresh_token = creds.refresh_token
+    existing = None
+    try:
+        from db import repository as repo
+        existing = repo.get_gmail_account(verified["user_id"])
+    except Exception:
+        pass
+
+    if not refresh_token and existing and existing.get("encrypted_refresh_token"):
+        try:
+            refresh_token = decrypt_token(existing["encrypted_refresh_token"])
+        except Exception:
+            pass
+
+    if not refresh_token:
         # Without a refresh token we can't send later without re-consent.
         raise GmailOAuthConfigError(
             "Google did not return a refresh token. Ensure the consent screen "
@@ -197,12 +239,14 @@ def exchange_code_for_account(code: str, state: str) -> dict:
         )
 
     email = _email_from_credentials(creds)
+    if not email and existing and existing.get("email"):
+        email = existing["email"]
 
     return {
         "user_id": verified["user_id"],
         "send_mode": verified["send_mode"],
         "email": email,
-        "refresh_token": creds.refresh_token,
+        "refresh_token": refresh_token,
         "scopes": list(creds.scopes or SCOPES),
     }
 
@@ -233,7 +277,21 @@ def _email_from_credentials(creds) -> str:
             timeout=10,
         )
         if resp.ok:
-            return resp.json().get("email", "") or ""
+            email = resp.json().get("email", "") or ""
+            if email:
+                return email
+    except Exception:
+        pass
+    # Fall back to unverified JWT payload decode
+    try:
+        if getattr(creds, "id_token", None):
+            import base64
+            payload = creds.id_token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            data = json.loads(base64.b64decode(payload).decode("utf-8"))
+            email = data.get("email")
+            if email:
+                return email
     except Exception:
         pass
     return ""

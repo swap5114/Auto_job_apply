@@ -53,10 +53,19 @@
     /* Grid line color (crosshair aesthetic) */
     --grid-line: 220 13% 91%;
 
-    /* Accent — signature SaaS gradient (indigo -> violet), used sparingly */
-    --accent-1: 243 75% 59%;
-    --accent-2: 262 83% 58%;
-    --accent-soft: 243 75% 96%;
+    /* Accent — softened to a calm pastel coral/peach (lower saturation,
+       lighter) so it reads warm and branded without shouting. accent-1 is
+       the coral, accent-2 a soft peach for gentle gradient depth, accent-soft
+       the very light tint used for chips/rings. */
+    --accent-1: 14 82% 63%;
+    --accent-2: 28 88% 68%;
+    --accent-soft: 20 90% 96%;
+
+    /* Brand accent — matches the pastel coral above; used sparingly for
+       highlights, connectors, and micro-labels. */
+    --brand: 14 82% 63%;
+    --brand-foreground: 0 0% 100%;
+    --brand-soft: 20 90% 96%;
 
     /* Radius (Cal.com scale) */
     --radius-sm: 0.125rem;
@@ -104,6 +113,37 @@
     font-family: "Cal Sans", var(--font-geist-sans), system-ui, sans-serif;
     letter-spacing: -0.02em;
     font-weight: 600;
+  }
+
+  /* Extra-tight display treatment for large marketing headlines
+     (Tsenta-style: big, dense, near-black). */
+  .font-display-tight {
+    font-family: "Cal Sans", var(--font-geist-sans), system-ui, sans-serif;
+    letter-spacing: -0.035em;
+    line-height: 0.98;
+    font-weight: 600;
+  }
+
+  /* Small uppercase mono-ish eyebrow label ("01 · FIND"). */
+  .eyebrow {
+    font-family: var(--font-geist-mono), ui-monospace, monospace;
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: hsl(var(--muted-foreground));
+  }
+
+  /* Brand accent helpers */
+  .text-brand {
+    color: hsl(var(--brand));
+  }
+
+  .bg-brand {
+    background-color: hsl(var(--brand));
+  }
+
+  .border-brand {
+    border-color: hsl(var(--brand));
   }
 
   /* Crosshair marker used at grid intersections */

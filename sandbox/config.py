@@ -83,6 +83,12 @@ DEFAULT_MAX_ATTEMPTS = int(os.getenv("DEMO_MAX_RETRIES", "2"))
 # command's default COMMAND_TIMEOUT.
 KIRO_TURN_TIMEOUT = int(os.getenv("KIRO_TURN_TIMEOUT", "900"))  # 15 min
 
+# Timeout (seconds) for the build verification step that runs inside the
+# container after AI code generation — npm install + npm run build, pip
+# install, etc. Shorter than a full Kiro turn since it's just running
+# pre-existing build commands, not generating code.
+BUILD_VERIFY_TIMEOUT = int(os.getenv("BUILD_VERIFY_TIMEOUT", "120"))  # 2 min
+
 # ---------------------------------------------------------------------------
 # GitHub deploy (Task 4)
 # ---------------------------------------------------------------------------

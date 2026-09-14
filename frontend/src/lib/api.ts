@@ -71,6 +71,9 @@ export interface Lead {
   posted_date: string;
   domain: string;
   review_decision: string;
+  // ATS keyword-coverage % for the tailored resume (0-100), or null if the
+  // resume hasn't been tailored yet.
+  keyword_coverage: number | null;
   // Phase 5 (Apply channel) additions.
   channel: string[];
   cover_note: string;
@@ -374,14 +377,14 @@ export const api = {
     }) => request<DemoBuildStatus>("/demos/build", { method: "POST", body: JSON.stringify(data) }),
 
     refine: (buildId: string, prompt: string) =>
-      request<DemoBuildStatus>(`/demos/build/${buildId}/refine`, {
+      request<DemoBuildStatus>(`/demos/${buildId}/refine`, {
         method: "POST",
         body: JSON.stringify({ prompt }),
       }),
 
     get: (buildId: string) => request<DemoBuildStatus>(`/demos/build/${buildId}`),
 
-    list: () => request<DemoBuildSummary[]>("/demos/list"),
+    list: () => request<DemoBuildItem[]>("/demos"),
 
     quota: () =>
       request<{ date: string; used: number; limit: number; remaining: number }>("/demos/quota"),
@@ -473,6 +476,16 @@ export const api = {
     get: () => request<Stats>("/stats"),
   },
 
+  outreach: {
+    // Outreach quota for the current month — the backend source of truth
+    // (GET /api/outreach/quota). `used` counts leads sent this month; `limit`
+    // is derived server-side from the user's plan.
+    quota: () =>
+      request<{ plan: string; used: number; limit: number; remaining: number; reset: string }>(
+        "/outreach/quota"
+      ),
+  },
+
   pipeline: {
     // On-demand full pipeline run (the "Run Pipeline" button)
     run: (opts?: RunPipelineOptions) =>
@@ -482,6 +495,11 @@ export const api = {
       }),
 
     runStatus: () => request<PipelineRunState>("/pipeline/run-status"),
+
+    // Abort an in-progress run. Backend endpoint to be implemented; the
+    // frontend calls POST /pipeline/abort and then refreshes run-status.
+    abort: () =>
+      request<{ status: string }>("/pipeline/abort", { method: "POST" }),
 
     // Start the outreach pipeline on a specific set of already-saved leads
     // (the hero-chat "approve these startups" bridge, Task 10).
@@ -540,6 +558,8 @@ export const api = {
           skipped_no_email: number;
           skipped_no_draft: number;
           failed: number;
+          skipped_quota: number;
+          quota_limit?: number;
           total: number;
           error: string | null;
         };
@@ -625,24 +645,5 @@ export const api = {
         body: formData,
       });
     },
-  },
-
-  demos: {
-    list: () => request<DemoBuildItem[]>("/demos"),
-
-    quota: () =>
-      request<{ date: string; used: number; limit: number; remaining: number }>("/demos/quota"),
-
-    build: (data: { title: string; description: string; company_name?: string; project_type?: string }) =>
-      request<DemoBuildStatus>("/demos/build", {
-        method: "POST",
-        body: JSON.stringify(data),
-      }),
-
-    refine: (build_id: string, prompt: string) =>
-      request<DemoBuildStatus>(`/demos/${build_id}/refine`, {
-        method: "POST",
-        body: JSON.stringify({ prompt }),
-      }),
   },
 };

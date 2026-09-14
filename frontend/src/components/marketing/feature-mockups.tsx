@@ -32,7 +32,7 @@ export function SourcingOrbitMockup() {
 
       {/* Center */}
       <div className="z-10 flex items-center rounded-full border bg-card px-3 py-1.5 shadow-elevation-low">
-        <span className="text-xs font-semibold text-foreground">AutoApply</span>
+        <span className="text-xs font-semibold text-foreground">Outra</span>
       </div>
 
       {/* Orbiting source icons */}

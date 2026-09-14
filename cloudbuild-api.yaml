@@ -1,0 +1,11 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: [
+      'build',
+      '--platform', 'linux/amd64',
+      '-t', 'us-central1-docker.pkg.dev/auto-job-apply-1859b/auto-job-apply/api:latest',
+      '-f', 'docker/Dockerfile.api',
+      '.'
+    ]
+images:
+  - 'us-central1-docker.pkg.dev/auto-job-apply-1859b/auto-job-apply/api:latest'

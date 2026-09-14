@@ -16,5 +16,6 @@ venv/
 .venv/
 env/
 .env.local
+sandbox_output/
 .vscode/
 .idea/

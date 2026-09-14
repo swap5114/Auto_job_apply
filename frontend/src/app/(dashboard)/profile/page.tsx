@@ -217,7 +217,7 @@ export default function ProfilePage() {
                 placeholder="e.g. Python, React, Postgres…"
               />
               <Separator />
-              <div className="grid grid-cols-2 gap-6">
+              <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
                 <div className="space-y-2">
                   <label className="text-sm font-medium text-foreground">Seniority</label>
                   <Input

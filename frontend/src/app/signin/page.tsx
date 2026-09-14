@@ -3,7 +3,9 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { Loader2, Zap } from "lucide-react";
+import { Loader2 } from "lucide-react";
+import { OutraLogo } from "@/components/ui/outra-logo";
+import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { useAuth } from "@/lib/auth-context";
 import { api } from "@/lib/api";
@@ -20,33 +22,34 @@ import { getAnonSession, clearAnonSession } from "@/lib/anon-session";
  * anonymous flow skip straight to the dashboard with an empty profile.
  */
 export default function SignInPage() {
-  const { user, loading, signInWithGoogle } = useAuth();
+  const { user, signInWithGoogle, loading: authLoading } = useAuth();
   const router = useRouter();
   const [signingIn, setSigningIn] = useState(false);
 
-  // Already signed in (e.g. visiting /signin directly while authenticated)
-  // -- nothing to convert here since that already happened on first sign-in.
   useEffect(() => {
-    if (!loading && user) {
+    // If already signed in when reaching this page, skip to dashboard.
+    if (!authLoading && user) {
       router.replace("/dashboard");
     }
-  }, [loading, user, router]);
+  }, [user, authLoading, router]);
 
-  async function handleSignIn() {
-    setSigningIn(true);
+  async function handleGoogleSignIn() {
     try {
-      await signInWithGoogle();
+      setSigningIn(true);
+      const authenticatedUser = await signInWithGoogle();
 
-      const anon = getAnonSession();
-      if (anon) {
+      // Convert any anonymous session data created before sign-in (Phase 3.6)
+      const anonData = getAnonSession();
+      if (anonData) {
         try {
-          await api.account.convertAnonSession(anon.parsed_resume, anon.inferred_criteria);
+          await api.account.convertAnonSession(
+            anonData.parsed_resume,
+            anonData.inferred_criteria,
+          );
           clearAnonSession();
-          toast.success("Welcome! Your resume and matches are saved to your account.");
         } catch (e: any) {
-          // Sign-in itself succeeded -- don't block getting into the
-          // dashboard over a conversion hiccup, just surface it.
-          toast.error(e?.message || "Signed in, but couldn't save your prior resume upload.");
+          console.error("Failed to convert anonymous session:", e);
+          toast.error("Signed in, but saving your initial resume data failed. You can re-upload on your Profile page.");
         }
       }
 
@@ -60,23 +63,22 @@ export default function SignInPage() {
 
   return (
     <div className="flex min-h-screen flex-col items-center justify-center gap-8 px-6">
-      <Link href="/" className="flex items-center gap-2">
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary">
-          <Zap className="h-4 w-4 text-primary-foreground" />
-        </div>
-        <span className="font-display text-lg text-foreground">AutoApply</span>
+      <Link href="/" className="flex items-center">
+        <OutraLogo size="lg" />
       </Link>
 
       <div className="w-full max-w-sm rounded-2xl border bg-card p-8 text-center shadow-dropdown">
-        <h1 className="font-display text-2xl text-foreground">Sign in to continue</h1>
+        <h1 className="font-display text-2xl text-foreground sm:text-3xl">Sign in to continue</h1>
         <p className="mt-2 text-sm text-muted-foreground">
           Save your resume, matches, and outreach — all tied to your account.
         </p>
 
-        <button
-          onClick={handleSignIn}
-          disabled={signingIn || loading}
-          className="mt-6 inline-flex w-full items-center justify-center gap-2.5 rounded-[10px] border border-input bg-background px-5 py-2.5 text-sm font-medium text-foreground shadow-[0px_2px_3px_0px_rgba(0,0,0,0.03)] transition-colors hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
+        <Button
+          variant="outline"
+          size="lg"
+          onClick={handleGoogleSignIn}
+          disabled={signingIn || authLoading}
+          className="mt-6 w-full gap-2.5"
         >
           {signingIn ? (
             <Loader2 className="h-4 w-4 animate-spin" />
@@ -84,7 +86,7 @@ export default function SignInPage() {
             <GoogleIcon className="h-4 w-4" />
           )}
           Continue with Google
-        </button>
+        </Button>
       </div>
     </div>
   );

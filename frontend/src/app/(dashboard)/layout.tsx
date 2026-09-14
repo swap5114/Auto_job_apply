@@ -17,8 +17,9 @@ export default function DashboardLayout({
 
           <TopBar />
 
-          {/* Content — padded to clear the floating top bar */}
-          <main className="mx-auto max-w-6xl px-4 pt-24">{children}</main>
+          {/* Content — padded to clear the floating top bar. Wider container
+              so data-dense pages (dashboard, applications) use the full page. */}
+          <main className="mx-auto max-w-[1400px] px-4 pt-24 sm:px-6 lg:px-8">{children}</main>
         </div>
       </PipelineProvider>
     </RequireAuth>

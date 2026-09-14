@@ -86,6 +86,9 @@ def check_and_queue_followups(user_id: Optional[str] = None) -> int:
             "followup_count": int(lead.get("followup_count") or 0),
             "is_followup": False,  # followup_check_node will set this if needed
             "status": "sent",
+            # M-1: pass the sent timestamp so reply detection only looks at
+            # mail received after we actually reached out.
+            "sent_at": (str(lead.get("sent_at")) if lead.get("sent_at") else ""),
         }
 
         try:
@@ -97,8 +100,20 @@ def check_and_queue_followups(user_id: Optional[str] = None) -> int:
             final_state = graph.get_state(config)
             if final_state and final_state.next and "review" in final_state.next:
                 queued += 1
-                _safe_update(user_id, lead_id, {"last_checked": now})
-                print(f"  📋 {company} — follow-up draft queued for review (thread: {thread_id})")
+                # C-4: persist the advanced followup_count back to the lead.
+                # followup_check_node increments it in graph state, but if we
+                # never write it back, the leads table stays at the old value,
+                # so the NEXT sweep rebuilds the SAME make_followup_thread_id
+                # and re-invokes an already-completed thread instead of
+                # starting a fresh follow-up cycle. Persisting it makes each
+                # cycle's thread_id distinct and keeps MAX_FOLLOWUPS honest.
+                new_count = (
+                    int(final_state.values.get("followup_count") or 0)
+                    if final_state.values else int(lead.get("followup_count") or 0)
+                )
+                _safe_update(user_id, lead_id, {"last_checked": now, "followup_count": new_count})
+                print(f"  📋 {company} — follow-up draft queued for review "
+                      f"(thread: {thread_id}, followup_count -> {new_count})")
             else:
                 # Ran to END — either replied, max followups, or check failed.
                 status = final_state.values.get("status", "unknown") if final_state else "unknown"

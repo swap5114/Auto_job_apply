@@ -190,8 +190,15 @@ def approve_lead(
     final_status = (final.values.get("status") if (final and final.values) else None) or "approved"
     print(f"✅ [APPROVED] Lead '{lead_id}' -> {final_status}.")
 
+    update_fields = {"status": final_status, "review_decision": "approved"}
+    if final and final.values:
+        if final.values.get("contact_email"):
+            update_fields["contact_email"] = final.values["contact_email"]
+        if final.values.get("contact_name"):
+            update_fields["contact_name"] = final.values["contact_name"]
+
     try:
-        repo.update_lead(user_id, lead_id, {"status": final_status, "review_decision": "approved"})
+        repo.update_lead(user_id, lead_id, update_fields)
     except Exception as e:
         print(f"⚠️ Warning: graph approved '{lead_id}' but failed to sync leads table status: {e}")
 
@@ -252,10 +259,17 @@ def edit_lead(
     final_status = (final.values.get("status") if (final and final.values) else None) or "approved"
     print(f"✏️ [EDITED & APPROVED] Lead '{lead_id}' updated with new draft -> {final_status}.")
 
+    update_fields = {
+        "status": final_status, "outreach_draft": new_draft, "review_decision": "edited",
+    }
+    if final and final.values:
+        if final.values.get("contact_email"):
+            update_fields["contact_email"] = final.values["contact_email"]
+        if final.values.get("contact_name"):
+            update_fields["contact_name"] = final.values["contact_name"]
+
     try:
-        repo.update_lead(user_id, lead_id, {
-            "status": final_status, "outreach_draft": new_draft, "review_decision": "edited",
-        })
+        repo.update_lead(user_id, lead_id, update_fields)
     except Exception as e:
         print(f"⚠️ Warning: graph edited '{lead_id}' but failed to sync leads table status: {e}")
 

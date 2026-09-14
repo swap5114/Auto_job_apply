@@ -119,7 +119,7 @@ gcloud run deploy autoapply-api \
   --allow-unauthenticated \
   --port 8000 \
   --cpu 1 --memory 1Gi \
-  --min-instances 0 --max-instances 10
+  --min-instances 1 --max-instances 10
 ```
 
 ### B. Deploy Worker Service
@@ -153,6 +153,7 @@ gcloud run deploy autoapply-frontend \
   --image $REGION-docker.pkg.dev/$PROJECT_ID/autoapply-repo/frontend:latest \
   --set-env-vars "API_URL=$API_URL" \
   --allow-unauthenticated \
+  --min-instances 1 \
   --port 3000
 ```
 

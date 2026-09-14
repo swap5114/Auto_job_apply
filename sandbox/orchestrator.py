@@ -50,6 +50,7 @@ from sandbox.config import (
     BUILD_STATUS_FILENAME,
     DEFAULT_MAX_ATTEMPTS,
     KIRO_TURN_TIMEOUT,
+    BUILD_VERIFY_TIMEOUT,
 )
 
 
@@ -158,6 +159,8 @@ Instructions:
 5. Once you believe the project is complete, ACTUALLY RUN its build and/or start command yourself (e.g. `npm run build`, `python -m py_compile`, etc.) using your own tools. Don't just claim it works — verify it by running it and checking the real exit code.
 6. When you're done (whether it worked or not), write a file named {BUILD_STATUS_FILENAME} into /workspace with this exact JSON shape:
    {{"status": "success" or "failed", "summary": "1-2 sentences on what you built or why it failed", "build_command": "the command you ran to build it", "start_command": "the command a user would run to start it", "entry_point": "main file or URL path, if relevant"}}
+7. If this is a fullstack or backend application, you MUST automatically configure CORS middleware (e.g. `cors` package in Express/Node, `CORSMiddleware` in FastAPI, or `flask-cors` in Flask) permitting cross-origin requests (`*` or dynamic origin) so that the deployed Vercel frontend can call the backend API without CORS errors.
+8. Always include a `vercel.json` file in the project root: `{{"buildCommand": "npm run build", "outputDirectory": "dist", "framework": "vite"}}` so Vercel correctly builds the frontend bundle into `dist`.
 
 Only write ONE of {NEEDS_SECRETS_FILENAME} or {BUILD_STATUS_FILENAME} per turn — whichever matches where you are right now."""
 
@@ -202,8 +205,89 @@ def _clear_state_files(container_id: str) -> None:
     )
 
 
+def _verify_build_in_container(container_id: str) -> tuple[bool, str, str]:
+    """Detect project type and run the appropriate build commands inside the
+    container to verify generated code actually compiles.
+
+    Returns (success, stdout, stderr).  This runs BEFORE we write
+    .build_status.json, so a failing build can be retried by the
+    orchestrator loop instead of silently shipping broken code.
+    """
+    # Detect project type from generated files
+    has_pkg_json = builder.read_file_from_container(container_id, f"{CONTAINER_WORKSPACE}/package.json") is not None
+    has_requirements = builder.read_file_from_container(container_id, f"{CONTAINER_WORKSPACE}/requirements.txt") is not None
+
+    if has_pkg_json:
+        # Node/npm project — install deps then build
+        print("  [VERIFY] Detected package.json — running npm install && npm run build...")
+        install_code, install_out, install_err = builder.run_command(
+            container_id, "npm install --no-audit --no-fund 2>&1",
+            timeout=BUILD_VERIFY_TIMEOUT,
+        )
+        if install_code != 0:
+            print(f"  [VERIFY] npm install FAILED (exit {install_code})")
+            return False, install_out, install_err
+
+        # Check if there's a build script — some simple projects may not have one
+        pkg_raw = builder.read_file_from_container(container_id, f"{CONTAINER_WORKSPACE}/package.json")
+        has_build_script = False
+        if pkg_raw:
+            try:
+                pkg = json.loads(pkg_raw)
+                has_build_script = "build" in pkg.get("scripts", {})
+            except json.JSONDecodeError:
+                pass
+
+        if has_build_script:
+            build_code, build_out, build_err = builder.run_command(
+                container_id, "npm run build 2>&1",
+                timeout=BUILD_VERIFY_TIMEOUT,
+            )
+            if build_code != 0:
+                print(f"  [VERIFY] npm run build FAILED (exit {build_code})")
+                return False, build_out, build_err
+            print("  [VERIFY] npm run build PASSED ✅")
+        else:
+            print("  [VERIFY] No build script in package.json — install-only check passed ✅")
+        return True, install_out, ""
+
+    elif has_requirements:
+        # Python project — install deps and syntax-check .py files
+        print("  [VERIFY] Detected requirements.txt — running pip install && syntax check...")
+        install_code, install_out, install_err = builder.run_command(
+            container_id, "pip install -r requirements.txt 2>&1",
+            timeout=BUILD_VERIFY_TIMEOUT,
+        )
+        if install_code != 0:
+            print(f"  [VERIFY] pip install FAILED (exit {install_code})")
+            return False, install_out, install_err
+
+        # Syntax-check all .py files
+        check_code, check_out, check_err = builder.run_command(
+            container_id,
+            'find /workspace -name "*.py" -exec python -m py_compile {} + 2>&1',
+            timeout=60,
+        )
+        if check_code != 0:
+            print(f"  [VERIFY] Python syntax check FAILED (exit {check_code})")
+            return False, check_out, check_err
+        print("  [VERIFY] pip install + Python syntax check PASSED ✅")
+        return True, install_out, ""
+
+    else:
+        # Static HTML or unknown — just check that at least one file exists
+        print("  [VERIFY] No package.json or requirements.txt — static project, skipping build check.")
+        return True, "", ""
+
+
 def _generate_with_gemini(container_id: str, prompt_text: str) -> bool:
-    """Fallback generator: uses Gemini API directly when kiro-cli is unauthenticated."""
+    """Fallback generator: uses Gemini / Vertex AI API directly when kiro-cli is unauthenticated.
+
+    After generating files, runs the build inside the container to verify
+    the code actually compiles.  Only writes .build_status.json as
+    "success" if the build passes; writes "failed" with error details
+    otherwise so the retry loop in _advance() can ask Gemini to fix it.
+    """
     from dotenv import load_dotenv
     load_dotenv(os.path.join(PROJECT_ROOT, "config", ".env"))
 
@@ -212,22 +296,41 @@ def _generate_with_gemini(container_id: str, prompt_text: str) -> bool:
         print("  [WARN] Gemini direct fallback: No GEMINI_API_KEY found in environment!")
         return False
 
-    print(f"  [GEMINI] Running direct Gemini API fallback code generation for container {container_id[:12]}...")
+    print(f"  [GEMINI] Running direct Gemini/Vertex AI API code generation for container {container_id[:12]}...")
     try:
-        from google import genai
-        client = genai.Client(api_key=api_key)
         gen_prompt = (
             f"You are an expert full-stack software engineer. Generate a complete, runnable application for:\n"
             f"{prompt_text}\n\n"
-            f"Output a single JSON object where keys are relative file paths and values are full file contents.\n"
-            f"Must include an index.html or App.jsx and package.json.\n"
-            f"Return ONLY valid raw JSON."
+            f"Requirements:\n"
+            f"1. Output a single JSON object where keys are relative file paths and values are full file contents.\n"
+            f"2. Must include package.json or requirements.txt with all specific dependencies required.\n"
+            f"3. Must include an index.html or App.jsx or main.py/server.js entrypoint.\n"
+            f"4. Must include a vercel.json file configured for deployment:\n"
+            f'   {{"buildCommand": "npm run build", "outputDirectory": "dist", "framework": "vite"}}\n'
+            f"5. If this is a fullstack or backend application, you MUST automatically configure CORS middleware (e.g., cors in Express, CORSMiddleware in FastAPI, or flask-cors in Flask) allowing all cross-origin requests ('*') so the frontend can communicate with the backend without CORS errors.\n"
+            f"6. Return ONLY valid raw JSON."
         )
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=gen_prompt,
-        )
-        raw_text = response.text or ""
+
+        raw_text = ""
+        # Try skills.llm_client first if available
+        try:
+            from skills.llm_client import llm_generate
+            raw_text = llm_generate(
+                system_prompt="You are a senior full-stack AI engineer. Always output valid raw JSON representing project files.",
+                user_message=gen_prompt,
+                max_tokens=8192,
+                backend="gemini",
+            )
+        except Exception as llm_err:
+            print(f"  [GEMINI] llm_client call error ({llm_err}), trying google.genai fallback...")
+            from google import genai
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=gen_prompt,
+            )
+            raw_text = response.text or ""
+
         if "```json" in raw_text:
             raw_text = raw_text.split("```json")[1].split("```")[0].strip()
         elif "```" in raw_text:
@@ -236,6 +339,8 @@ def _generate_with_gemini(container_id: str, prompt_text: str) -> bool:
         files = json.loads(raw_text)
         if isinstance(files, dict):
             for rel_path, content in files.items():
+                if isinstance(content, (dict, list)):
+                    content = json.dumps(content, indent=2)
                 if isinstance(content, str) and rel_path.strip():
                     # Ensure directory exists if path contains subdirectories
                     dir_path = os.path.dirname(rel_path)
@@ -243,16 +348,33 @@ def _generate_with_gemini(container_id: str, prompt_text: str) -> bool:
                         builder.run_command(container_id, f"mkdir -p /workspace/{dir_path}")
                     builder.write_file_to_container(container_id, rel_path, content)
 
-            # Write .build_status.json so orchestrator sees success
-            status_data = {
-                "status": "success",
-                "summary": "Demo application generated and verified via Gemini API.",
-                "build_command": "npm run build",
-                "start_command": "npm start",
-            }
-            builder.write_file_to_container(container_id, BUILD_STATUS_FILENAME, json.dumps(status_data, indent=2))
-            print("  [OK] Gemini API code generation completed successfully!")
-            return True
+            # ── NEW: actually verify the build before claiming success ──
+            build_ok, build_stdout, build_stderr = _verify_build_in_container(container_id)
+
+            if build_ok:
+                status_data = {
+                    "status": "success",
+                    "summary": "Demo application generated and build-verified via Vertex AI / Gemini API.",
+                    "build_command": "npm run build",
+                    "start_command": "npm start",
+                }
+                builder.write_file_to_container(container_id, BUILD_STATUS_FILENAME, json.dumps(status_data, indent=2))
+                print("  [OK] Gemini code generation + build verification completed successfully!")
+                return True
+            else:
+                # Build failed — write a failed status so _advance() can
+                # retry and let Gemini fix its own errors.
+                error_snippet = (build_stdout + "\n" + build_stderr)[-2000:]
+                status_data = {
+                    "status": "failed",
+                    "summary": f"Generated code failed build verification: {error_snippet[:500]}",
+                    "build_command": "npm run build",
+                    "start_command": "npm start",
+                }
+                builder.write_file_to_container(container_id, BUILD_STATUS_FILENAME, json.dumps(status_data, indent=2))
+                print(f"  [FAIL] Gemini generated code but build verification FAILED.")
+                return True  # return True so orchestrator reads the status file
+
     except Exception as e:
         print(f"  [WARN] Gemini direct fallback generation exception: {e}")
     return False
@@ -312,6 +434,16 @@ def start_build(
     """
     if state is None:
         state = BuildState(build_id=str(uuid.uuid4())[:8], max_attempts=max_attempts)
+
+    # On Cloud Run (no Docker daemon) or when SANDBOX_MODE=local_fs, generate
+    # directly on the host filesystem instead of in a container. This is what
+    # makes build-demo work in production, where builder.start_container()
+    # would otherwise fail with "Cannot connect to Docker".
+    if _sandbox_mode() == "local_fs":
+        print("  [SANDBOX] Using container-less (local_fs) build mode.")
+        return start_build_local_fs(
+            demo_project, company=company, max_attempts=max_attempts, state=state
+        )
 
     try:
         state.container_id = builder.start_container(kiro_api_key=kiro_api_key)
@@ -418,9 +550,164 @@ def _advance(state: BuildState, prompt: str, resume: bool) -> None:
     state.result = state.result or {"status": "failed", "summary": "Max attempts reached."}
 
 
+# ---------------------------------------------------------------------------
+# Container-less build path (Cloud Run) — no Docker daemon required
+# ---------------------------------------------------------------------------
+#
+# On Cloud Run there is no Docker daemon and no kiro-cli, so the container
+# path (start_build -> builder.start_container) fails immediately with
+# "Cannot connect to Docker". This path generates the project files
+# directly on the host filesystem via the Vertex/Gemini LLM, validates the
+# build locally with validate_build_output(), and sets state.project_dir so
+# the existing export/GitHub/Vercel/Render deploy pipeline runs unchanged.
+
+def _sandbox_mode() -> str:
+    """Resolve the sandbox execution mode.
+
+    - "local_fs": generate on the host filesystem, no Docker (Cloud Run).
+    - "docker":   the original local-Docker container path.
+
+    Explicit override via SANDBOX_MODE; otherwise auto-detect: if a Docker
+    daemon is reachable use docker, else fall back to local_fs so the
+    feature works on Cloud Run out of the box.
+    """
+    mode = os.getenv("SANDBOX_MODE", "").strip().lower()
+    if mode in ("local_fs", "docker"):
+        return mode
+    try:
+        from sandbox import builder as _b
+        _b._get_docker_client()  # raises if no daemon
+        return "docker"
+    except Exception:
+        return "local_fs"
+
+
+def _generate_files_local_fs(project_dir: str, prompt_text: str) -> tuple[bool, str]:
+    """Generate project files directly into a host directory via the LLM
+    (Vertex/Gemini). Returns (ok, error). No container involved.
+    """
+    os.makedirs(project_dir, exist_ok=True)
+
+    gen_prompt = (
+        f"You are an expert full-stack software engineer. Generate a complete, runnable application for:\n"
+        f"{prompt_text}\n\n"
+        f"Requirements:\n"
+        f"1. Output a single JSON object where keys are relative file paths and values are full file contents.\n"
+        f"2. Must include package.json or requirements.txt with all specific dependencies required.\n"
+        f"3. Must include an index.html or App.jsx or main.py/server.js entrypoint.\n"
+        f'4. Must include a vercel.json: {{"buildCommand": "npm run build", "outputDirectory": "dist", "framework": "vite"}}\n'
+        f"5. If fullstack/backend, configure permissive CORS so the frontend can call the backend.\n"
+        f"6. Return ONLY valid raw JSON."
+    )
+
+    try:
+        from skills.llm_client import llm_generate
+        # Use the deployment's configured backend (vertex in prod) rather than
+        # hard-coding gemini, so build-demo uses the same GCP-credited path.
+        raw_text = llm_generate(
+            system_prompt="You are a senior full-stack AI engineer. Always output valid raw JSON representing project files.",
+            user_message=gen_prompt,
+            max_tokens=8192,
+        )
+    except Exception as e:
+        return False, f"LLM generation failed: {e}"
+
+    if "```json" in raw_text:
+        raw_text = raw_text.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in raw_text:
+        raw_text = raw_text.split("```", 1)[1].split("```", 1)[0].strip()
+
+    try:
+        files = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        return False, f"LLM did not return valid JSON file map: {e}"
+
+    if not isinstance(files, dict) or not files:
+        return False, "LLM returned an empty or non-object file map."
+
+    written = 0
+    for rel_path, content in files.items():
+        if not isinstance(rel_path, str) or not rel_path.strip():
+            continue
+        # Guard against path traversal in LLM-provided relative paths.
+        safe_rel = os.path.normpath(rel_path).lstrip("/\\")
+        if safe_rel.startswith(".."):
+            continue
+        if isinstance(content, (dict, list)):
+            content = json.dumps(content, indent=2)
+        if not isinstance(content, str):
+            continue
+        abs_path = os.path.join(project_dir, safe_rel)
+        os.makedirs(os.path.dirname(abs_path) or project_dir, exist_ok=True)
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        written += 1
+
+    if written == 0:
+        return False, "LLM file map produced no writable files."
+    return True, ""
+
+
+def start_build_local_fs(
+    demo_project: dict,
+    company: str = "",
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    state: Optional[BuildState] = None,
+) -> BuildState:
+    """Container-less build for Cloud Run: generate to a host temp dir,
+    validate locally, and set state so deploy_build() can run.
+
+    Mirrors start_build()'s contract (mutates `state` in place if given) so
+    the API layer's polling works identically. Does NOT set a container_id,
+    so stop_build() is a safe no-op afterward.
+    """
+    import tempfile
+
+    if state is None:
+        state = BuildState(build_id=str(uuid.uuid4())[:8], max_attempts=max_attempts)
+
+    state.stage = "building"
+    prompt = render_initial_prompt(demo_project, company)
+
+    project_dir = os.path.join(
+        tempfile.gettempdir(), "autoapply_builds", f"build_{state.build_id}"
+    )
+
+    last_error = ""
+    while state.attempt < state.max_attempts:
+        state.attempt += 1
+        ok, err = _generate_files_local_fs(project_dir, prompt)
+        if not ok:
+            last_error = err
+            state.transcript.append({"attempt": state.attempt, "error": err})
+            prompt = RETRY_PROMPT_TEMPLATE.format(previous_summary=err)
+            continue
+
+        is_valid, validation_error = validate_build_output(project_dir)
+        if is_valid:
+            state.stage = "success"
+            state.project_dir = project_dir
+            state.result = {
+                "status": "success",
+                "summary": "Demo generated on host filesystem and build-validated (container-less mode).",
+                "build_command": "npm run build",
+                "start_command": "npm start",
+            }
+            return state
+
+        last_error = validation_error
+        state.transcript.append({"attempt": state.attempt, "error": validation_error[:2000]})
+        prompt = RETRY_PROMPT_TEMPLATE.format(previous_summary=validation_error[:1500])
+
+    state.stage = "failed"
+    state.result = {"status": "failed", "summary": f"Container-less build failed: {last_error[:500]}"}
+    return state
+
+
 def stop_build(state: BuildState) -> None:
     """Stop and remove the build's container. Safe to call even if the
-    container is already gone.
+    container is already gone (e.g. the container-less local_fs path never
+    started one).
     """
     if state.container_id:
         builder.stop_container(state.container_id)
@@ -471,6 +758,93 @@ def needs_backend_deploy(demo_project: dict, result: Optional[dict]) -> bool:
     return any(kw in tech_stack for kw in _BACKEND_TECH_KEYWORDS)
 
 
+def validate_build_output(project_dir: str) -> tuple[bool, str]:
+    """Run a local build check on the exported project directory BEFORE
+    pushing to GitHub / deploying.  This is a defense-in-depth gate that
+    catches build failures regardless of which code-generation path
+    produced the files (Kiro CLI or Gemini fallback).
+
+    Returns (is_valid, error_message).  error_message is empty on success.
+    """
+    import subprocess
+
+    pkg_path = os.path.join(project_dir, "package.json")
+    req_path = os.path.join(project_dir, "requirements.txt")
+
+    if os.path.exists(pkg_path):
+        # ── Node/npm project ──
+        print("  [PRE-DEPLOY] Validating Node project build...")
+        try:
+            install = subprocess.run(
+                ["npm", "install", "--no-audit", "--no-fund"],
+                cwd=project_dir, capture_output=True, text=True,
+                timeout=BUILD_VERIFY_TIMEOUT,
+            )
+            if install.returncode != 0:
+                msg = f"npm install failed (exit {install.returncode}):\n{install.stderr[-1500:]}"
+                print(f"  [PRE-DEPLOY] FAIL: {msg[:200]}")
+                return False, msg
+        except subprocess.TimeoutExpired:
+            return False, f"npm install timed out after {BUILD_VERIFY_TIMEOUT}s"
+
+        # Check for a build script
+        has_build = False
+        try:
+            with open(pkg_path, "r", encoding="utf-8") as f:
+                pkg = json.loads(f.read())
+            has_build = "build" in pkg.get("scripts", {})
+        except Exception:
+            pass
+
+        if has_build:
+            try:
+                build = subprocess.run(
+                    ["npm", "run", "build"],
+                    cwd=project_dir, capture_output=True, text=True,
+                    timeout=BUILD_VERIFY_TIMEOUT,
+                )
+                if build.returncode != 0:
+                    msg = f"npm run build failed (exit {build.returncode}):\n{build.stderr[-1500:]}"
+                    print(f"  [PRE-DEPLOY] FAIL: {msg[:200]}")
+                    return False, msg
+            except subprocess.TimeoutExpired:
+                return False, f"npm run build timed out after {BUILD_VERIFY_TIMEOUT}s"
+
+        print("  [PRE-DEPLOY] Node build validation PASSED ✅")
+        return True, ""
+
+    elif os.path.exists(req_path):
+        # ── Python project ──
+        print("  [PRE-DEPLOY] Validating Python project...")
+        # Syntax-check all .py files (lightweight, no venv needed)
+        py_files = []
+        for root, _dirs, fnames in os.walk(project_dir):
+            for fn in fnames:
+                if fn.endswith(".py"):
+                    py_files.append(os.path.join(root, fn))
+
+        for py_file in py_files:
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "py_compile", py_file],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode != 0:
+                    msg = f"Python syntax error in {os.path.basename(py_file)}:\n{result.stderr[-1000:]}"
+                    print(f"  [PRE-DEPLOY] FAIL: {msg[:200]}")
+                    return False, msg
+            except subprocess.TimeoutExpired:
+                pass  # Skip slow files
+
+        print("  [PRE-DEPLOY] Python syntax validation PASSED ✅")
+        return True, ""
+
+    else:
+        # Static / unknown — no build step to verify
+        print("  [PRE-DEPLOY] Static project, no build step to verify.")
+        return True, ""
+
+
 def finalize_success(state: BuildState) -> None:
     """Export the built project's files BEFORE tearing down the container.
 
@@ -483,12 +857,17 @@ def finalize_success(state: BuildState) -> None:
     """
     if state.stage != "success":
         return
+    # Container-less (local_fs) builds already wrote files straight to the
+    # host and set project_dir; there's no container to export from, so skip.
+    if state.project_dir and not state.container_id:
+        state.deploy_stage = "exporting"
+        return
     try:
         state.deploy_stage = "exporting"
         state.project_dir = export_build_output(state)
     except Exception as e:
         state.deploy_stage = "deploy_failed"
-    state.deploy_error = f"Failed to export build output: {e}"
+        state.deploy_error = f"Failed to export build output: {e}"
 
 
 def deploy_build(
@@ -510,6 +889,15 @@ def deploy_build(
     if not state.project_dir:
         state.deploy_stage = "deploy_failed"
         state.deploy_error = state.deploy_error or "No exported project directory to deploy from."
+        return
+
+    # ── Pre-deploy build validation gate ──
+    # Catch broken builds HERE before they ever reach GitHub / Vercel / Render.
+    is_valid, validation_error = validate_build_output(state.project_dir)
+    if not is_valid:
+        state.deploy_stage = "deploy_failed"
+        state.deploy_error = f"Pre-deploy build validation failed: {validation_error[:1000]}"
+        print(f"  ❌ Pre-deploy validation FAILED — not pushing to GitHub/Vercel/Render.")
         return
 
     from sandbox import github_deploy, vercel_deploy, render_deploy

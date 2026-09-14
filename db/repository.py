@@ -44,6 +44,7 @@ from db.models import (
     Subscription,
     UsageCounter,
     User,
+    UserSettings,
 )
 from db.session import get_session
 
@@ -125,6 +126,22 @@ def get_user_by_firebase_uid(firebase_uid: str) -> Optional[dict]:
     with get_session() as session:
         user = session.scalar(select(User).where(User.firebase_uid == firebase_uid))
         return _to_dict(user) if user else None
+
+
+def get_all_user_ids() -> list[str]:
+    """Return every user's id. Used by scheduled/cron jobs (the sourcing/
+    follow-up sweeps in orchestrator.scheduler and api/main.py's
+    /api/internal/* endpoints) which must operate per-tenant across ALL
+    users, not the single db.current_user operator stand-in.
+
+    Ordered by created_at so the sweep is deterministic. This is the one
+    legitimate cross-tenant read: it returns only ids (no per-user data),
+    and each id is then fed back into the normal user_id-scoped repo
+    functions, so tenant isolation still holds for the actual data access.
+    """
+    with get_session() as session:
+        rows = session.scalars(select(User.id).order_by(User.created_at)).all()
+        return [str(r) for r in rows]
 
 
 def get_or_create_user(firebase_uid: str, email: str, plan: str = "free") -> dict:
@@ -392,6 +409,23 @@ def get_resume(user_id: str, resume_id: str) -> Optional[dict]:
         return _to_dict(resume) if resume else None
 
 
+def get_primary_resume(user_id: str) -> Optional[dict]:
+    """Fetch user_id's primary resume row (is_primary=True), or fall back to
+    their most recent resume if none is explicitly marked primary. Returns None
+    if the user has no resumes saved in the DB.
+    """
+    with get_session() as session:
+        resume = session.scalar(
+            select(Resume).where(Resume.user_id == user_id, Resume.is_primary.is_(True))
+        )
+        if not resume:
+            resume = session.scalar(
+                select(Resume).where(Resume.user_id == user_id).order_by(Resume.created_at.desc())
+            )
+        return _to_dict(resume) if resume else None
+
+
+
 # ---------------------------------------------------------------------------
 # Usage counters (per-user; free-tier 15-lead-lifetime cap lives here in Phase 7)
 # ---------------------------------------------------------------------------
@@ -518,16 +552,19 @@ def get_running_pipeline_run(user_id: str) -> Optional[dict]:
         return _to_dict(run) if run else None
 
 
-def update_pipeline_run(run_id: str, fields: dict) -> dict:
-    """Update a pipeline run row by its own id (not user-scoped in the
-    query, since the background thread that calls this already knows
-    exactly which run_id it started and isn't taking it from an untrusted
-    caller -- unlike every user-facing repo function above, there's no
-    "which tenant is asking" ambiguity to guard against here).
+def update_pipeline_run(run_id: str, fields: dict, user_id: Optional[str] = None) -> dict:
+    """Update a pipeline run row by its own id.
+
+    The background thread that calls this owns the run_id it created, so
+    the original design left the query un-scoped. M-4 hardens it with an
+    OPTIONAL user_id: when supplied (the api/main.py callers now do), it's
+    added to the WHERE clause as defense-in-depth, so a caller can never
+    mutate another tenant's run row even if a wrong run_id is passed. When
+    omitted, behavior is unchanged (back-compat for existing callers/tests).
     """
     with get_session() as session:
         run = session.get(PipelineRun, run_id)
-        if run is None:
+        if run is None or (user_id is not None and str(run.user_id) != str(user_id)):
             raise NotFoundError(f"No pipeline run found with id {run_id}")
         for key, value in fields.items():
             setattr(run, key, value)
@@ -535,14 +572,16 @@ def update_pipeline_run(run_id: str, fields: dict) -> dict:
         return _to_dict(run)
 
 
-def append_pipeline_run_step(run_id: str, step: str, status: str) -> dict:
+def append_pipeline_run_step(run_id: str, step: str, status: str, user_id: Optional[str] = None) -> dict:
     """Append one {step, status} entry to a run's steps list and update
     current_step -- mirrors api/main.py's old on_step callback, now
     writing to Postgres instead of an in-memory dict.
+
+    M-4: optional user_id scoping, same contract as update_pipeline_run.
     """
     with get_session() as session:
         run = session.get(PipelineRun, run_id)
-        if run is None:
+        if run is None or (user_id is not None and str(run.user_id) != str(user_id)):
             raise NotFoundError(f"No pipeline run found with id {run_id}")
         run.current_step = step if status == "running" else None
         if status in ("ok", "error"):
@@ -620,6 +659,54 @@ def get_subscription(user_id: str) -> Optional[dict]:
     with get_session() as session:
         sub = session.scalar(select(Subscription).where(Subscription.user_id == user_id))
         return _to_dict(sub) if sub else None
+
+
+# ---------------------------------------------------------------------------
+# User settings (per-user; C-1 -- replaces the shared global config/.env +
+# config/search_criteria.json that the /api/settings/* routes used to
+# read/write for every tenant at once)
+# ---------------------------------------------------------------------------
+
+
+def get_user_settings(user_id: str) -> Optional[dict]:
+    """Return the user's settings row as a dict, or None if they've never
+    saved any (caller falls back to process-level defaults)."""
+    if not user_id:
+        raise ValidationError("get_user_settings requires a user_id")
+    with get_session() as session:
+        row = session.scalar(select(UserSettings).where(UserSettings.user_id == user_id))
+        return _to_dict(row) if row else None
+
+
+def update_user_settings(
+    user_id: str,
+    pipeline_config: Optional[dict] = None,
+    search_criteria: Optional[dict] = None,
+) -> dict:
+    """Merge-update a user's pipeline_config and/or search_criteria JSONB
+    blobs, creating the row on first write. Only the keys present in the
+    passed dicts are updated (merge, not replace), so a partial settings
+    update never wipes unrelated keys."""
+    if not user_id:
+        raise ValidationError("update_user_settings requires a user_id")
+    with get_session() as session:
+        row = session.scalar(select(UserSettings).where(UserSettings.user_id == user_id))
+        if row is None:
+            row = UserSettings(user_id=user_id, pipeline_config={}, search_criteria={})
+            session.add(row)
+            session.flush()
+
+        if pipeline_config:
+            merged = dict(row.pipeline_config or {})
+            merged.update(pipeline_config)
+            row.pipeline_config = merged
+        if search_criteria:
+            merged = dict(row.search_criteria or {})
+            merged.update(search_criteria)
+            row.search_criteria = merged
+
+        session.flush()
+        return _to_dict(row)
 
 
 # ---------------------------------------------------------------------------
@@ -950,15 +1037,6 @@ def get_companies() -> list[dict]:
         return [_to_dict(r) for r in rows]
 
 
-def get_jobs(open_only: bool = False) -> list[dict]:
-    """Return all shared jobs across all tenants."""
-    with get_session() as session:
-        stmt = select(Job)
-        if open_only:
-            stmt = stmt.where(Job.is_open.is_(True))
-        rows = session.scalars(stmt).all()
-        return [_to_dict(r) for r in rows]
-
 
 # ---------------------------------------------------------------------------
 # Demo Build & Rate Limit Repository Methods
@@ -989,6 +1067,79 @@ def check_and_increment_demo_quota(user_id: str, max_daily: int = 5) -> bool:
         usage.count += 1
         session.flush()
         return True
+
+
+# ---------------------------------------------------------------------------
+# Outreach quota (per-user, per calendar month)
+#
+# The metered resource is "outreach sent" — a lead moving to status 'sent' or
+# 'draft_created' (both stamp sent_at). The monthly allowance is a function of
+# the user's plan. This is the single backend source of truth for the quota;
+# the frontend reads it via GET /api/outreach/quota and no longer guesses.
+# ---------------------------------------------------------------------------
+
+# Monthly outreach allowance per plan. Keep in sync with the copy shown in the
+# UI (frontend/src/lib/quota.ts falls back to these same numbers offline).
+PLAN_OUTREACH_LIMIT: dict[str, int] = {
+    "free": 25,
+    "pro": 250,
+    "power": 1000,
+}
+
+# Outreach outcomes that consume quota (both put a message in the world).
+_OUTREACH_SENT_STATUSES = ("sent", "draft_created")
+
+
+def _month_start_utc() -> datetime:
+    """First instant of the current UTC calendar month."""
+    now = datetime.now(timezone.utc)
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def count_outreach_used(user_id: str, since: Optional[datetime] = None) -> int:
+    """Count outreach this user has sent (status sent/draft_created) since
+    `since` (default: start of the current UTC month), by sent_at.
+    """
+    from sqlalchemy import func
+
+    window_start = since or _month_start_utc()
+    with get_session() as session:
+        return int(
+            session.scalar(
+                select(func.count())
+                .select_from(Lead)
+                .where(
+                    Lead.user_id == user_id,
+                    Lead.status.in_(_OUTREACH_SENT_STATUSES),
+                    Lead.sent_at.is_not(None),
+                    Lead.sent_at >= window_start,
+                )
+            )
+            or 0
+        )
+
+
+def get_outreach_quota(user_id: str) -> dict:
+    """Return this user's outreach quota for the current month:
+    {plan, used, limit, remaining, reset} — the backend source of truth.
+    """
+    user = get_user(user_id)
+    plan = (user or {}).get("plan") or "free"
+    if plan not in PLAN_OUTREACH_LIMIT:
+        plan = "free"
+    limit = PLAN_OUTREACH_LIMIT[plan]
+    used = count_outreach_used(user_id)
+    # Reset is the first of next month (UTC).
+    ms = _month_start_utc()
+    reset = (ms.replace(year=ms.year + 1, month=1) if ms.month == 12
+             else ms.replace(month=ms.month + 1))
+    return {
+        "plan": plan,
+        "used": used,
+        "limit": limit,
+        "remaining": max(0, limit - used),
+        "reset": reset.isoformat(),
+    }
 
 
 def get_daily_demo_usage(user_id: str, max_daily: int = 5) -> dict:

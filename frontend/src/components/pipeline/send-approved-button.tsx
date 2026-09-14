@@ -42,6 +42,7 @@ export function SendApprovedButton({
         if (res.mode === "direct" && s.sent) parts.push(`${s.sent} sent`);
         if (res.mode === "drafts" && s.draft_created) parts.push(`${s.draft_created} drafts created`);
         if (s.skipped_no_email) parts.push(`${s.skipped_no_email} skipped (no email)`);
+        if (s.skipped_quota) parts.push(`${s.skipped_quota} skipped (monthly limit reached)`);
         if (s.failed) parts.push(`${s.failed} failed`);
         const msg = parts.length ? parts.join(", ") : "Nothing to send";
         if ((res.mode === "direct" && s.sent) || (res.mode === "drafts" && s.draft_created)) {

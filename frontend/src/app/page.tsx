@@ -2,21 +2,20 @@
 
 import Link from "next/link";
 import { motion } from "framer-motion";
-import { ChevronRight, Sparkles, Workflow } from "lucide-react";
+import { Sparkles } from "lucide-react";
 import { MarketingNav } from "@/components/marketing/marketing-nav";
-import { PillBadge } from "@/components/marketing/pill-badge";
-import { LogoCloud } from "@/components/marketing/logo-cloud";
-import { FeatureCards } from "@/components/marketing/feature-cards";
-import { HeroChat } from "@/components/marketing/hero-chat";
-import { UsageVideos } from "@/components/marketing/usage-videos";
+import { Button } from "@/components/ui/button";
+import { HeroDashboard } from "@/components/marketing/hero-dashboard";
+import { PipelineSection } from "@/components/marketing/pipeline-section";
+import { DarkShowcase } from "@/components/marketing/dark-showcase";
 import { FAQ } from "@/components/marketing/faq";
-import { UpcomingFeatures } from "@/components/marketing/upcoming-features";
+import { FinalCta } from "@/components/marketing/final-cta";
 import { Footer } from "@/components/marketing/footer";
 import { useAuth } from "@/lib/auth-context";
 
 export default function LandingPage() {
-  // Signed-in visitors skip straight to the dashboard (Phase 3.5) --
-  // everyone else goes through /signin first.
+  // Signed-in visitors skip straight to the dashboard; everyone else goes
+  // through /signin first.
   const { user } = useAuth();
   const primaryHref = user ? "/dashboard" : "/signin";
 
@@ -24,134 +23,97 @@ export default function LandingPage() {
     <div className="relative min-h-screen">
       <MarketingNav />
 
-      {/* Vertical grid guide lines (crosshair aesthetic) */}
-      <div className="pointer-events-none absolute inset-0 z-0 mx-auto hidden max-w-6xl lg:block">
+      {/* Vertical grid guide lines (crosshair aesthetic) — scoped to the
+          top light area so they don't run through the dark sections. */}
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-0 mx-auto hidden h-[220vh] max-w-6xl lg:block">
         <div className="absolute left-0 top-0 h-full w-px bg-border/50" />
         <div className="absolute right-0 top-0 h-full w-px bg-border/50" />
       </div>
 
       <main className="relative z-10">
         {/* === HERO === */}
-        <section className="mx-auto max-w-6xl px-6 pt-16 pb-20 md:pt-24">
-          <div className="grid items-center gap-12 lg:grid-cols-2">
-            {/* Left: copy */}
-            <div>
-              <motion.div
-                initial={{ opacity: 0, y: 12 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.5 }}
-              >
-                <PillBadge icon={<Sparkles className="h-3 w-3" />}>
-                  Fully autonomous outreach
-                </PillBadge>
-              </motion.div>
+        <section className="mx-auto max-w-5xl px-6 pt-16 text-center md:pt-24">
+          {/* Eyebrow pill — honest positioning, no false claims */}
+          <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5 }}
+            className="flex justify-center"
+          >
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-xs font-medium text-muted-foreground shadow-[0px_1px_2px_0px_rgba(0,0,0,0.04)]">
+              <Sparkles className="h-3 w-3 text-brand" />
+              Personalized outreach, not spray-and-pray
+            </span>
+          </motion.div>
 
-              <motion.h1
-                initial={{ opacity: 0, y: 16 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.6, delay: 0.05 }}
-                className="mt-6 font-display text-5xl leading-[1.05] text-foreground md:text-6xl"
-              >
-                Personalized outreach to YC startups that actually gets read
-              </motion.h1>
+          {/* Headline */}
+          <motion.h1
+            initial={{ opacity: 0, y: 16 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6, delay: 0.05 }}
+            className="mx-auto mt-7 max-w-3xl font-display-tight text-5xl text-foreground sm:text-6xl md:text-[4.25rem]"
+          >
+            Outreach to startups that actually gets read.
+          </motion.h1>
 
-              <motion.p
-                initial={{ opacity: 0, y: 16 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.6, delay: 0.12 }}
-                className="mt-5 max-w-md text-lg leading-relaxed text-muted-foreground"
-              >
-                We find YC startups hiring now, tailor your resume to each, and draft
-                outreach that opens with a genuinely useful idea for them — you approve,
-                and it sends from your own inbox.
-              </motion.p>
+          {/* Subcopy — describes the real flow */}
+          <motion.p
+            initial={{ opacity: 0, y: 16 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6, delay: 0.12 }}
+            className="mx-auto mt-6 max-w-xl text-[15px] leading-relaxed text-muted-foreground"
+          >
+            Outra finds Y Combinator startups hiring for roles that fit you, tailors your resume to
+            each one, and drafts outreach that opens with a genuinely useful idea for them. You
+            review everything, and it sends from your own inbox.
+          </motion.p>
 
-              <motion.div
-                initial={{ opacity: 0, y: 16 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.6, delay: 0.18 }}
-                className="mt-8 flex flex-wrap items-center gap-3"
-              >
-                <Link
-                  href={primaryHref}
-                  className="inline-flex items-center gap-1.5 rounded-[10px] bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground shadow-button-brand transition-all hover:shadow-button-brand-hover active:shadow-button-brand-active"
-                >
-                  Get started
-                  <ChevronRight className="h-4 w-4" />
-                </Link>
-                <Link
-                  href="#features"
-                  className="inline-flex items-center gap-1.5 rounded-[10px] border border-input bg-card px-5 py-2.5 text-sm font-medium text-foreground shadow-[0px_2px_3px_0px_rgba(0,0,0,0.03)] transition-colors hover:bg-accent"
-                >
-                  See how it works
-                  <ChevronRight className="h-4 w-4" />
-                </Link>
-              </motion.div>
+          {/* CTAs */}
+          <motion.div
+            initial={{ opacity: 0, y: 16 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6, delay: 0.18 }}
+            className="mt-8 flex flex-wrap items-center justify-center gap-3"
+          >
+            <Button asChild size="lg">
+              <Link href={primaryHref}>Get started</Link>
+            </Button>
+            <Button asChild size="lg" variant="outline">
+              <Link href="#pipeline">See how it works</Link>
+            </Button>
+          </motion.div>
 
-              <motion.p
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                transition={{ duration: 0.6, delay: 0.3 }}
-                className="mt-4 text-xs text-muted-foreground"
-              >
-                No spray-and-pray. Every message is reviewed by you.
-              </motion.p>
-            </div>
+          <motion.p
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.6, delay: 0.26 }}
+            className="mt-3 text-xs text-muted-foreground"
+          >
+            Free to start. No card required. You approve every message.
+          </motion.p>
 
-            {/* Right: hero chat -- attach a resume, describe your target,
-                sign in, and see matched YC startups. */}
-            <div className="lg:pl-8">
-              <HeroChat />
-            </div>
+          {/* Product mockup (has its own entrance animation) */}
+          <div className="mt-14 pb-4">
+            <HeroDashboard />
           </div>
         </section>
 
-        {/* === LOGO CLOUD === */}
-        <section className="border-y border-border/60 bg-card/40 py-10">
-          <LogoCloud />
-        </section>
+        {/* === PIPELINE (scroll-driven 4-step) === */}
+        <div className="border-t border-border/60">
+          <PipelineSection />
+        </div>
 
-        {/* === FEATURES === */}
-        <section id="features" className="py-20 md:py-28">
-          <div className="mx-auto mb-14 max-w-2xl px-6 text-center">
-            <PillBadge icon={<Workflow className="h-3 w-3" />}>
-              How it works
-            </PillBadge>
-            <h2 className="mt-6 font-display text-4xl leading-tight text-foreground md:text-5xl">
-              Landing interviews is easy
-            </h2>
-            <p className="mt-4 text-lg text-muted-foreground">
-              An end-to-end pipeline for individuals who want quality outreach
-              at scale, without the busywork.
-            </p>
-          </div>
-
-          <FeatureCards />
-
-          <div className="mt-14 flex justify-center">
-            <Link
-              href={primaryHref}
-              className="inline-flex items-center gap-1.5 rounded-[10px] bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground shadow-button-brand transition-all hover:shadow-button-brand-hover"
-            >
-              {user ? "Open the dashboard" : "Get started"}
-              <ChevronRight className="h-4 w-4" />
-            </Link>
-          </div>
-        </section>
-
-        {/* === USAGE VIDEOS === */}
-        <section className="border-t border-border/60">
-          <UsageVideos />
-        </section>
-
-        {/* === UPCOMING FEATURES === */}
-        <section className="border-t border-border/60 bg-card/40">
-          <UpcomingFeatures />
-        </section>
+        {/* === FULL-WIDTH DARK SHOWCASE === */}
+        <DarkShowcase />
 
         {/* === FAQ === */}
         <section className="border-t border-border/60">
           <FAQ />
+        </section>
+
+        {/* === FINAL CTA === */}
+        <section className="border-t border-border/60 bg-card/40">
+          <FinalCta />
         </section>
       </main>
 

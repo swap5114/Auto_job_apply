@@ -400,17 +400,23 @@ def copy_files_from_container(
     basename = os.path.basename(src_path.rstrip("/"))
     wrapped_dir = os.path.join(dest_path, basename)
     if os.path.isdir(wrapped_dir):
+        import shutil
         for item in os.listdir(wrapped_dir):
             src_item = os.path.join(wrapped_dir, item)
             dst_item = os.path.join(dest_path, item)
             if os.path.exists(dst_item):
                 if os.path.isdir(dst_item):
-                    import shutil
-                    shutil.rmtree(dst_item)
+                    shutil.rmtree(dst_item, ignore_errors=True)
                 else:
-                    os.remove(dst_item)
-            os.rename(src_item, dst_item)
-        os.rmdir(wrapped_dir)
+                    try:
+                        os.remove(dst_item)
+                    except Exception:
+                        pass
+            try:
+                shutil.move(src_item, dst_item)
+            except Exception:
+                pass
+        shutil.rmtree(wrapped_dir, ignore_errors=True)
 
     print(f"  [OK] Files copied to: {dest_path}")
     return dest_path

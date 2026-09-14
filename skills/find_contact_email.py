@@ -29,6 +29,7 @@ HUNTER_URL = "https://api.hunter.io/v2/domain-search"
 APOLLO_API_KEY = os.getenv("APOLLO_API_KEY")
 APOLLO_ORG_ENRICH_URL = "https://api.apollo.io/api/v1/organizations/enrich"
 APOLLO_MATCH_URL = "https://api.apollo.io/api/v1/people/match"
+APOLLO_PEOPLE_SEARCH_URL = "https://api.apollo.io/v1/mixed_people/api_search"
 
 EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 URL_PATTERN = re.compile(r"https?://[^\s)]+")
@@ -77,15 +78,14 @@ def guess_domains_from_company(company: str) -> list:
 
 def hunter_lookup(domain: str) -> str:
     """Looks up a work email for a company domain via Hunter's Domain Search.
-    Returns the best match (prefers a generic/role address like hr@ or
-    careers@ over a random personal one, since we have no named contact)."""
+    Prefers personal/employee addresses over generic role inboxes (e.g. help@, info@)."""
     if not domain:
         return None
 
     params = {
         "domain": domain,
         "api_key": HUNTER_API_KEY,
-        "limit": 5,
+        "limit": 10,
     }
 
     try:
@@ -99,9 +99,25 @@ def hunter_lookup(domain: str) -> str:
     if not emails:
         return None
 
-    generic = next((e for e in emails if e.get("type") == "generic"), None)
-    chosen = generic or emails[0]
-    return chosen.get("value")
+    # Prefer personal/named employee emails over generic catch-alls
+    personal = [e for e in emails if e.get("type") == "personal"]
+    if personal:
+        decision_maker = next(
+            (e for e in personal if any(
+                t in (e.get("position") or "").lower()
+                for t in ("founder", "ceo", "cto", "engineer", "lead", "head", "manager", "director", "talent", "recruiter")
+            )),
+            personal[0]
+        )
+        return decision_maker.get("value")
+
+    # If only generic emails exist, filter out unwanted customer support/billing inboxes
+    GENERIC_EXCLUDES = ("help@", "support@", "billing@", "legal@", "privacy@", "abuse@", "press@")
+    non_support = [e for e in emails if not any(e.get("value", "").lower().startswith(p) for p in GENERIC_EXCLUDES)]
+    if non_support:
+        return non_support[0].get("value")
+
+    return emails[0].get("value")
 
 
 # ---------------------------------------------------------------------------
@@ -194,15 +210,83 @@ def apollo_match(payload: dict):
     return None, None
 
 
-def apollo_lookup(domain: str, company: str = None, contact_name: str = None):
-    """Fallback contact discovery via Apollo. Returns (email, name).
+def apollo_search_decision_makers(domain: str, company: str = None) -> list[dict]:
+    """Searches Apollo for founders, C-level execs, or hiring managers at domain.
+    This search endpoint is free (does NOT consume email unlock credits). Returns
+    a list of candidate person dicts with id, name, and title."""
+    if not APOLLO_API_KEY or not domain:
+        return []
 
-    Scoped to endpoints a standard Apollo key can reach (People Search is
-    usually 403 API_INACCESSIBLE, so it's avoided):
-      1. If a contact name is already known, unlock that person by name+domain.
-      2. Otherwise enrich the org by domain and unlock the org-chart root
-         (typically the founder/CEO -- ideal for YC-stage cold outreach).
-    """
+    titles = [
+        "founder", "co-founder", "ceo", "chief executive officer",
+        "cto", "chief technology officer", "head of engineering",
+        "vp engineering", "vp of engineering", "founding engineer",
+        "engineering manager", "lead engineer", "director of engineering"
+    ]
+
+    payload = {
+        "q_organization_domains": domain,
+        "person_titles": titles,
+        "page": 1,
+        "per_page": 5,
+    }
+
+    try:
+        resp = requests.post(
+            APOLLO_PEOPLE_SEARCH_URL,
+            json=payload,
+            headers=_apollo_headers(),
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            people = resp.json().get("people", [])
+            results = []
+            for p in people:
+                pid = p.get("id")
+                if pid:
+                    results.append({
+                        "id": pid,
+                        "name": _apollo_person_name(p),
+                        "title": p.get("title", ""),
+                    })
+            if results:
+                return results
+    except Exception as e:
+        print(f"Apollo decision-maker search failed for {domain}: {e}")
+
+    # Fallback search by company name if domain search had no results
+    if company:
+        try:
+            payload["q_organization_name"] = company
+            payload.pop("q_organization_domains", None)
+            resp = requests.post(
+                APOLLO_PEOPLE_SEARCH_URL,
+                json=payload,
+                headers=_apollo_headers(),
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                people = resp.json().get("people", [])
+                results = []
+                for p in people:
+                    pid = p.get("id")
+                    if pid:
+                        results.append({
+                            "id": pid,
+                            "name": _apollo_person_name(p),
+                            "title": p.get("title", ""),
+                        })
+                if results:
+                    return results
+        except Exception:
+            pass
+
+    return []
+
+
+def apollo_lookup(domain: str, company: str = None, contact_name: str = None):
+    """Find a high-quality decision maker (Founder/CEO/CTO/Engineering Lead) via Apollo.
+    Returns (email, name)."""
     if not APOLLO_API_KEY:
         return None, None
 
@@ -210,7 +294,7 @@ def apollo_lookup(domain: str, company: str = None, contact_name: str = None):
     if not domain:
         return None, None
 
-    # 1) Targeted unlock when we already have a name (e.g. YC/company_list founder).
+    # 1) Targeted unlock when we already have a contact name (e.g. from YC/company listing).
     if contact_name:
         parts = contact_name.split()
         if len(parts) >= 2:
@@ -220,7 +304,16 @@ def apollo_lookup(domain: str, company: str = None, contact_name: str = None):
         if email:
             return email, name or contact_name
 
-    # 2) Org-chart root (founder/CEO) via organization enrichment.
+    # 2) Priority decision-maker search: find Founders, CEOs, CTOs, and Engineering Leads.
+    candidates = apollo_search_decision_makers(domain, company=company)
+    for candidate in candidates[:2]:
+        email, name = apollo_match({"id": candidate["id"]})
+        if email:
+            resolved_name = name or candidate.get("name")
+            print(f"  [APOLLO] Unlocked decision-maker: {resolved_name} ({candidate.get('title')}) -> {email}")
+            return email, resolved_name
+
+    # 3) Fallback: Org-chart root via organization enrichment.
     org = apollo_org_enrich(domain)
     for pid in (org.get("org_chart_root_people_ids") or [])[:2]:
         email, name = apollo_match({"id": pid})
@@ -338,6 +431,27 @@ def _lookup_by_guessed_domains(company: str, contact_name: str = None):
     return None, None
 
 
+def _scan_yc_listing(listing_url: str):
+    """Scrapes public YC company page for contact email or founder name (zero API credits)."""
+    if not listing_url or "ycombinator.com/companies/" not in listing_url:
+        return None, None
+    try:
+        resp = requests.get(listing_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if resp.status_code == 200:
+            emails = EMAIL_PATTERN.findall(resp.text)
+            excluded = ("ycombinator.com", "example.com", "sentry.io", "w3.org")
+            valid = [
+                e.lower() for e in emails 
+                if not e.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"))
+                and not any(x in e.lower() for x in excluded)
+            ]
+            if valid:
+                return valid[0], None
+    except Exception:
+        pass
+    return None, None
+
+
 def find_contact_email_for_lead(lead: dict) -> dict:
     """Finds the best contact email (and name, when known) for a lead.
 
@@ -354,34 +468,43 @@ def find_contact_email_for_lead(lead: dict) -> dict:
 
     email, name = None, None
 
+    # Free check 1: scan jd_text before hitting paid APIs (applicable to all sources)
+    if jd_text:
+        email_match = EMAIL_PATTERN.search(jd_text)
+        if email_match:
+            found_e = email_match.group(0).lower()
+            if not found_e.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", "ycombinator.com")):
+                return {"contact_email": found_e, "contact_name": contact_name}
+
     if domain:
         # A verified domain (YC website, company_list CSV, careers page) beats
         # any guessing below -- use it directly regardless of source.
         email, name = _lookup_by_domain(domain, company, contact_name)
 
-    elif source == "x":
-        # Bio/tweet text is already stored in jd_text -- scan it before
-        # spending any API call.
-        email_match = EMAIL_PATTERN.search(jd_text)
-        if email_match:
-            email = email_match.group(0)
-        else:
+    # Free check 2: if domain lookup yielded nothing, check public YC company page
+    if not email and (source == "yc" or "ycombinator.com/companies/" in listing_url):
+        email, name = _scan_yc_listing(listing_url)
+        if email and domain:
+            _cache_set_contact(domain, email, name)
+
+    if not email:
+        if source == "x":
             url_match = URL_PATTERN.search(jd_text)
             if url_match:
                 d = urlparse(url_match.group(0)).netloc
                 email, name = _lookup_by_domain(d, company, contact_name)
 
-    elif source == "careers_page" and listing_url:
-        # listing_url is the company's own site here -- real domain.
-        email, name = _lookup_by_domain(urlparse(listing_url).netloc, company, contact_name)
+        elif source == "careers_page" and listing_url:
+            # listing_url is the company's own site here -- real domain.
+            email, name = _lookup_by_domain(urlparse(listing_url).netloc, company, contact_name)
 
-    elif source in ("arbeitnow", "jobicy") and company:
-        # listing_url points at the aggregator, not the employer -- guess.
-        email, name = _lookup_by_guessed_domains(company, contact_name)
+        elif source in ("arbeitnow", "jobicy") and company:
+            # listing_url points at the aggregator, not the employer -- guess.
+            email, name = _lookup_by_guessed_domains(company, contact_name)
 
-    elif company:
-        # Last resort for any other source that at least has a company name.
-        email, name = _lookup_by_guessed_domains(company, contact_name)
+        elif company:
+            # Last resort for any other source that at least has a company name.
+            email, name = _lookup_by_guessed_domains(company, contact_name)
 
     return {"contact_email": email, "contact_name": name}
 

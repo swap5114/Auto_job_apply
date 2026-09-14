@@ -54,6 +54,12 @@ const config: Config = {
         // Signature accent
         accent1: "hsl(var(--accent-1))",
         accent2: "hsl(var(--accent-2))",
+        // Warm brand accent (Tsenta-style burnt orange)
+        brand: {
+          DEFAULT: "hsl(var(--brand))",
+          foreground: "hsl(var(--brand-foreground))",
+          soft: "hsl(var(--brand-soft))",
+        },
       },
       borderRadius: {
         lg: "var(--radius-lg)",

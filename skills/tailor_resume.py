@@ -31,9 +31,24 @@ STRICT RULES -- violating any of these is a critical failure:
 Return ONLY valid JSON matching the exact same structure as the input base resume. No prose, no markdown code fences, no explanation -- just the JSON object."""
 
 
-def load_base_resume() -> dict:
-    with open(BASE_RESUME_PATH, encoding="utf-8") as f:
-        return json.load(f)
+def load_base_resume(user_id: str | None = None) -> dict:
+    if user_id is None:
+        try:
+            user_id = get_current_user_id()
+        except Exception:
+            user_id = None
+    if user_id:
+        try:
+            db_resume = repo.get_primary_resume(user_id)
+            if db_resume and db_resume.get("parsed_json"):
+                return db_resume["parsed_json"]
+        except Exception as e:
+            print(f"  ⚠️  load_base_resume: failed to load DB resume for user {user_id}: {e}")
+
+    if os.path.exists(BASE_RESUME_PATH):
+        with open(BASE_RESUME_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
 
 
 def slugify(text: str) -> str:
@@ -90,6 +105,7 @@ def tailor_resume_for_lead(lead: dict) -> dict:
 
     Returns {"resume_version": filename, "keyword_coverage": float}.
     """
+    user_id = lead.get("user_id") or get_current_user_id()
     company = lead.get("company") or lead.get("x_handle") or "Unknown"
     role = lead.get("role") or ""
     jd_text = lead.get("jd_text") or ""
@@ -98,14 +114,14 @@ def tailor_resume_for_lead(lead: dict) -> dict:
     if not jd_text.strip():
         jd_text = f"Role: {role} at {company}"
 
-    base_resume = load_base_resume()
+    base_resume = load_base_resume(user_id)
     try:
         tailored = tailor_resume(base_resume, company, role, jd_text, company_research=company_research)
     except Exception as e:
         print(f"  ⚠️  tailor_resume_for_lead failed ({e}); using base resume.")
         tailored = base_resume
 
-    filename = save_resume(tailored, company)
+    filename = save_resume(tailored, company, user_id=user_id)
     coverage = keyword_coverage(jd_text, tailored)
     print(
         f"  tailor_resume_for_lead: tailored resume for {company} -> "
@@ -355,11 +371,15 @@ def resume_to_pdf(resume: dict, output_path: str):
         raise RuntimeError(f"xhtml2pdf failed to render {output_path} ({result.err} errors)")
 
 
-def save_resume(resume: dict, company: str) -> str:
+def save_resume(resume: dict, company: str, user_id: str | None = None) -> str:
     os.makedirs(RESUMES_DIR, exist_ok=True)
     name_slug = slugify(resume.get("name", "resume"))
     company_slug = slugify(company)
-    base_filename = f"{name_slug}_resume_{company_slug}"
+    if user_id:
+        user_slug = slugify(user_id)
+        base_filename = f"{user_slug}_{name_slug}_resume_{company_slug}"
+    else:
+        base_filename = f"{name_slug}_resume_{company_slug}"
 
     json_path = os.path.join(RESUMES_DIR, f"{base_filename}.json")
     md_path = os.path.join(RESUMES_DIR, f"{base_filename}.md")
@@ -405,7 +425,7 @@ def run(user_id: str | None = None):
 
     if user_id is None:
         user_id = get_current_user_id()
-    base_resume = load_base_resume()
+    base_resume = load_base_resume(user_id)
     leads = repo.get_leads(user_id)
     targets = [lead for lead in leads if not (lead.get("resume_version") or "").strip()]
 
@@ -434,7 +454,7 @@ def run(user_id: str | None = None):
                 pass
             continue
 
-        filename = save_resume(tailored, company)
+        filename = save_resume(tailored, company, user_id=user_id)
         coverage = keyword_coverage(jd_text, tailored)
         # status: "tailored" mirrors graph/pipeline.py's tailor_resume_node
         # (the graph-driven path already sets this) -- the standalone

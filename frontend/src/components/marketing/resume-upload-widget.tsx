@@ -13,6 +13,7 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { api, type AnonResumeUploadResult } from "@/lib/api";
 import { saveAnonSession } from "@/lib/anon-session";
 
@@ -104,11 +105,10 @@ export function ResumeUploadWidget() {
         onDragLeave={() => setDragging(false)}
         onDrop={onDrop}
         onClick={() => !uploading && fileInput.current?.click()}
-        className={`mt-5 flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed px-6 py-10 text-center transition-colors ${
-          dragging
-            ? "border-accent1 bg-accent1/5"
-            : "border-border hover:border-accent1/40 hover:bg-muted/30"
-        } ${uploading ? "cursor-wait opacity-70" : "cursor-pointer"}`}
+        className={`mt-5 flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed px-6 py-10 text-center transition-colors ${dragging
+          ? "border-accent1 bg-accent1/5"
+          : "border-border hover:border-accent1/40 hover:bg-muted/30"
+          } ${uploading ? "cursor-wait opacity-70" : "cursor-pointer"}`}
       >
         <input
           ref={fileInput}
@@ -228,13 +228,10 @@ function MatchedJobsPreview({
         </div>
       )}
 
-      <button
-        onClick={onSignIn}
-        className="mt-4 flex w-full items-center justify-center gap-1.5 rounded-[10px] bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground shadow-button-brand transition-all hover:shadow-button-brand-hover"
-      >
+      <Button onClick={onSignIn} className="mt-4 w-full gap-1.5">
         Sign in to save & apply
         <ArrowRight className="h-3.5 w-3.5" />
-      </button>
+      </Button>
       <p className="mt-2 text-center text-[11px] text-muted-foreground">
         Your resume and matches carry straight over — no re-upload.
       </p>

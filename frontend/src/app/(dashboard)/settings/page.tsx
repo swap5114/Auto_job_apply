@@ -11,7 +11,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
 import { Badge } from "@/components/ui/badge";
-import { Mail, CheckCircle2, AlertCircle, Clock, Sparkles, FileText, Wand2, Github, Zap, ExternalLink } from "lucide-react";
+import { Mail, CheckCircle2, AlertCircle, Sparkles, FileText, Wand2, Github, Zap, ExternalLink } from "lucide-react";
 import { api, type SearchCriteria, type PipelineConfig } from "@/lib/api";
 
 type GmailStatus = { connected: boolean; email: string | null; send_mode: "draft" | "direct" };
@@ -159,51 +159,17 @@ function GmailConnectionCard() {
         )}
 
         {/* Google OAuth Testing Guidelines Notice */}
-        <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50/80 p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900/60">
-          <div className="flex items-start gap-3.5">
-            <div className="mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-400">
-              <AlertCircle className="h-4 w-4" />
-            </div>
-            <div className="space-y-3 text-xs">
-              <div className="flex items-center gap-2 flex-wrap">
-                <p className="font-display font-semibold text-slate-900 dark:text-slate-100 text-sm">
-                  Google Cloud Connector — OAuth Testing Guidelines (100 Test Users Cap)
-                </p>
-                <Badge variant="outline" className="border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400 font-mono text-[10px]">
-                  Testing Mode
-                </Badge>
-              </div>
-
-              {/* Prominent Highlight Badge for 24-48 hrs wait time */}
-              <div className="rounded-xl border border-amber-300 bg-amber-100/80 p-3.5 text-amber-950 dark:border-amber-700/60 dark:bg-amber-950/80 dark:text-amber-200 shadow-xs">
-                <div className="flex items-center gap-2 font-bold text-xs text-amber-950 dark:text-amber-100">
-                  <Clock className="h-4 w-4 text-amber-700 dark:text-amber-400 flex-shrink-0 animate-pulse" />
-                  <span>Important Notice: Wait 24–48 Hours for Tester Access Approval</span>
-                </div>
-                <p className="mt-1.5 text-xs font-medium text-amber-900 dark:text-amber-200 leading-relaxed">
-                  After your Google email address is submitted to the workspace administrator for inclusion in Google Cloud Console, <strong>please allow up to 24–48 hours for Google OAuth test user authorization to propagate</strong> before connecting your Gmail inbox.
-                </p>
-              </div>
-
-              <div className="space-y-2 pt-1 text-slate-700 dark:text-slate-300 leading-relaxed">
-                <p className="font-semibold text-slate-900 dark:text-slate-200">Guidelines for Users &amp; Administrators:</p>
-                <ul className="space-y-1.5 list-none pl-0">
-                  <li className="flex items-start gap-2">
-                    <span className="mt-1.5 h-1.5 w-1.5 rounded-full bg-slate-500 dark:bg-slate-400 flex-shrink-0" />
-                    <span><strong>Authorized Accounts Only:</strong> Only Google accounts explicitly added to the Google Cloud Console OAuth Consent Screen test list can connect successfully.</span>
-                  </li>
-                  <li className="flex items-start gap-2">
-                    <span className="mt-1.5 h-1.5 w-1.5 rounded-full bg-slate-500 dark:bg-slate-400 flex-shrink-0" />
-                    <span><strong>Unapproved Accounts Prompt:</strong> Attempting to connect an unapproved Google account will display Google&apos;s <em>&quot;Access blocked: App has not completed verification&quot;</em> error prompt.</span>
-                  </li>
-                  <li className="flex items-start gap-2">
-                    <span className="mt-1.5 h-1.5 w-1.5 rounded-full bg-slate-500 dark:bg-slate-400 flex-shrink-0" />
-                    <span><strong>Adding Test Users:</strong> Workspace admins can add user email addresses in <strong>Google Cloud Console &rarr; APIs &amp; Services &rarr; OAuth consent screen &rarr; Test users</strong>.</span>
-                  </li>
-                </ul>
-              </div>
-            </div>
-          </div>
+        {/* Early-access note — Gmail sending is in Google's review period, so
+            connecting is limited to approved accounts for now. Kept concise
+            and user-facing (no admin/console instructions). */}
+        <div className="mt-5 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+          <p className="text-xs leading-relaxed text-amber-800">
+            <strong>Early access:</strong> Gmail sending is still in Google&apos;s review period, so
+            connecting is limited to approved accounts while we finish verification. If you hit an
+            &ldquo;access blocked&rdquo; screen, your account isn&apos;t approved yet — reach out and
+            we&apos;ll add you. Everything else in Outra works without connecting Gmail.
+          </p>
         </div>
       </CardContent>
     </Card>
@@ -709,7 +675,7 @@ export default function SettingsPage() {
 
                   <Separator />
 
-                  <div className="grid grid-cols-2 gap-6">
+                  <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
                     <div className="space-y-2">
                       <label className="text-sm font-medium text-foreground">Follow-up Days</label>
                       <p className="text-xs text-muted-foreground">Days to wait before a follow-up</p>

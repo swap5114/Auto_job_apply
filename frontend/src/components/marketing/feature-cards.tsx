@@ -10,9 +10,9 @@ import {
 const features = [
   {
     number: "01",
-    title: "Source from everywhere",
+    title: "Source from YC startups",
     description:
-      "We pull leads from job boards, company career pages, and hiring signals on X — deduplicated into one clean queue.",
+      "We scan Y Combinator companies that are actively hiring and pull their open roles into one clean queue. More sources are on the roadmap.",
     mockup: SourcingOrbitMockup,
   },
   {

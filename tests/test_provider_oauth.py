@@ -46,6 +46,9 @@ def test_vercel_auth_url_construction(monkeypatch):
 
     assert "https://vercel.com/oauth/authorize" in url
     assert "client_id=vc_client_456" in url
+    assert "response_type=code" in url
+    assert "code_challenge=" in url
+    assert "code_challenge_method=S256" in url
     assert "state=" in url
 
 
@@ -53,3 +56,21 @@ def test_missing_client_id_raises_config_error(monkeypatch):
     monkeypatch.delenv("GITHUB_CLIENT_ID", raising=False)
     with pytest.raises(ProviderOAuthConfigError):
         get_github_auth_url("user-123")
+
+
+def test_connect_routes_return_400_when_not_configured(monkeypatch):
+    from fastapi import HTTPException
+    from api.main import github_oauth_connect, vercel_oauth_connect
+
+    monkeypatch.delenv("GITHUB_CLIENT_ID", raising=False)
+    monkeypatch.delenv("VERCEL_CLIENT_ID", raising=False)
+
+    with pytest.raises(HTTPException) as exc_gh:
+        github_oauth_connect(user_id="test_user")
+    assert exc_gh.value.status_code == 400
+    assert "GITHUB_CLIENT_ID" in exc_gh.value.detail
+
+    with pytest.raises(HTTPException) as exc_vc:
+        vercel_oauth_connect(user_id="test_user")
+    assert exc_vc.value.status_code == 400
+    assert "VERCEL_CLIENT_ID" in exc_vc.value.detail

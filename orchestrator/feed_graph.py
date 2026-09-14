@@ -92,6 +92,7 @@ def feed_pending_leads(user_id: Optional[str] = None) -> int:
             "resume_version": lead.get("resume_version") or None,
             "outreach_draft": lead.get("outreach_draft") or None,
             "listing_url": lead.get("listing_url") or None,
+            "domain": lead.get("domain") or None,
             "channel": ["outreach"],
             "status": "in_review",
         }

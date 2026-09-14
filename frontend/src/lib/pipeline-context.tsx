@@ -13,6 +13,10 @@ import { api, type PipelineRunState } from "@/lib/api";
 interface PipelineContextValue {
   state: PipelineRunState | null;
   refresh: () => Promise<PipelineRunState | null>;
+  /** Abort the in-progress run, then refresh status. */
+  abort: () => Promise<void>;
+  /** True while an abort request is in flight. */
+  aborting: boolean;
 }
 
 const PipelineContext = createContext<PipelineContextValue | null>(null);
@@ -40,6 +44,7 @@ export function PipelineProvider({
   idleMs?: number;
 }) {
   const [state, setState] = useState<PipelineRunState | null>(null);
+  const [aborting, setAborting] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mounted = useRef(true);
   const inFlight = useRef(false);
@@ -57,6 +62,19 @@ export function PipelineProvider({
       inFlight.current = false;
     }
   }, []);
+
+  const abort = useCallback(async () => {
+    setAborting(true);
+    try {
+      await api.pipeline.abort();
+      // Optimistically flip to not-running so the UI updates immediately;
+      // the next poll reconciles with the real backend state.
+      setState((s) => (s ? { ...s, running: false, current_step: null } : s));
+      await refresh();
+    } finally {
+      if (mounted.current) setAborting(false);
+    }
+  }, [refresh]);
 
   useEffect(() => {
     mounted.current = true;
@@ -87,7 +105,7 @@ export function PipelineProvider({
   }, [refresh, activeMs, idleMs]);
 
   return (
-    <PipelineContext.Provider value={{ state, refresh }}>
+    <PipelineContext.Provider value={{ state, refresh, abort, aborting }}>
       {children}
     </PipelineContext.Provider>
   );
@@ -101,7 +119,12 @@ export function usePipelineStatus() {
   const ctx = useContext(PipelineContext);
   if (!ctx) {
     // Fallback so components don't crash if used outside the provider.
-    return { state: null as PipelineRunState | null, refresh: async () => null };
+    return {
+      state: null as PipelineRunState | null,
+      refresh: async () => null,
+      abort: async () => { },
+      aborting: false,
+    };
   }
   return ctx;
 }

@@ -240,7 +240,7 @@ function LeadsPageInner() {
           Loading leads…
         </div>
       ) : (
-        <div className="overflow-hidden rounded-2xl border bg-card shadow-elevation-low">
+        <div className="overflow-hidden rounded-2xl border border-border/70 bg-card shadow-card">
           <table className="w-full">
             <thead>
               <tr className="border-b bg-muted/40">
@@ -370,7 +370,7 @@ function LeadsPageInner() {
                     </div>
                   )}
 
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                     <div className="rounded-xl border bg-card p-3.5">
                       <p className="text-xs font-medium text-muted-foreground">Contact Email ID</p>
                       <p className="mt-1 font-mono text-xs font-medium text-emerald-600 flex items-center gap-1.5 truncate">

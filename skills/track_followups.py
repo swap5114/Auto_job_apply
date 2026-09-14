@@ -19,8 +19,46 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "config", ".env"))
 
-FOLLOWUP_DAYS = int(os.getenv("FOLLOWUP_DAYS", "5"))
-MAX_FOLLOWUPS = int(os.getenv("MAX_FOLLOWUPS", "1"))
+# H-2: read these LIVE (not as import-time constants) so a Settings change
+# that writes FOLLOWUP_DAYS/MAX_FOLLOWUPS takes effect on the next run
+# without a process restart. The module-level names are kept as backward-
+# compatible defaults for any code still referencing them directly, but the
+# pipeline reads via get_followup_days()/get_max_followups() at call time.
+def _read_env_int_live(key: str, default: int) -> int:
+    """Read an int env var live, preferring config/.env at call time so a
+    settings write is picked up without restarting. Falls back to the
+    process env, then the default."""
+    env_path = os.path.join(os.path.dirname(__file__), "..", "config", ".env")
+    try:
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f"{key}="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    try:
+                        return int(val)
+                    except ValueError:
+                        break
+    except FileNotFoundError:
+        pass
+    try:
+        return int(os.getenv(key, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
+def get_followup_days() -> int:
+    return _read_env_int_live("FOLLOWUP_DAYS", 5)
+
+
+def get_max_followups() -> int:
+    return _read_env_int_live("MAX_FOLLOWUPS", 1)
+
+
+# Backward-compatible module constants (import-time snapshot). Prefer the
+# get_*() functions above in code paths that must honor a live settings change.
+FOLLOWUP_DAYS = get_followup_days()
+MAX_FOLLOWUPS = get_max_followups()
 
 
 def get_gmail_service(user_id: str | None = None):
@@ -32,13 +70,24 @@ def get_gmail_service(user_id: str | None = None):
 
 
 def check_thread_for_reply(service, contact_email: str, sent_after: str) -> bool:
-    """Check if there's a reply from contact_email after the sent_at timestamp.
+    """Check if there's a reply from contact_email after we sent to them.
 
-    Uses Gmail search to find messages FROM the contact in threads where we
-    sent TO them. Returns True if a reply exists.
+    M-1: scope the reply check to messages in threads we actually sent TO
+    this contact, AND after the sent timestamp, so unrelated inbound mail
+    from the same address (a newsletter, an old thread, a different topic)
+    doesn't get miscounted as a "reply" and wrongly suppress a follow-up.
+
+    Query semantics:
+      - `from:{contact_email}`  -> messages authored by the contact
+      - `in:inbox`              -> received (not our own sent copy)
+      - `after:YYYY/MM/DD`      -> only since we sent (when sent_after known)
+    We then confirm at least one matching message is in a thread that also
+    contains a message we sent to that contact (to:{contact_email}).
     """
+    if not contact_email:
+        return False
     try:
-        query = f"from:{contact_email}"
+        query = f"from:{contact_email} in:inbox"
         if sent_after:
             try:
                 dt = datetime.fromisoformat(sent_after.replace("Z", "+00:00"))
@@ -49,9 +98,35 @@ def check_thread_for_reply(service, contact_email: str, sent_after: str) -> bool
         results = service.users().messages().list(
             userId="me", q=query, maxResults=5
         ).execute()
-
         messages = results.get("messages", [])
-        return len(messages) > 0
+        if not messages:
+            return False
+
+        # Confirm the reply lives in a thread we actually started with this
+        # contact -- i.e. a thread that also has a message we sent TO them.
+        for msg in messages:
+            thread_id = msg.get("threadId")
+            if not thread_id:
+                continue
+            try:
+                thread = service.users().threads().get(
+                    userId="me", id=thread_id, format="metadata",
+                    metadataHeaders=["From", "To"],
+                ).execute()
+            except Exception:
+                # If we can't fetch the thread, fall back to counting the
+                # inbound message as a reply rather than silently dropping it.
+                return True
+            we_sent_here = False
+            for tmsg in thread.get("messages", []):
+                headers = {h["name"].lower(): h["value"]
+                           for h in tmsg.get("payload", {}).get("headers", [])}
+                if contact_email.lower() in (headers.get("to", "") or "").lower():
+                    we_sent_here = True
+                    break
+            if we_sent_here:
+                return True
+        return False
 
     except Exception as e:
         print(f"  ⚠️  Error checking thread for {contact_email}: {e}")

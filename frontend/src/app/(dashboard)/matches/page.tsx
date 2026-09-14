@@ -23,14 +23,7 @@ import { Badge } from "@/components/ui/badge";
 import { AnimatedCounter } from "@/components/ui/animated-counter";
 import { staggerContainer, fadeInUp, scaleIn } from "@/lib/motion";
 import { api, type MatchedJob } from "@/lib/api";
-
-function Panel({ className = "", children }: { className?: string; children: React.ReactNode }) {
-  return (
-    <div className={`rounded-2xl border border-border/70 bg-card shadow-card ${className}`}>
-      {children}
-    </div>
-  );
-}
+import { Panel } from "@/components/ui/panel";
 
 export default function MatchesPage() {
   const router = useRouter();
@@ -124,7 +117,7 @@ export default function MatchesPage() {
       ) : jobs.length === 0 ? (
         <NoMatchesState onRefresh={load} />
       ) : (
-        <div className="space-y-4 pb-16">
+        <div className="space-y-6 pb-16">
           {/* Stats strip — the "wow" moment: real numbers, immediately */}
           <motion.div
             className="grid grid-cols-2 gap-4 sm:grid-cols-3"
@@ -172,7 +165,7 @@ export default function MatchesPage() {
 
           {/* Match cards */}
           <motion.div
-            className="grid gap-4 lg:grid-cols-2"
+            className="grid gap-4 md:grid-cols-2"
             variants={staggerContainer(0.05, 0.1)}
             initial="hidden"
             animate="show"
@@ -278,7 +271,7 @@ export default function MatchesPage() {
 
 function LoadingSkeleton() {
   return (
-    <div className="grid gap-4 lg:grid-cols-2">
+    <div className="grid gap-4 md:grid-cols-2">
       {Array.from({ length: 4 }).map((_, i) => (
         <div key={i} className="rounded-2xl border border-border/70 bg-card p-5 shadow-card">
           <div className="flex items-center gap-3">

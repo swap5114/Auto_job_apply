@@ -28,6 +28,10 @@ import json
 import time
 import uuid
 import threading
+import logging
+from collections import deque
+
+logger = logging.getLogger("uvicorn.error")
 from datetime import datetime, timezone
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -73,8 +77,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="AutoApply Pipeline API",
-    description="REST API for the Auto Job Apply pipeline dashboard",
+    title="Outra Pipeline API",
+    description="REST API for the Outra pipeline dashboard",
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -94,6 +98,8 @@ else:
     ALLOWED_ORIGINS = [
         "http://localhost:3000",
         "https://auto-job-apply-frontend-831721132982.us-central1.run.app",
+        "https://outra.online",
+        "https://www.outra.online",
     ]
 
 app.add_middleware(
@@ -128,6 +134,10 @@ class LeadResponse(BaseModel):
     posted_date: str
     domain: str
     review_decision: str
+    # ATS keyword-coverage % for the tailored resume (0-100), or None if the
+    # resume hasn't been tailored yet. Surfaced so the UI can show a real
+    # resume-readiness signal instead of inferring from resume_version.
+    keyword_coverage: Optional[float] = None
     # Phase 5 additions. channel is a real list[str] (not the all-strings
     # convention every other field here follows) since it's genuinely a
     # small array -- the frontend needs it as one to render per-channel
@@ -150,6 +160,14 @@ class StatsResponse(BaseModel):
     sent: int
     replied: int
     rejected: int
+
+
+class OutreachQuotaResponse(BaseModel):
+    plan: str
+    used: int
+    limit: int
+    remaining: int
+    reset: str  # ISO timestamp of when the monthly allowance resets
 
 
 class EditRequest(BaseModel):
@@ -400,6 +418,7 @@ def _lead_to_response(lead: dict) -> LeadResponse:
         posted_date=s(lead.get("posted_date")),
         domain=s(lead.get("domain")),
         review_decision=s(lead.get("review_decision")),
+        keyword_coverage=lead.get("keyword_coverage"),
         channel=lead.get("channel") or [],
         cover_note=s(lead.get("cover_note")),
         applied_at=s(lead.get("applied_at")),
@@ -552,13 +571,19 @@ def approve_lead(
     fallback was never fed into the graph in the first place, so there's
     no channel-specific "ready_to_apply" distinction to make.
     """
+    # M-2: distinguish "lead isn't paused in the graph" (a legitimate
+    # reason to fall back to a direct status update) from "the graph resume
+    # actually errored" (a real failure we must NOT silently paper over as
+    # success). _approve returns False for the former and raises for the
+    # latter; only the False path falls through to the direct update.
     try:
         from orchestrator.review_cli import approve_lead as _approve
         if _approve(lead_id, user_id=user_id, channel=channel):
             _invalidate_leads_cache(user_id)
             return {"status": "approved", "lead_id": lead_id, "via": "graph"}
     except Exception as e:
-        print(f"  approve via graph failed ({e}), falling back to direct update")
+        logger.exception(f"approve_lead: graph resume errored for lead {lead_id} (user {user_id})")
+        raise HTTPException(status_code=500, detail=f"Approve failed during graph resume: {e}")
 
     try:
         repo.update_lead(user_id, lead_id, {"status": "approved", "review_decision": "approved"})
@@ -587,7 +612,8 @@ def reject_lead(
             _invalidate_leads_cache(user_id)
             return {"status": "rejected", "lead_id": lead_id, "via": "graph"}
     except Exception as e:
-        print(f"  reject via graph failed ({e}), falling back to direct update")
+        logger.exception(f"reject_lead: graph resume errored for lead {lead_id} (user {user_id})")
+        raise HTTPException(status_code=500, detail=f"Reject failed during graph resume: {e}")
 
     try:
         repo.update_lead(user_id, lead_id, {"status": "rejected", "review_decision": "rejected"})
@@ -613,7 +639,8 @@ def edit_lead(lead_id: str, body: EditRequest, user_id: str = Depends(get_authen
             _invalidate_leads_cache(user_id)
             return {"status": "approved", "lead_id": lead_id, "draft_updated": True, "via": "graph"}
     except Exception as e:
-        print(f"  edit via graph failed ({e}), falling back to direct update")
+        logger.exception(f"edit_lead: graph resume errored for lead {lead_id} (user {user_id})")
+        raise HTTPException(status_code=500, detail=f"Edit failed during graph resume: {e}")
 
     try:
         repo.update_lead(user_id, lead_id, {
@@ -713,12 +740,13 @@ _demo_builds_registry_lock = threading.Lock()  # protects the _demo_builds dict 
 
 def _register_build(
     build_id: str, lead_id: str, state, company: str = "", demo_title: str = "",
-    demo_project: Optional[dict] = None,
+    demo_project: Optional[dict] = None, user_id: str = "",
 ) -> None:
     with _demo_builds_registry_lock:
         _demo_builds[build_id] = {
             "state": state,
             "lead_id": lead_id,
+            "user_id": user_id,
             "lock": threading.Lock(),
             "running": True,
             "company": company,
@@ -727,8 +755,20 @@ def _register_build(
             # later, in a separate request) can chain into deploy_build()
             # with the same spec the build was originally started with.
             "demo_project": demo_project or {},
-            "started_at": _now_iso(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
         }
+    if user_id:
+        try:
+            repo.create_demo_build(
+                user_id=user_id,
+                build_id=build_id,
+                title=demo_title or "Untitled Demo",
+                company_name=company,
+                project_type=(demo_project or {}).get("project_type", "fullstack"),
+                spec_json=demo_project or {},
+            )
+        except Exception as e:
+            print(f"  [WARN] Failed to persist demo build row to DB: {e}")
 
 
 def _get_build_entry(build_id: str) -> Optional[dict]:
@@ -736,8 +776,19 @@ def _get_build_entry(build_id: str) -> Optional[dict]:
         return _demo_builds.get(build_id)
 
 
-def _finish_build_and_deploy(entry: dict, demo_project: dict, company: str, github_token: Optional[str] = None) -> None:
-    """Shared tail end for both _run_build_bg and _resume_build_bg."""
+def _finish_build_and_deploy(
+    entry: dict,
+    demo_project: dict,
+    company: str,
+    user_id: Optional[str] = None,
+    github_token: Optional[str] = None,
+    vercel_token: Optional[str] = None,
+    render_api_key: Optional[str] = None,
+) -> None:
+    """Shared tail end for both _run_build_bg and _resume_build_bg.
+    
+    Deploys to the user's connected GitHub repository, Vercel, and Render accounts.
+    """
     from sandbox import orchestrator
 
     state = entry["state"]
@@ -749,10 +800,58 @@ def _finish_build_and_deploy(entry: dict, demo_project: dict, company: str, gith
         orchestrator.stop_build(state)  # container no longer needed either way
 
     if state.stage == "success" and state.project_dir:
-        orchestrator.deploy_build(state, demo_project, company, github_token=github_token)
+        # Load user's connected provider keys from database
+        user_id_val = user_id or entry.get("user_id")
+        if user_id_val:
+            try:
+                user_keys = repo.get_user_provider_keys(user_id_val)
+                github_token = github_token or user_keys.get("github_token")
+                vercel_token = vercel_token or user_keys.get("vercel_token")
+                render_api_key = render_api_key or user_keys.get("render_api_key")
+            except Exception as e:
+                print(f"  [WARN] Could not retrieve user provider keys: {e}")
+
+        # Fall back to server environment variables if not set
+        github_token = github_token or os.getenv("GITHUB_TOKEN")
+        vercel_token = vercel_token or os.getenv("VERCEL_TOKEN")
+        render_api_key = render_api_key or os.getenv("RENDER_API_KEY")
+
+        orchestrator.deploy_build(
+            state,
+            demo_project,
+            company,
+            github_token=github_token,
+            vercel_token=vercel_token,
+            render_api_key=render_api_key,
+            project_type=demo_project.get("project_type", "fullstack"),
+        )
+
+        # Update persistent DB record with deployed URLs
+        if user_id_val:
+            try:
+                repo.update_demo_build_status(
+                    user_id=user_id_val,
+                    build_id=state.build_id,
+                    stage=state.stage,
+                    deploy_stage=state.deploy_stage,
+                    repo_url=state.repo_url,
+                    frontend_url=state.frontend_url,
+                    backend_url=state.backend_url,
+                )
+            except Exception as e:
+                print(f"  [WARN] Failed to update DemoBuild in DB: {e}")
 
 
-def _run_build_bg(build_id: str, demo_project: dict, company: str, max_attempts: int, github_token: Optional[str] = None):
+def _run_build_bg(
+    build_id: str,
+    demo_project: dict,
+    company: str,
+    max_attempts: int,
+    user_id: str = "",
+    github_token: Optional[str] = None,
+    vercel_token: Optional[str] = None,
+    render_api_key: Optional[str] = None,
+):
     """Background worker: runs the (blocking) build loop, then marks it done."""
     from sandbox import orchestrator, gcp_job_executor
 
@@ -775,10 +874,31 @@ def _run_build_bg(build_id: str, demo_project: dict, company: str, max_attempts:
                 max_attempts=max_attempts,
                 state=state,  # mutate the SAME object callers are already polling
             )
-            _finish_build_and_deploy(entry, demo_project, company, github_token=github_token)
+            _finish_build_and_deploy(
+                entry,
+                demo_project,
+                company,
+                user_id=user_id,
+                github_token=github_token,
+                vercel_token=vercel_token,
+                render_api_key=render_api_key,
+            )
     except Exception as e:
         state.stage = "failed"
+        if state.deploy_stage and state.deploy_stage not in ("deployed", "deploy_failed"):
+            state.deploy_stage = "deploy_failed"
         state.error = f"Unexpected orchestrator error: {e}"
+        state.deploy_error = state.deploy_error or str(e)
+        if user_id:
+            try:
+                repo.update_demo_build_status(
+                    user_id=user_id,
+                    build_id=build_id,
+                    stage="failed",
+                    deploy_stage="deploy_failed",
+                )
+            except Exception:
+                pass
     finally:
         with entry["lock"]:
             entry["running"] = False
@@ -830,10 +950,11 @@ def build_demo(lead_id: str, body: BuildDemoRequest, user_id: str = Depends(get_
     _register_build(
         state.build_id, lead_id, state,
         company=company, demo_title=body.demo_project.title, demo_project=demo_project_dict,
+        user_id=user_id,
     )
     threading.Thread(
         target=_run_build_bg,
-        args=(state.build_id, demo_project_dict, company, max_attempts),
+        args=(state.build_id, demo_project_dict, company, max_attempts, user_id),
         daemon=True,
     ).start()
 
@@ -969,22 +1090,30 @@ def list_builds(user_id: str = Depends(get_authenticated_user_id)):
             attempt=state.attempt,
             max_attempts=state.max_attempts,
             started_at=entry.get("started_at", ""),
+            repo_url=state.repo_url,
             frontend_url=state.frontend_url,
             backend_url=state.backend_url,
         ))
 
-    summaries.sort(key=lambda s: s.started_at, reverse=True)
+    summaries.sort(key=lambda s: (s.started_at or ""), reverse=True)
     return summaries
 
 
 @app.get("/api/demos", response_model=list[DemoBuildSummary])
 def list_demos(user_id: str = Depends(get_authenticated_user_id)):
     """List all demo builds for the Demo Studio page."""
+    from sandbox.config import DEFAULT_MAX_ATTEMPTS
+
     with _demo_builds_registry_lock:
         entries = list(_demo_builds.items())
 
     summaries = []
+    seen_ids = set()
     for build_id, entry in entries:
+        entry_user = entry.get("user_id")
+        if entry_user and entry_user != user_id:
+            continue
+        seen_ids.add(build_id)
         state = entry["state"]
         with entry["lock"]:
             running = entry["running"]
@@ -1009,7 +1138,35 @@ def list_demos(user_id: str = Depends(get_authenticated_user_id)):
             backend_url=state.backend_url,
         ))
 
-    summaries.sort(key=lambda s: s.started_at, reverse=True)
+    # Merge persisted historical demo builds from Postgres
+    try:
+        db_builds = repo.list_user_demo_builds(user_id)
+        for row in db_builds:
+            bid = row.get("build_id")
+            if bid and bid not in seen_ids:
+                seen_ids.add(bid)
+                summaries.append(DemoBuildSummary(
+                    build_id=bid,
+                    lead_id="standalone",
+                    company=row.get("company_name", ""),
+                    company_name=row.get("company_name", ""),
+                    demo_title=row.get("title", ""),
+                    title=row.get("title", ""),
+                    project_type=row.get("project_type", "fullstack"),
+                    running=False,
+                    stage=row.get("stage", "success"),
+                    deploy_stage=row.get("deploy_stage", "deployed"),
+                    attempt=1,
+                    max_attempts=DEFAULT_MAX_ATTEMPTS,
+                    started_at=str(row.get("created_at") or ""),
+                    repo_url=row.get("repo_url"),
+                    frontend_url=row.get("frontend_url"),
+                    backend_url=row.get("backend_url"),
+                ))
+    except Exception as e:
+        print(f"  [WARN] Failed to load persisted user demo builds: {e}")
+
+    summaries.sort(key=lambda s: (s.started_at or ""), reverse=True)
     return summaries
 
 
@@ -1021,14 +1178,14 @@ def get_demos_quota(user_id: str = Depends(get_authenticated_user_id)):
     key = f"user_demo:{user_id}"
     with demo_build_limiter._lock:
         hits = demo_build_limiter._hits.get(key, deque())
-        while hits and now - hits[0] > demo_build_limiter.window_seconds:
+        while hits and hits[0] <= now - demo_build_limiter.window_seconds:
             hits.popleft()
         used = len(hits)
+        limit = demo_build_limiter.max_requests
 
-    today = datetime.date.today().isoformat()
-    limit = 5
     return {
-        "date": today,
+        "user_id": user_id,
+        "date": datetime.now(timezone.utc).date().isoformat(),
         "used": used,
         "limit": limit,
         "remaining": max(0, limit - used)
@@ -1056,10 +1213,11 @@ def build_standalone_demo(body: StandaloneDemoBuildRequest, user_id: str = Depen
     _register_build(
         state.build_id, "standalone", state,
         company=body.company_name or "", demo_title=body.title, demo_project=demo_project_dict,
+        user_id=user_id,
     )
     threading.Thread(
         target=_run_build_bg,
-        args=(state.build_id, demo_project_dict, body.company_name or "", max_attempts),
+        args=(state.build_id, demo_project_dict, body.company_name or "", max_attempts, user_id),
         daemon=True,
     ).start()
 
@@ -1089,9 +1247,10 @@ def refine_demo(build_id: str, body: RefineDemoRequest, user_id: str = Depends(g
     with entry["lock"]:
         entry["running"] = True
 
+    user_id_val = entry.get("user_id", user_id)
     threading.Thread(
         target=_run_build_bg,
-        args=(build_id, demo_project, company, state.max_attempts),
+        args=(build_id, demo_project, company, state.max_attempts, user_id_val),
         daemon=True,
     ).start()
 
@@ -1137,6 +1296,15 @@ def get_stats(user_id: str = Depends(get_authenticated_user_id)):
             counts["new"] += 1
 
     return StatsResponse(total=total, **counts)
+
+
+@app.get("/api/outreach/quota", response_model=OutreachQuotaResponse)
+def get_outreach_quota_route(user_id: str = Depends(get_authenticated_user_id)):
+    """The caller's outreach quota for the current month — the single source
+    of truth for the "outreach left" card. `used` counts leads sent this
+    month; `limit` is derived from the user's plan."""
+    q = repo.get_outreach_quota(user_id)
+    return OutreachQuotaResponse(**q)
 
 
 # ---------------------------------------------------------------------------
@@ -1228,7 +1396,7 @@ def _run_pipeline_bg(user_id: str, run_id: str, sources, yc_max_leads, x_max_lea
 
     def on_step(label: str, status: str):
         try:
-            repo.append_pipeline_run_step(run_id, label, status)
+            repo.append_pipeline_run_step(run_id, label, status, user_id=user_id)
         except Exception as e:
             print(f"  ⚠️  pipeline run {run_id}: failed to record step '{label}': {e}")
 
@@ -1241,14 +1409,14 @@ def _run_pipeline_bg(user_id: str, run_id: str, sources, yc_max_leads, x_max_lea
             progress_callback=on_step,
             user_id=user_id,
         )
-        repo.update_pipeline_run(run_id, {"status": "completed", "summary": summary})
+        repo.update_pipeline_run(run_id, {"status": "completed", "summary": summary}, user_id=user_id)
     except Exception as e:
-        repo.update_pipeline_run(run_id, {"status": "failed", "error": str(e)})
+        repo.update_pipeline_run(run_id, {"status": "failed", "error": str(e)}, user_id=user_id)
     finally:
         # New leads were likely written to Postgres — drop the cache so the
         # next dashboard/leads read reflects them.
         _invalidate_leads_cache(user_id)
-        repo.update_pipeline_run(run_id, {"current_step": None, "finished_at": datetime.now(timezone.utc)})
+        repo.update_pipeline_run(run_id, {"current_step": None, "finished_at": datetime.now(timezone.utc)}, user_id=user_id)
 
 
 def _pipeline_run_to_response(run: Optional[dict]) -> dict:
@@ -1319,18 +1487,18 @@ def _run_process_leads_bg(user_id: str, run_id: str, lead_ids: list[str]):
 
     def on_step(label: str, status: str):
         try:
-            repo.append_pipeline_run_step(run_id, label, status)
+            repo.append_pipeline_run_step(run_id, label, status, user_id=user_id)
         except Exception as e:
             print(f"  ⚠️  pipeline run {run_id}: failed to record step '{label}': {e}")
 
     try:
         summary = run_pipeline_for_leads(user_id=user_id, lead_ids=lead_ids, progress_callback=on_step)
-        repo.update_pipeline_run(run_id, {"status": "completed", "summary": summary})
+        repo.update_pipeline_run(run_id, {"status": "completed", "summary": summary}, user_id=user_id)
     except Exception as e:
-        repo.update_pipeline_run(run_id, {"status": "failed", "error": str(e)})
+        repo.update_pipeline_run(run_id, {"status": "failed", "error": str(e)}, user_id=user_id)
     finally:
         _invalidate_leads_cache(user_id)
-        repo.update_pipeline_run(run_id, {"current_step": None, "finished_at": datetime.now(timezone.utc)})
+        repo.update_pipeline_run(run_id, {"current_step": None, "finished_at": datetime.now(timezone.utc)}, user_id=user_id)
 
 
 @app.post("/api/pipeline/run-for-leads")
@@ -1513,6 +1681,94 @@ def trigger_catalog_refresh(providers: Optional[list[str]] = None, user_id: str 
 
 
 # ---------------------------------------------------------------------------
+# Routes: Internal scheduled triggers (Cloud Scheduler cron jobs)
+# ---------------------------------------------------------------------------
+
+def _verify_internal_request(request: Request) -> None:
+    """Guard for /api/internal/* Cloud Scheduler endpoints (C-3).
+
+    These endpoints trigger backend work (catalog refresh, per-tenant
+    follow-up sweeps) and are NOT behind Firebase auth, since Cloud
+    Scheduler can't mint a user token. Historically they relied solely on
+    Cloud Run ingress IAM; this adds a defense-in-depth shared-secret
+    header check.
+
+    Behavior: if INTERNAL_TASK_SECRET is set (prod), the request MUST carry
+    a matching `X-Internal-Secret` header or it's rejected 401. If the
+    secret is NOT set (local dev), the check is skipped so `docker compose`
+    / local cron keeps working — matching the codebase's existing
+    env-flag-gated posture. Configure the secret in prod AND pass it from
+    the Cloud Scheduler job (--headers=X-Internal-Secret=...).
+    """
+    import hmac
+
+    secret = os.getenv("INTERNAL_TASK_SECRET", "")
+    if not secret:
+        return  # not configured (local dev) -> skip, same as USE_CLOUD_TASKS spirit
+    provided = request.headers.get("x-internal-secret", "")
+    if not provided or not hmac.compare_digest(provided, secret):
+        raise HTTPException(status_code=401, detail="Missing or invalid internal task secret")
+
+
+@app.post("/api/internal/catalog-refresh")
+def internal_catalog_refresh(request: Request, providers: Optional[list[str]] = None):
+    """Sync the shared job catalog (companies/jobs) from YC and ATS boards.
+    Triggered daily by Google Cloud Scheduler (catalog-refresh-job).
+
+    Catalog is a shared, cross-tenant resource (companies/jobs have no
+    user_id), so this legitimately runs once, not per user.
+    """
+    _verify_internal_request(request)
+    try:
+        from orchestrator.pipeline_runner import run_catalog_refresh
+        summary = run_catalog_refresh(providers=providers or ["yc"])
+        return {"status": "success", "summary": summary}
+    except Exception as e:
+        print(f"  ❌ internal_catalog_refresh error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/internal/check-followups")
+def internal_check_followups(request: Request):
+    """Triggered daily by Google Cloud Scheduler (followups-check-job) to
+    monitor outreach threads for EVERY tenant (C-2).
+
+    Unlike the catalog refresh, follow-ups are per-user data, so this
+    sweeps all users and runs each scoped to their own user_id — the old
+    no-arg run_followup_pipeline() silently checked only the single
+    db.current_user operator, so real tenants' sent leads were never
+    followed up in production.
+    """
+    _verify_internal_request(request)
+    try:
+        from orchestrator.pipeline_runner import run_followup_pipeline
+
+        user_ids = repo.get_all_user_ids()
+        results = []
+        ok = 0
+        failed = 0
+        for user_id in user_ids:
+            try:
+                summary = run_followup_pipeline(user_id=user_id)
+                results.append({"user_id": user_id, "ok": True, "summary": summary})
+                ok += 1
+            except Exception as e:
+                print(f"  ❌ internal_check_followups error for user {user_id}: {e}")
+                results.append({"user_id": user_id, "ok": False, "error": str(e)})
+                failed += 1
+        return {
+            "status": "success",
+            "users_swept": len(user_ids),
+            "ok": ok,
+            "failed": failed,
+            "results": results,
+        }
+    except Exception as e:
+        print(f"  ❌ internal_check_followups error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
 # Routes: Gmail connection (per-user OAuth, Task 5)
 # ---------------------------------------------------------------------------
 
@@ -1576,18 +1832,27 @@ def gmail_callback(code: str = Query(None), state: str = Query(None), error: str
 
 
     if error:
+        print(f"[GMAIL CALLBACK] ERROR from Google: {error}", flush=True)
         return RedirectResponse(f"{frontend}/settings?gmail=error")
     if not code or not state:
+        print(f"[GMAIL CALLBACK] Missing code={bool(code)} state={bool(state)}", flush=True)
         return RedirectResponse(f"{frontend}/settings?gmail=error")
 
     try:
         result = gmail_oauth.exchange_code_for_account(code, state)
-    except gmail_oauth.GmailOAuthStateError:
+    except gmail_oauth.GmailOAuthStateError as e:
+        print(f"[GMAIL CALLBACK] State error: {e}", flush=True)
         return RedirectResponse(f"{frontend}/settings?gmail=state_error")
-    except gmail_oauth.GmailOAuthConfigError:
+    except gmail_oauth.GmailOAuthConfigError as e:
+        print(f"[GMAIL CALLBACK] Config error: {e}", flush=True)
         return RedirectResponse(f"{frontend}/settings?gmail=config_error")
-    except Exception:
+    except Exception as e:
+        import traceback
+        print(f"[GMAIL CALLBACK] Exchange FAILED: {e}", flush=True)
+        traceback.print_exc()
         return RedirectResponse(f"{frontend}/settings?gmail=error")
+
+    print(f"[GMAIL CALLBACK] Exchange OK: user={result['user_id']} email={result['email']}", flush=True)
 
     try:
         encrypted = gmail_oauth.encrypt_token(result["refresh_token"])
@@ -1598,9 +1863,13 @@ def gmail_callback(code: str = Query(None), state: str = Query(None), error: str
             scopes=result["scopes"],
             send_mode=result["send_mode"],
         )
-    except Exception:
+    except Exception as e:
+        import traceback
+        print(f"[GMAIL CALLBACK] Upsert FAILED: {e}", flush=True)
+        traceback.print_exc()
         return RedirectResponse(f"{frontend}/settings?gmail=error")
 
+    print(f"[GMAIL CALLBACK] SUCCESS — redirecting to {frontend}/settings?gmail=connected", flush=True)
     return RedirectResponse(f"{frontend}/settings?gmail=connected")
 
 
@@ -1640,12 +1909,19 @@ def get_search_criteria(user_id: str = Depends(get_authenticated_user_id)):
     exist side by side; this route is just gated behind auth now like every
     other non-anon route, its behavior is otherwise unchanged.
     """
-    path = _get_search_criteria_path()
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="search_criteria.json not found")
+    # C-1: per-user now. Read the caller's own saved criteria; if they have
+    # none yet, fall back to the shared config/search_criteria.json as the
+    # DEFAULT seed (read-only) so a brand-new user still gets sensible
+    # starting keywords -- but their edits go to their own row, never the
+    # shared file.
+    settings = repo.get_user_settings(user_id) or {}
+    data = settings.get("search_criteria") or {}
 
-    with open(path, "r") as f:
-        data = json.load(f)
+    if not data:
+        path = _get_search_criteria_path()
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                data = json.load(f)
 
     return SettingsResponse(
         role_keywords=data.get("role_keywords", []),
@@ -1659,35 +1935,28 @@ def get_search_criteria(user_id: str = Depends(get_authenticated_user_id)):
 
 @app.put("/api/settings/search-criteria")
 def update_search_criteria(body: SettingsUpdateRequest, user_id: str = Depends(get_authenticated_user_id)):
-    """Update search criteria configuration (global pipeline config file -- see get_search_criteria's note)."""
-    path = _get_search_criteria_path()
+    """Update the CALLER's search criteria (C-1: per-user now).
 
-    # Read existing
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            data = json.load(f)
-    else:
-        data = {}
-
-    # Merge updates
+    Writes to the caller's own user_settings.search_criteria JSONB instead
+    of the shared config/search_criteria.json, so one tenant's keyword
+    edits can never leak into another tenant's scraping/matching config.
+    """
+    updates: dict = {}
     if body.role_keywords is not None:
-        data["role_keywords"] = body.role_keywords
+        updates["role_keywords"] = body.role_keywords
     if body.tech_stack_keywords is not None:
-        data["tech_stack_keywords"] = body.tech_stack_keywords
+        updates["tech_stack_keywords"] = body.tech_stack_keywords
     if body.seniority_exclude_keywords is not None:
-        data["seniority_exclude_keywords"] = body.seniority_exclude_keywords
+        updates["seniority_exclude_keywords"] = body.seniority_exclude_keywords
     if body.non_tech_exclude_keywords is not None:
-        data["non_tech_exclude_keywords"] = body.non_tech_exclude_keywords
+        updates["non_tech_exclude_keywords"] = body.non_tech_exclude_keywords
     if body.years_experience_threshold is not None:
-        data["years_experience_threshold"] = body.years_experience_threshold
+        updates["years_experience_threshold"] = body.years_experience_threshold
     if body.location_keywords is not None:
-        data["location_keywords"] = body.location_keywords
+        updates["location_keywords"] = body.location_keywords
 
-    # Write back
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-    return {"status": "updated", "data": data}
+    row = repo.update_user_settings(user_id, search_criteria=updates) if updates else (repo.get_user_settings(user_id) or {})
+    return {"status": "updated", "data": row.get("search_criteria", {}) if isinstance(row, dict) else {}}
 
 
 @app.post("/api/settings/auto-fill-from-resume")
@@ -1747,49 +2016,56 @@ def auto_fill_search_criteria_from_resume(user_id: str = Depends(get_authenticat
 
 @app.get("/api/settings/pipeline-config", response_model=PipelineConfigResponse)
 def get_pipeline_config(user_id: str = Depends(get_authenticated_user_id)):
-    """Get pipeline configuration from .env."""
+    """Get the CALLER's pipeline configuration (C-1: per-user now).
+
+    followup_days / max_followups / gmail_direct_send are read from the
+    user's own user_settings row, falling back to the process-level
+    env default when the user hasn't set them. model_backend stays an
+    operator/infra-level value (which LLM backend the deployment uses is a
+    cost/ops decision, not a per-tenant preference) so it's still read from
+    the environment and is NOT writable per-user.
+    """
+    settings = repo.get_user_settings(user_id) or {}
+    pc = settings.get("pipeline_config") or {}
+
+    def _int_default(env_key: str, fallback: int) -> int:
+        try:
+            return int(_read_env_value(env_key, str(fallback)))
+        except (ValueError, TypeError):
+            return fallback
+
     return PipelineConfigResponse(
-        model_backend=_read_env_value("MODEL_BACKEND", "claude"),
-        followup_days=int(_read_env_value("FOLLOWUP_DAYS", "5")),
-        max_followups=int(_read_env_value("MAX_FOLLOWUPS", "1")),
-        gmail_direct_send=_read_env_value("GMAIL_DIRECT_SEND", "false").lower() == "true",
+        model_backend=_read_env_value("MODEL_BACKEND", "vertex"),
+        followup_days=int(pc.get("followup_days", _int_default("FOLLOWUP_DAYS", 5))),
+        max_followups=int(pc.get("max_followups", _int_default("MAX_FOLLOWUPS", 1))),
+        gmail_direct_send=bool(
+            pc["gmail_direct_send"] if "gmail_direct_send" in pc
+            else _read_env_value("GMAIL_DIRECT_SEND", "false").lower() == "true"
+        ),
     )
 
 
 @app.put("/api/settings/pipeline-config")
 def update_pipeline_config(body: PipelineConfigUpdateRequest, user_id: str = Depends(get_authenticated_user_id)):
-    """Update pipeline configuration in .env."""
-    env_path = _get_env_path()
+    """Update the CALLER's pipeline configuration (C-1: per-user now).
 
-    # Read current .env content
-    lines = []
-    if os.path.exists(env_path):
-        with open(env_path, "r") as f:
-            lines = f.readlines()
-
-    # Helper to update or add a key
-    def set_value(key: str, value: str):
-        nonlocal lines
-        found = False
-        for i, line in enumerate(lines):
-            if line.strip().startswith(f"{key}="):
-                lines[i] = f"{key}={value}\n"
-                found = True
-                break
-        if not found:
-            lines.append(f"{key}={value}\n")
-
-    if body.model_backend is not None:
-        set_value("MODEL_BACKEND", body.model_backend)
+    Writes to the caller's own user_settings row instead of the shared
+    config/.env, so one tenant's change can never affect another's.
+    model_backend is intentionally ignored here (operator/infra-level, set
+    via deployment env, not per-tenant) -- accepting it silently in the
+    request body but not persisting it keeps the existing UI contract
+    without reintroducing a global write.
+    """
+    updates: dict = {}
     if body.followup_days is not None:
-        set_value("FOLLOWUP_DAYS", str(body.followup_days))
+        updates["followup_days"] = int(body.followup_days)
     if body.max_followups is not None:
-        set_value("MAX_FOLLOWUPS", str(body.max_followups))
+        updates["max_followups"] = int(body.max_followups)
     if body.gmail_direct_send is not None:
-        set_value("GMAIL_DIRECT_SEND", str(body.gmail_direct_send).lower())
+        updates["gmail_direct_send"] = bool(body.gmail_direct_send)
 
-    with open(env_path, "w") as f:
-        f.writelines(lines)
+    if updates:
+        repo.update_user_settings(user_id, pipeline_config=updates)
 
     return {"status": "updated"}
 
@@ -2647,7 +2923,10 @@ def github_oauth_connect(user_id: str = Depends(get_authenticated_user_id)):
         url = get_github_auth_url(user_id)
         return {"auth_url": url}
     except ProviderOAuthConfigError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=400,
+            detail=f"GitHub 1-Click OAuth is not configured: {e} Please set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in config/.env, or paste a Personal Access Token in Settings."
+        )
 
 
 @app.get("/api/auth/github/callback")
@@ -2681,7 +2960,10 @@ def vercel_oauth_connect(user_id: str = Depends(get_authenticated_user_id)):
         url = get_vercel_auth_url(user_id)
         return {"auth_url": url}
     except ProviderOAuthConfigError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Vercel 1-Click OAuth is not configured: {e} Please set VERCEL_CLIENT_ID and VERCEL_CLIENT_SECRET in config/.env, or paste a Vercel API Token in Settings."
+        )
 
 
 @app.get("/api/auth/vercel/callback")
@@ -2697,9 +2979,11 @@ async def vercel_oauth_callback(
         return RedirectResponse(url=f"{frontend_url}/settings?vercel=error&msg={err_msg}")
 
     try:
-        from api.provider_oauth import verify_provider_state, exchange_vercel_code
-        user_id = verify_provider_state(state, expected_provider="vercel")
-        token = await exchange_vercel_code(code)
+        from api.provider_oauth import get_provider_state_payload, exchange_vercel_code
+        state_data = get_provider_state_payload(state, expected_provider="vercel")
+        user_id = state_data["user_id"]
+        code_verifier = state_data.get("code_verifier")
+        token = await exchange_vercel_code(code, code_verifier=code_verifier)
         repo.update_user_provider_keys(user_id, vercel_token=token)
         return RedirectResponse(url=f"{frontend_url}/settings?vercel=connected")
     except Exception as e:

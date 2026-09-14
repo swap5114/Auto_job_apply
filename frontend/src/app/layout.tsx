@@ -6,8 +6,8 @@ import { AuthProvider } from "@/lib/auth-context";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "AutoApply — Job Pipeline Dashboard",
-  description: "Minimalist dashboard for managing your automated job application pipeline",
+  title: "Outra — AI Cold Outreach & Job Pipeline",
+  description: "Personalized cold outreach to hiring startups — you approve every message.",
 };
 
 export default function RootLayout({

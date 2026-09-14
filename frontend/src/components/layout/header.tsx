@@ -10,13 +10,13 @@ interface HeaderProps {
 
 export function Header({ title, description, action }: HeaderProps) {
   return (
-    <div className="mb-6 flex items-end justify-between gap-4">
-      <div>
+    <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+      <div className="min-w-0">
         <motion.h1
           initial={{ opacity: 0, y: 6 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.4 }}
-          className="font-display text-3xl text-foreground"
+          className="font-display text-2xl text-foreground sm:text-3xl"
         >
           {title}
         </motion.h1>
@@ -36,6 +36,7 @@ export function Header({ title, description, action }: HeaderProps) {
           initial={{ opacity: 0, y: 6 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.4, delay: 0.12 }}
+          className="flex shrink-0 flex-wrap items-center gap-2"
         >
           {action}
         </motion.div>

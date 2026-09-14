@@ -140,6 +140,7 @@ class User(Base):
     pipeline_runs = relationship("PipelineRun", back_populates="user", cascade="all, delete-orphan")
     demo_builds = relationship("DemoBuild", back_populates="user", cascade="all, delete-orphan")
     demo_usages = relationship("DemoUsageDaily", back_populates="user", cascade="all, delete-orphan")
+    settings = relationship("UserSettings", back_populates="user", cascade="all, delete-orphan", uselist=False)
 
 
 class Resume(Base):
@@ -424,6 +425,37 @@ class DemoUsageDaily(Base):
         UniqueConstraint("user_id", "usage_date", name="uq_demo_usage_user_date"),
     )
 
+
+class UserSettings(Base):
+    """Per-user pipeline/settings knobs (C-1).
+
+    Replaces the two shared GLOBAL config files that the /api/settings/*
+    routes used to read/write for every tenant:
+      - config/.env's FOLLOWUP_DAYS / MAX_FOLLOWUPS / MODEL_BACKEND /
+        GMAIL_DIRECT_SEND (pipeline_config JSONB)
+      - config/search_criteria.json's scraper keyword filters
+        (search_criteria JSONB)
+
+    Storing these per-user means one tenant editing their settings can
+    never overwrite another tenant's, which the global-file design did.
+    Values are plain JSONB blobs so the shape can evolve without a
+    migration each time. A missing row / missing key falls back to the
+    process-level env/file default at read time.
+    """
+    __tablename__ = "user_settings"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    pipeline_config = Column(JSONB, nullable=False, default=dict)  # {followup_days, max_followups, model_backend, gmail_direct_send}
+    search_criteria = Column(JSONB, nullable=False, default=dict)  # {role_keywords, tech_stack_keywords, ...}
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    user = relationship("User", back_populates="settings")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_user_settings_user"),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -253,6 +253,17 @@ def deploy_to_github(
         env=env_vars,
     )
 
+    if result.returncode != 0 and "already exists" in result.stderr.lower():
+        print(f"  Repo '{repo_name}' already exists on GitHub — linking remote and pushing updates...")
+        view_result = subprocess.run(["gh", "repo", "view", repo_name, "--json", "url,owner", "-q", ".url"], cwd=project_dir, capture_output=True, text=True, timeout=GIT_COMMAND_TIMEOUT, env=env_vars)
+        repo_url = view_result.stdout.strip()
+        if repo_url:
+            owner = repo_url.rstrip("/").split("/")[-2]
+            _run(["git", "remote", "add", "origin", f"{repo_url}.git"], cwd=project_dir)
+            _run(["git", "push", "-u", "-f", "origin", "main"], cwd=project_dir)
+            print(f"  [OK] Force pushed updates to existing repo: {repo_url}")
+            return DeployRepoResult(repo_name=repo_name, repo_url=repo_url, owner=owner)
+
     if result.returncode != 0 and github_token:
         # Fallback to direct GitHub REST API creation + git push via token if gh CLI fails or user token differs
         import httpx

@@ -10,9 +10,10 @@ import {
   Hammer,
   CheckCircle2,
   Settings,
-  Zap,
+  Sparkles,
   Play,
   Loader2,
+  Square,
   UserRound,
   LogOut,
 } from "lucide-react";
@@ -21,6 +22,7 @@ import { api, type Stats } from "@/lib/api";
 import { usePipelineStatus } from "@/lib/use-pipeline-status";
 import { RunPipelineDialog } from "@/components/pipeline/run-pipeline-dialog";
 import { useAuth } from "@/lib/auth-context";
+import { OutraLogo } from "@/components/ui/outra-logo";
 
 export function TopBar() {
   const pathname = usePathname();
@@ -28,7 +30,7 @@ export function TopBar() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [runOpen, setRunOpen] = useState(false);
 
-  const { state } = usePipelineStatus();
+  const { state, abort, aborting } = usePipelineStatus();
   const running = state?.running ?? false;
 
   useEffect(() => {
@@ -62,13 +64,12 @@ export function TopBar() {
   const leadsBadge = stats?.total ?? null;
   const reviewBadge = stats ? (stats.pending_review ?? 0) + (stats.in_review ?? 0) : null;
 
-  // v1 nav: Matches is parked, Builds is active!
   const navigation = [
     { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard, badge: null as number | null },
+    { name: "Matches", href: "/matches", icon: Sparkles, badge: null as number | null },
     { name: "Leads", href: "/leads", icon: FileText, badge: leadsBadge },
-    { name: "Builds", href: "/builds", icon: Hammer, badge: null as number | null },
     { name: "Review", href: "/review", icon: CheckCircle2, badge: reviewBadge },
-    { name: "Profile", href: "/profile", icon: UserRound, badge: null as number | null },
+    { name: "Builds", href: "/builds", icon: Hammer, badge: null as number | null },
     { name: "Settings", href: "/settings", icon: Settings, badge: null as number | null },
   ];
 
@@ -98,17 +99,8 @@ export function TopBar() {
         className="glass mx-auto flex h-14 items-center justify-between gap-2 rounded-2xl border px-3"
       >
         {/* Logo */}
-        <Link href="/" className="flex shrink-0 items-center gap-2 pl-1 pr-2">
-          <motion.div
-            whileHover={{ rotate: -12, scale: 1.08 }}
-            transition={{ type: "spring", stiffness: 400, damping: 15 }}
-            className="flex h-8 w-8 items-center justify-center rounded-lg accent-gradient shadow-[0_2px_8px_-2px_hsl(var(--accent-1)/0.5)]"
-          >
-            <Zap className="h-4 w-4 text-white" />
-          </motion.div>
-          <span className="hidden font-display text-base leading-none text-foreground sm:block">
-            AutoApply
-          </span>
+        <Link href="/" className="flex shrink-0 items-center pl-1 pr-2">
+          <OutraLogo size="sm" />
         </Link>
 
         {/* Center nav */}
@@ -181,6 +173,29 @@ export function TopBar() {
             )}
           </AnimatePresence>
 
+          {/* Abort — only while a run is in progress */}
+          <AnimatePresence>
+            {running && (
+              <motion.button
+                initial={{ opacity: 0, width: 0 }}
+                animate={{ opacity: 1, width: "auto" }}
+                exit={{ opacity: 0, width: 0 }}
+                whileTap={{ scale: 0.97 }}
+                onClick={abort}
+                disabled={aborting}
+                title="Abort the current run"
+                className="inline-flex items-center gap-1.5 overflow-hidden whitespace-nowrap rounded-xl border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-60"
+              >
+                {aborting ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Square className="h-3 w-3 fill-current" />
+                )}
+                <span className="hidden sm:block">{aborting ? "Aborting" : "Abort"}</span>
+              </motion.button>
+            )}
+          </AnimatePresence>
+
           <motion.button
             whileHover={{ scale: 1.03 }}
             whileTap={{ scale: 0.97 }}
@@ -190,6 +205,19 @@ export function TopBar() {
             {running ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
             <span className="hidden sm:block">{running ? "Running" : "Run"}</span>
           </motion.button>
+
+          <Link
+            href="/profile"
+            title="Profile"
+            className={cn(
+              "flex h-9 w-9 items-center justify-center rounded-xl transition-colors",
+              pathname === "/profile"
+                ? "bg-muted text-foreground"
+                : "text-muted-foreground hover:bg-muted hover:text-foreground"
+            )}
+          >
+            <UserRound className="h-4 w-4" />
+          </Link>
 
           <button
             onClick={handleSignOut}

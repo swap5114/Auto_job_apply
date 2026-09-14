@@ -55,7 +55,7 @@ def test_token_encrypt_decrypt_roundtrip():
 def test_state_sign_verify_roundtrip_and_tamper():
     state = gmail_oauth.sign_state("user-123", "direct")
     decoded = gmail_oauth.verify_state(state)
-    assert decoded == {"user_id": "user-123", "send_mode": "direct"}
+    assert decoded == {"user_id": "user-123", "send_mode": "direct", "code_verifier": ""}
 
     # Corrupt a character in the middle -> HMAC check fails.
     i = len(state) // 2
