@@ -29,6 +29,7 @@ apscheduler
 # Sandbox (Docker-based demo builder)
 docker
 google-cloud-run
+google-cloud-storage # Resume artifact store (storage/artifact_store.py): PDFs/MD/original uploads live in GCS in prod (RESUME_STORAGE_BACKEND=gcs), local disk in dev.
 
 # --- Phase 0: Production Foundation (Postgres multi-tenant backend) ---
 sqlalchemy==2.0.36

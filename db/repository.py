@@ -42,6 +42,7 @@ from db.models import (
     Resume,
     SearchCriteria,
     Subscription,
+    TailoredResume,
     UsageCounter,
     User,
     UserSettings,
@@ -423,6 +424,75 @@ def get_primary_resume(user_id: str) -> Optional[dict]:
                 select(Resume).where(Resume.user_id == user_id).order_by(Resume.created_at.desc())
             )
         return _to_dict(resume) if resume else None
+
+
+# ---------------------------------------------------------------------------
+# Tailored resumes (per-user, per-lead/company; JSON in PG, artifacts in store)
+# ---------------------------------------------------------------------------
+
+
+def add_tailored_resume(user_id: str, data: dict) -> dict:
+    """Persist a tailored resume version for user_id. `data` may include
+    lead_id, company, role, tailored_json, keyword_coverage, pdf_key, md_key,
+    legacy_version, source. Returns the created row as a dict."""
+    if not user_id:
+        raise ValidationError("add_tailored_resume requires a user_id")
+    with get_session() as session:
+        row = TailoredResume(
+            user_id=user_id,
+            lead_id=data.get("lead_id"),
+            company=data.get("company"),
+            role=data.get("role"),
+            tailored_json=data.get("tailored_json"),
+            keyword_coverage=data.get("keyword_coverage"),
+            template=data.get("template") or "jake",
+            model_used=data.get("model_used"),
+            pdf_key=data.get("pdf_key"),
+            md_key=data.get("md_key"),
+            legacy_version=data.get("legacy_version"),
+            source=data.get("source") or "pipeline",
+        )
+        session.add(row)
+        session.flush()
+        return _to_dict(row)
+
+
+def get_tailored_resumes(user_id: str, limit: int = 100) -> list[dict]:
+    """All tailored resume versions for user_id, newest first."""
+    with get_session() as session:
+        rows = session.scalars(
+            select(TailoredResume)
+            .where(TailoredResume.user_id == user_id)
+            .order_by(TailoredResume.created_at.desc())
+            .limit(limit)
+        ).all()
+        return [_to_dict(r) for r in rows]
+
+
+def get_tailored_resume(user_id: str, tailored_id: str) -> Optional[dict]:
+    """Fetch one tailored resume, scoped to user_id."""
+    if not _is_valid_uuid(tailored_id):
+        return None
+    with get_session() as session:
+        row = session.scalar(
+            select(TailoredResume).where(
+                TailoredResume.id == tailored_id, TailoredResume.user_id == user_id
+            )
+        )
+        return _to_dict(row) if row else None
+
+
+def get_tailored_resume_for_lead(user_id: str, lead_id: str) -> Optional[dict]:
+    """Most recent tailored resume for a specific lead, scoped to user_id."""
+    if not _is_valid_uuid(lead_id):
+        return None
+    with get_session() as session:
+        row = session.scalar(
+            select(TailoredResume)
+            .where(TailoredResume.user_id == user_id, TailoredResume.lead_id == lead_id)
+            .order_by(TailoredResume.created_at.desc())
+        )
+        return _to_dict(row) if row else None
 
 
 
@@ -822,7 +892,11 @@ def close_unseen_jobs(company_id: str, seen_external_ids: set[str]) -> int:
         return closed
 
 
-def get_jobs(company_id: Optional[str] = None, open_only: bool = False) -> list[dict]:
+def get_jobs(
+    company_id: Optional[str] = None,
+    open_only: bool = False,
+    sources: Optional[list[str]] = None,
+) -> list[dict]:
     """Return catalog jobs, optionally scoped to one company and/or
     filtered to only currently-open ones (is_open=True -- see add_job's
     docstring for how that flag stays accurate).
@@ -831,6 +905,11 @@ def get_jobs(company_id: Optional[str] = None, open_only: bool = False) -> list[
     connector tests, prioritize_tokens' bookkeeping) keep seeing every
     row unchanged; user-facing matching (skills/match_jobs.py's callers)
     should pass open_only=True.
+
+    sources, when given, restricts the result to jobs from those catalog
+    sources (e.g. ["yc"]). This is how the user-facing match feeds keep
+    non-YC sources (greenhouse/lever/ashby/…) parked while they're on
+    hold, without deleting their rows or touching the scrapers.
     """
     with get_session() as session:
         stmt = select(Job)
@@ -838,8 +917,58 @@ def get_jobs(company_id: Optional[str] = None, open_only: bool = False) -> list[
             stmt = stmt.where(Job.company_id == company_id)
         if open_only:
             stmt = stmt.where(Job.is_open.is_(True))
+        if sources:
+            stmt = stmt.where(Job.source.in_(sources))
         jobs = session.scalars(stmt).all()
         return [_to_dict(j) for j in jobs]
+
+
+def search_jobs_by_company(
+    query: str,
+    open_only: bool = True,
+    sources: Optional[list[str]] = None,
+    limit: int = 20,
+) -> list[dict]:
+    """Search the shared catalog for jobs whose COMPANY name matches `query`
+    (case-insensitive substring). Each returned dict is the job plus a
+    "company_name" key (the joined Company.name), so callers can build a
+    response without a second lookup.
+
+    Powers the Matches search bar's local-catalog tier: an instant search
+    over the YC companies/jobs we've already synced. Results are ordered
+    with prefix matches ahead of mid-string matches, then alphabetically.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    like = f"%{q.lower()}%"
+
+    with get_session() as session:
+        stmt = (
+            select(Job, Company.name)
+            .join(Company, Company.id == Job.company_id)
+            .where(func.lower(Company.name).like(like))
+        )
+        if open_only:
+            stmt = stmt.where(Job.is_open.is_(True))
+        if sources:
+            stmt = stmt.where(Job.source.in_(sources))
+
+        rows = session.execute(stmt).all()
+        out: list[dict] = []
+        for job, company_name in rows:
+            d = _to_dict(job)
+            d["company_name"] = company_name
+            out.append(d)
+
+    ql = q.lower()
+
+    def _rank(d: dict) -> tuple[int, str]:
+        name = (d.get("company_name") or "").lower()
+        return (0 if name.startswith(ql) else 1, name)
+
+    out.sort(key=_rank)
+    return out[:limit]
 
 
 def get_job_with_company(job_id: str) -> Optional[dict]:

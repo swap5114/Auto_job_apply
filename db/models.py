@@ -156,6 +156,44 @@ class Resume(Base):
     user = relationship("User", back_populates="resumes")
 
 
+class TailoredResume(Base):
+    """A per-lead / per-company tailored version of a user's resume.
+
+    The structured tailored JSON lives here in Postgres (small, queryable,
+    the source of truth). The rendered PDF/Markdown artifacts live in object
+    storage (storage/artifact_store.py) — only their keys are stored here
+    (pdf_key/md_key), never the bytes, so the table stays lean and the
+    artifacts survive multi-instance/Cloud Run deploys.
+
+    Powers the Resume page's history list ("every version we built, and the
+    company it was built for") and the outreach attach path (resolve pdf_key
+    -> object store -> attach), replacing the old flat resumes/ disk files.
+    """
+    __tablename__ = "tailored_resumes"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Optional link to the lead this was tailored for (null for a manual
+    # rephrase saved from the Resume page). Set null on lead delete so the
+    # version survives in history.
+    lead_id = Column(UUID(as_uuid=False), ForeignKey("leads.id", ondelete="SET NULL"), nullable=True, index=True)
+    company = Column(String, nullable=True)
+    role = Column(String, nullable=True)
+    tailored_json = Column(JSONB, nullable=True)
+    keyword_coverage = Column(Float, nullable=True)  # ATS score 0-100
+    template = Column(String, nullable=False, default="jake")  # standard | jake
+    model_used = Column(String, nullable=True)  # vertex (gemini) | vertex_claude
+    # Object-storage keys (storage/artifact_store.py). Bytes never live in PG.
+    pdf_key = Column(String, nullable=True)
+    md_key = Column(String, nullable=True)
+    # Legacy/local filename base (pre-object-store) for backward-compat reads.
+    legacy_version = Column(String, nullable=True)
+    source = Column(String, nullable=False, default="pipeline")  # pipeline | manual
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+    user = relationship("User")
+
+
 class SearchCriteria(Base):
     __tablename__ = "search_criteria"
 

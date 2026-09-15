@@ -34,9 +34,63 @@ Return ONLY the message text in the exact format requested. No prose, no explana
 
 
 def load_tailored_resume(resume_version: str) -> dict:
-    path = os.path.join(RESUMES_DIR, f"{resume_version}.json")
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    from storage import artifact_store as store
+
+    data = store.get_bytes(f"{resume_version}.json")
+    if data is None:
+        raise FileNotFoundError(f"tailored resume JSON not found for version '{resume_version}'")
+    return json.loads(data.decode("utf-8"))
+
+
+def _own_links(tailored_resume: dict) -> set[str]:
+    """The candidate's own contact links (github/linkedin/portfolio/email),
+    normalized to lowercase, so we can verify the outreach draft only ever
+    cites links that belong to this specific user's resume."""
+    contact = (tailored_resume.get("contact") or {}) if isinstance(tailored_resume, dict) else {}
+    links: set[str] = set()
+    for key in ("github", "linkedin", "portfolio", "email", "website"):
+        val = (contact.get(key) or "").strip().lower()
+        if val:
+            links.add(val)
+    return links
+
+
+def sanitize_outreach_links(draft: str, tailored_resume: dict) -> str:
+    """Defense-in-depth: strip any URL or email in the outreach draft that is
+    NOT one of the candidate's own resume contact links.
+
+    The prompt already instructs the model to only sign off with a link from
+    the resume, but this guarantees a hallucinated/foreign handle (someone
+    else's GitHub, a made-up portfolio) can never go out. A link is kept only
+    if one of the user's own contact values is a substring of it (or vice
+    versa), so "github.com/alice" survives when the resume lists that handle
+    but a fabricated "github.com/bob" is removed.
+    """
+    if not draft:
+        return draft
+    own = _own_links(tailored_resume)
+
+    url_or_email = re.compile(
+        r"(https?://[^\s<>\)\]]+|www\.[^\s<>\)\]]+|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
+    )
+
+    def _keep(token: str) -> bool:
+        t = token.rstrip(".,;:!?)\u201d\"'").lower()
+        for link in own:
+            if link and (link in t or t in link):
+                return True
+        return False
+
+    def _repl(m: re.Match) -> str:
+        token = m.group(0)
+        return token if _keep(token) else ""
+
+    cleaned = url_or_email.sub(_repl, draft)
+    # Tidy up any orphaned "()" / doubled spaces / dangling label left behind.
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r" +\n", "\n", cleaned)
+    return cleaned.strip()
 
 
 def draft_outreach_message(tailored_resume: dict, lead: dict) -> str:
@@ -151,6 +205,10 @@ def run(user_id: str | None = None):
             except Exception:
                 pass
             continue
+
+        # Strip any link/email that isn't this user's own resume contact, so
+        # only the sender's real credentials ever go out.
+        draft = sanitize_outreach_links(draft, tailored_resume)
 
         # Success clears any prior failure flag.
         repo.update_lead(user_id, lead["id"], {

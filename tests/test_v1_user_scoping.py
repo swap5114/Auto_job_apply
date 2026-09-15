@@ -192,3 +192,98 @@ def test_tailor_resume_and_base_resume_multi_tenant_isolation(monkeypatch):
     assert tr.slugify(user_b["id"]) in res_b["resume_version"]
     assert res_a["resume_version"] != res_b["resume_version"]
 
+
+
+def test_load_base_resume_never_falls_back_to_shared_file_for_real_user():
+    """A real (non-operator) user with NO resume on file must raise
+    NoResumeError, NOT silently borrow config/base_resume.json. This is the
+    regression guard for the old 'my resume went to every user' leak.
+    """
+    import skills.tailor_resume as tr
+
+    user = _make_user("no-resume")
+    with pytest.raises(tr.NoResumeError):
+        tr.load_base_resume(user["id"])
+
+
+def test_tailor_resume_rejects_fabricated_content(monkeypatch):
+    """If the LLM invents a company/skill not in the base resume, tailor_resume
+    must reject that output and never return the fabricated version.
+    """
+    import skills.tailor_resume as tr
+
+    base = {
+        "name": "Real Candidate",
+        "contact": {"email": "real@example.com"},
+        "experience": [{"company": "TrueCorp", "title": "Engineer", "bullets": ["Built APIs"]}],
+        "skills": {"Languages": ["Python"]},
+        "projects": [],
+        "education": [],
+    }
+    # Model fabricates a new employer + a skill the candidate never listed.
+    fabricated = {
+        "name": "Real Candidate",
+        "contact": {"email": "real@example.com"},
+        "experience": [
+            {"company": "TrueCorp", "title": "Engineer", "bullets": ["Built APIs"]},
+            {"company": "FakeGiant Inc", "title": "Principal Engineer", "bullets": ["Led 50 people"]},
+        ],
+        "skills": {"Languages": ["Python", "Rust", "Go"]},
+        "projects": [],
+        "education": [],
+    }
+    monkeypatch.setattr(
+        tr, "llm_generate_json",
+        lambda system_prompt, user_message, max_tokens: fabricated,
+    )
+
+    result = tr.tailor_resume(base, "SomeCo", "Engineer", "We use Python.")
+    # Every attempt fabricated, so it must fall back to the untouched base.
+    assert result == base
+    # And the validator itself catches the fabrications directly.
+    violations = tr.find_fabrications(base, fabricated)
+    assert any("FakeGiant Inc" in v.lower() or "fakegiant" in v.lower() for v in violations)
+    assert any("rust" in v.lower() for v in violations)
+
+
+def test_find_fabrications_allows_reworded_but_truthful_bullets():
+    """Rewording bullets / reordering skills is allowed — only NEW identity
+    facts (companies, titles, skills, projects) count as fabrication."""
+    import skills.tailor_resume as tr
+
+    base = {
+        "experience": [{"company": "TrueCorp", "title": "Engineer", "bullets": ["Built REST APIs in Python"]}],
+        "skills": {"Languages": ["Python", "JavaScript"]},
+        "projects": [{"name": "Widget"}],
+        "education": [],
+    }
+    reworded = {
+        # Same company/title, bullet reworded with JD terminology, skills reordered.
+        "experience": [{"company": "TrueCorp", "title": "Engineer", "bullets": ["Designed and shipped RESTful APIs using Python"]}],
+        "skills": {"Languages": ["JavaScript", "Python"]},
+        "projects": [{"name": "Widget"}],
+        "education": [],
+    }
+    assert tr.find_fabrications(base, reworded) == []
+
+
+def test_sanitize_outreach_links_strips_foreign_links():
+    """The outreach draft must only ever cite the candidate's own resume
+    links — a fabricated/foreign GitHub or email is stripped."""
+    from skills.draft_outreach import sanitize_outreach_links
+
+    tailored = {
+        "name": "Real Candidate",
+        "contact": {"github": "https://github.com/realcandidate", "email": "real@example.com"},
+    }
+    draft = (
+        "Hi team, excited about this role.\n\n"
+        "Here's my GitHub: https://github.com/realcandidate and a portfolio "
+        "https://github.com/someoneelse plus reach me at imposter@evil.com or real@example.com.\n\n"
+        "Best,\nReal"
+    )
+    cleaned = sanitize_outreach_links(draft, tailored)
+    assert "github.com/realcandidate" in cleaned
+    assert "real@example.com" in cleaned
+    assert "someoneelse" not in cleaned
+    assert "imposter@evil.com" not in cleaned

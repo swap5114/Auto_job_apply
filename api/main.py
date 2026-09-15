@@ -470,12 +470,20 @@ def get_lead_resume_pdf(lead_id: str, user_id: str = Depends(get_authenticated_u
     if not resume_version:
         raise HTTPException(status_code=404, detail="No tailored resume for this lead yet")
 
-    from skills.tailor_resume import RESUMES_DIR
-    pdf_path = os.path.join(RESUMES_DIR, f"{resume_version}.pdf")
-    if not os.path.exists(pdf_path):
-        raise HTTPException(status_code=404, detail="Tailored resume PDF file not found on disk")
+    # Serve from the artifact store (GCS in prod, local resumes/ in dev) so the
+    # PDF resolves regardless of which instance rendered it.
+    from storage import artifact_store as store
+    from fastapi.responses import Response
 
-    return FileResponse(pdf_path, media_type="application/pdf", filename=f"{resume_version}.pdf")
+    pdf_bytes = store.get_bytes(f"{resume_version}.pdf")
+    if pdf_bytes is None:
+        raise HTTPException(status_code=404, detail="Tailored resume PDF not found")
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{resume_version}.pdf"'},
+    )
 
 
 @app.post("/api/jobs/{job_id}/save", response_model=LeadResponse)
@@ -621,6 +629,23 @@ def reject_lead(
         raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
     _invalidate_leads_cache(user_id)
     return {"status": "rejected", "lead_id": lead_id, "via": "direct"}
+
+
+@app.delete("/api/leads/{lead_id}")
+def delete_lead(lead_id: str, user_id: str = Depends(get_authenticated_user_id)):
+    """Remove a lead from the user's pipeline entirely.
+
+    Used by the dashboard's "remove from pipeline" action on a saved match:
+    saving a matched catalog job creates a per-user Lead, and this is the
+    inverse -- it deletes that Lead so the match flips back to an unsaved
+    state the user can re-save. Scoped to user_id; returns 404 if the lead
+    doesn't exist or belongs to another tenant.
+    """
+    deleted = repo.delete_lead(user_id, lead_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
+    _invalidate_leads_cache(user_id)
+    return {"status": "removed", "lead_id": lead_id}
 
 
 @app.post("/api/leads/{lead_id}/edit")
@@ -2159,6 +2184,21 @@ def scheduler_trigger(job_id: str, user_id: str = Depends(get_authenticated_user
 MAX_RESUME_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
 ALLOWED_RESUME_EXTENSIONS = {".pdf", ".docx", ".txt"}
 
+# Max characters of job-description text we feed the tailoring LLM. Real JDs
+# are well under this (~1-3k words); beyond it the extra text is almost always
+# boilerplate (benefits, legal, EEO) that dilutes the signal and pushes the
+# model toward hallucination/keyword-stuffing. We hard-clip at this length and
+# tell the caller. ~12k chars ≈ 3k tokens, comfortably within budget.
+MAX_JD_CHARS = 12000
+
+# Catalog sources surfaced in the user-facing match feeds (signed-in
+# /api/jobs/matched + anonymous /api/anon/resume). Only YC is live right
+# now; the other scraped sources (greenhouse/lever/ashby/jobicy/…) are
+# parked -- their rows still live in the catalog and the scrapers still
+# run, but they're filtered out of matches until we un-park them by adding
+# their source keys here.
+MATCH_SOURCES = ["yc"]
+
 
 class ParsedResumeResponse(BaseModel):
     """Mirrors config/base_resume.json's shape -- see
@@ -2205,6 +2245,46 @@ class MatchedJobResponse(BaseModel):
     # rather than only finding out on a 409 from POST /api/jobs/{id}/save.
     already_saved_lead_id: Optional[str] = None
     already_saved_channel: list[str] = []
+
+
+class JobSearchResult(BaseModel):
+    """One search hit for the Matches search bar.
+
+    `origin` distinguishes the two tiers:
+      - "catalog": already in our synced YC catalog (has a real job `id`, so
+        it saves through the normal /api/jobs/{id}/save path).
+      - "live_yc": found in the live YC directory but not in our catalog
+        (e.g. not currently hiring). It has no job `id` yet -- saving it goes
+        through /api/jobs/search/save, which materializes a catalog row first.
+    `is_hiring` lets the UI flag cold-outreach candidates ("not actively
+    hiring — send a cold intro").
+    """
+    origin: str  # "catalog" | "live_yc"
+    id: Optional[str] = None  # catalog job id (None for live_yc until saved)
+    company_name: str
+    title: str
+    apply_url: Optional[str] = None
+    source: str = "yc"
+    is_hiring: bool = True
+    # yc directory identity, needed to save a live_yc result:
+    slug: Optional[str] = None
+    website: Optional[str] = None
+    jd_text: Optional[str] = None
+    already_saved_lead_id: Optional[str] = None
+
+
+class JobSearchResponse(BaseModel):
+    query: str
+    results: list[JobSearchResult]
+
+
+class SaveColdCompanyRequest(BaseModel):
+    """Save a live-YC company (not in our catalog) as a cold-outreach lead."""
+    slug: str
+    company_name: str
+    website: Optional[str] = None
+    jd_text: Optional[str] = None
+    apply_url: Optional[str] = None
 
 
 class AnonResumeUploadResponse(BaseModel):
@@ -2329,8 +2409,10 @@ async def chat_match(
     except Exception as e:
         print(f"  ⚠️  chat_match: failed to persist criteria for {user_id}: {e}")
 
-    # v1 is YC-focused: match only YC catalog jobs.
-    yc_jobs = [j for j in repo.get_jobs(open_only=True) if j.get("source") == "yc"]
+    # v1 is YC-focused: match only YC catalog jobs (MATCH_SOURCES). Filtered
+    # at the DB level so the other sources stay parked, same as the other
+    # match feeds (/api/jobs/matched, /api/anon/resume).
+    yc_jobs = repo.get_jobs(open_only=True, sources=MATCH_SOURCES)
     company_names = _build_company_name_map(yc_jobs)
     matched = match_jobs(yc_jobs, criteria, limit=30)
 
@@ -2392,7 +2474,9 @@ def get_matched_jobs(user_id: str = Depends(get_authenticated_user_id)):
     # open_only=True: never surface a job whose company-side board no
     # longer lists it -- see db.repository.close_unseen_jobs/add_job for
     # how is_open stays accurate.
-    all_jobs = repo.get_jobs(open_only=True)  # whole shared catalog -- no user_id, Phase 1's tables
+    # sources=MATCH_SOURCES: only YC for now -- the other catalog sources
+    # (greenhouse/lever/ashby/…) are parked, so we don't surface them here.
+    all_jobs = repo.get_jobs(open_only=True, sources=MATCH_SOURCES)  # shared catalog, YC-only
     company_names = _build_company_name_map(all_jobs)
     matched = match_jobs(all_jobs, criteria, limit=50)
 
@@ -2426,6 +2510,167 @@ def get_matched_jobs(user_id: str = Depends(get_authenticated_user_id)):
         ))
 
     return response
+
+
+@app.get("/api/jobs/search", response_model=JobSearchResponse)
+def search_jobs(
+    q: str = Query(..., min_length=1, description="Company name to search for"),
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Search YC companies by name for the Matches search bar (two tiers):
+
+      1) Local catalog first -- instant search over the YC companies/jobs we
+         already sync (MATCH_SOURCES). These are actively-hiring roles.
+      2) Live YC fallback -- if a company isn't in our catalog (not currently
+         hiring, or an older batch we don't sync), we look it up in the full
+         YC directory (all.json) so the user can still cold-mail it. These
+         come back with origin="live_yc" and is_hiring reflecting the
+         directory, and are saved via /api/jobs/search/save.
+
+    Local hits always rank above live hits, and we suppress live duplicates of
+    companies already present in the catalog.
+    """
+    query = (q or "").strip()
+    if not query:
+        return JobSearchResponse(query=query, results=[])
+
+    # Which of the user's leads are already saved, keyed by job_id, so a
+    # catalog result can render as "Saved" instead of risking a 409.
+    existing_by_job_id: dict[str, dict] = {}
+    for lead in repo.get_leads(user_id):
+        jid = lead.get("job_id")
+        if jid:
+            existing_by_job_id[str(jid)] = lead
+
+    results: list[JobSearchResult] = []
+    seen_company_names: set[str] = set()
+
+    # Tier 1 — local catalog (YC only).
+    catalog_hits = repo.search_jobs_by_company(
+        query, open_only=True, sources=MATCH_SOURCES, limit=20
+    )
+    for job in catalog_hits:
+        name = job.get("company_name") or "Unknown Company"
+        seen_company_names.add(name.strip().lower())
+        existing = existing_by_job_id.get(str(job.get("id")))
+        results.append(JobSearchResult(
+            origin="catalog",
+            id=str(job.get("id")),
+            company_name=name,
+            title=job.get("title") or "",
+            apply_url=job.get("apply_url"),
+            source=job.get("source") or "yc",
+            is_hiring=True,
+            jd_text=job.get("jd_text"),
+            already_saved_lead_id=str(existing["id"]) if existing else None,
+        ))
+
+    # Tier 2 — live YC directory fallback (cold-mail candidates). Only bother
+    # if the local catalog gave us little/nothing, and skip companies we
+    # already surfaced from the catalog.
+    if len(results) < 10:
+        try:
+            from skills.scrape_job_boards.yc_startups import search_companies
+            live = search_companies(query, limit=10)
+        except Exception as e:
+            logger.warning(f"search_jobs: live YC lookup failed for '{query}': {e}")
+            live = []
+        for c in live:
+            name = (c.get("company") or "").strip()
+            if not name or name.lower() in seen_company_names:
+                continue
+            seen_company_names.add(name.lower())
+            results.append(JobSearchResult(
+                origin="live_yc",
+                id=None,
+                company_name=name,
+                title=c.get("role") or f"Engineering @ {name}",
+                apply_url=c.get("listing_url"),
+                source="yc",
+                is_hiring=bool(c.get("is_hiring")),
+                slug=c.get("slug"),
+                website=c.get("website"),
+                jd_text=c.get("jd_text"),
+            ))
+
+    return JobSearchResponse(query=query, results=results)
+
+
+@app.post("/api/jobs/search/save", response_model=LeadResponse)
+def save_cold_company(
+    body: SaveColdCompanyRequest,
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Save a live-YC company (found via /api/jobs/search but not in our
+    catalog) as a per-user cold-outreach lead.
+
+    We first materialize the company + a placeholder job in the shared
+    catalog (same shape as the daily YC catalog sync: Company ats_type="yc",
+    Job source="yc", external_id=slug), so the row is deduped/reusable and
+    downstream email discovery can resolve the company domain. Then we create
+    the lead against that catalog job via the normal save path.
+    """
+    slug = (body.slug or "").strip()
+    name = (body.company_name or "").strip()
+    if not slug or not name:
+        raise HTTPException(status_code=400, detail="slug and company_name are required")
+
+    # Materialize the catalog company + job (idempotent on re-save).
+    company = repo.get_or_create_company(name=name, ats_type="yc", ats_token=slug)
+    website = (body.website or "").strip()
+    apply_url = (body.apply_url or website or f"https://www.ycombinator.com/companies/{slug}").strip()
+    job = repo.add_job(
+        company["id"],
+        source="yc",
+        external_id=slug,
+        title=f"Engineering @ {name}",
+        location="Remote/Unspecified",
+        department="Engineering",
+        jd_text=body.jd_text or "",
+        apply_url=apply_url,
+        posted_at=None,
+    )
+    # add_job returns None if the job already existed -- fetch it either way.
+    if job is None:
+        job = next(
+            (j for j in repo.get_jobs(company_id=company["id"]) if j.get("external_id") == slug),
+            None,
+        )
+    if job is None:
+        raise HTTPException(status_code=500, detail="Failed to materialize catalog job for company")
+
+    # Derive a real domain from the website (skip ATS/YC hosts), mirroring
+    # the /api/jobs/{id}/save path so email discovery has something to work with.
+    domain = ""
+    if website:
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(website if "://" in website else f"https://{website}").netloc
+            domain = host.replace("www.", "").strip()
+            if any(b in domain for b in ("greenhouse.io", "lever.co", "ashbyhq.com", "ycombinator.com")):
+                domain = ""
+        except Exception:
+            domain = ""
+
+    try:
+        lead = repo.add_lead(user_id, {
+            "job_id": job["id"],
+            "channel": ["outreach"],
+            "source": "yc",
+            "company": name,
+            "role": f"Engineering @ {name}",
+            "jd_text": body.jd_text or "",
+            "listing_url": apply_url,
+            "domain": domain,
+            "status": "matched",
+        })
+    except repo.DuplicateLeadError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except repo.ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    _invalidate_leads_cache(user_id)
+    return _lead_to_response(lead)
 
 
 @app.post("/api/anon/resume", response_model=AnonResumeUploadResponse)
@@ -2473,8 +2718,9 @@ async def anon_upload_resume(request: Request, file: UploadFile = File(...)):
 
     inferred_criteria = infer_criteria(parsed_resume)
 
-    # open_only=True: see the /api/jobs/matched route's identical comment.
-    all_jobs = repo.get_jobs(open_only=True)  # whole shared catalog -- no user_id, Phase 1's tables
+    # open_only=True + sources=MATCH_SOURCES: see the /api/jobs/matched
+    # route's identical comment -- YC-only, other sources parked.
+    all_jobs = repo.get_jobs(open_only=True, sources=MATCH_SOURCES)  # shared catalog, YC-only
     company_names = _build_company_name_map(all_jobs)
     matched = match_jobs(all_jobs, inferred_criteria, limit=50)
 
@@ -2630,6 +2876,55 @@ class ProfileResumeResponse(BaseModel):
     parsed_json: Optional[dict] = None
     is_primary: bool
     created_at: str
+    # True when parsing degraded (LLM truncation/failure fell back to the
+    # heuristic). The frontend surfaces a "we couldn't fully read your resume,
+    # please re-upload" prompt instead of silently trusting a gutted parse.
+    parse_incomplete: bool = False
+    parse_warning: Optional[str] = None
+
+
+class BaseResumeResponse(BaseModel):
+    """The user's current base (primary) resume, for the Resume page's editor."""
+    resume_id: Optional[str] = None
+    parsed_json: Optional[dict] = None
+    has_resume: bool = False
+
+
+class RephraseRequest(BaseModel):
+    """Live rephrase of the base resume against a JD / freeform instruction.
+    Preview only — nothing is persisted."""
+    jd_text: str
+    company: Optional[str] = None
+    role: Optional[str] = None
+    template: Optional[str] = "jake"  # standard | jake
+
+
+class RephraseResponse(BaseModel):
+    base_json: dict
+    tailored_json: dict
+    keyword_coverage: float
+    ats_below_floor: bool
+    model_used: str
+    escalated: bool
+    template: str
+    # Positional change-map for live highlighting (see diff_resumes).
+    diff: dict
+    # True when the pasted JD exceeded max_jd_chars and was clipped.
+    jd_truncated: bool = False
+    max_jd_chars: int = MAX_JD_CHARS
+
+
+class TailoredResumeResponse(BaseModel):
+    id: str
+    lead_id: Optional[str] = None
+    company: Optional[str] = None
+    role: Optional[str] = None
+    keyword_coverage: Optional[float] = None
+    template: str = "jake"
+    model_used: Optional[str] = None
+    source: str
+    created_at: str
+    tailored_json: Optional[dict] = None
 
 
 @app.get("/api/profile/search-criteria", response_model=ProfileSearchCriteriaResponse)
@@ -2694,6 +2989,44 @@ def list_profile_resumes(user_id: str = Depends(get_authenticated_user_id)):
     ]
 
 
+class SaveResumeVersionRequest(BaseModel):
+    """Save an edited/tailored resume JSON as a new named version (NOT the
+    primary — the base resume stays the tailoring source of truth). The name
+    is what shows in the Resume-page selector dropdown."""
+    parsed_json: dict
+    name: Optional[str] = None
+    is_primary: bool = False
+
+
+@app.post("/api/profile/resumes", response_model=ProfileResumeResponse)
+def save_profile_resume(
+    body: SaveResumeVersionRequest,
+    user_id: str = Depends(get_authenticated_user_id),
+):
+    """Persist a resume JSON the user tailored/edited on the Resume page as a
+    saved version they can re-select later from the dropdown. Stored as a
+    non-primary version by default so it never silently replaces the base
+    resume the pipeline tailors from.
+    """
+    if not body.parsed_json:
+        raise HTTPException(status_code=400, detail="parsed_json is required")
+
+    name = (body.name or "").strip() or (body.parsed_json.get("name") or "Saved resume")
+    saved = repo.add_resume(
+        user_id,
+        file_ref=name,
+        parsed_json=body.parsed_json,
+        is_primary=bool(body.is_primary),
+    )
+    return ProfileResumeResponse(
+        id=str(saved["id"]),
+        file_ref=saved.get("file_ref"),
+        parsed_json=saved.get("parsed_json"),
+        is_primary=bool(saved.get("is_primary")),
+        created_at=saved["created_at"].isoformat() if saved.get("created_at") else "",
+    )
+
+
 @app.post("/api/profile/upload-resume", response_model=ProfileResumeResponse)
 async def profile_upload_resume(
     file: UploadFile = File(...),
@@ -2734,12 +3067,21 @@ async def profile_upload_resume(
     except ResumeParseError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    # Separate the internal parse-quality markers from the resume content we
+    # actually store, so a degraded parse is surfaced to the user rather than
+    # silently saved as their clean primary resume.
+    parse_incomplete = bool(parsed_resume.pop("_parse_incomplete", False))
+    parse_warning = parsed_resume.pop("_parse_error", None) if parse_incomplete else None
+
     from skills.infer_criteria import infer_criteria
     inferred = infer_criteria(parsed_resume)
     inferred["inferred_from_resume"] = True
 
     new_resume = repo.add_resume(user_id, file_ref=filename, parsed_json=parsed_resume, is_primary=True)
-    repo.upsert_search_criteria(user_id, inferred)
+    # Only refresh search criteria from a resume we actually parsed well —
+    # criteria inferred from a gutted resume would be wrong.
+    if not parse_incomplete:
+        repo.upsert_search_criteria(user_id, inferred)
 
     created_iso = new_resume["created_at"].isoformat() if hasattr(new_resume.get("created_at"), "isoformat") else str(new_resume.get("created_at") or "")
 
@@ -2749,7 +3091,154 @@ async def profile_upload_resume(
         parsed_json=parsed_resume,
         is_primary=True,
         created_at=created_iso,
+        parse_incomplete=parse_incomplete,
+        parse_warning=(
+            "We couldn't fully read this resume automatically — some sections "
+            "may be missing. Please review it, or try re-uploading as a PDF or "
+            ".docx." if parse_incomplete else None
+        ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Resume page (base resume + live JD rephrase + tailored history)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/resume/base", response_model=BaseResumeResponse)
+def get_base_resume(user_id: str = Depends(get_authenticated_user_id)):
+    """The authenticated user's current base (primary) resume, for the Resume
+    page's right-hand editor. Tenant-scoped via repo.get_primary_resume."""
+    primary = repo.get_primary_resume(user_id)
+    if not primary or not primary.get("parsed_json"):
+        return BaseResumeResponse(has_resume=False)
+    return BaseResumeResponse(
+        resume_id=str(primary["id"]),
+        parsed_json=primary.get("parsed_json"),
+        has_resume=True,
+    )
+
+
+@app.post("/api/resume/rephrase", response_model=RephraseResponse)
+def rephrase_resume(body: RephraseRequest, user_id: str = Depends(get_authenticated_user_id)):
+    """Live-rephrase the user's OWN base resume against a JD / instruction and
+    return the tailored JSON — a PREVIEW only, nothing is persisted. Same
+    tailoring engine (ATS-floor retry + anti-fabrication) as the pipeline, so
+    the Resume page shows exactly what outreach would attach.
+
+    Raises 400 if the user has no base resume on file (we never rephrase a
+    shared/other resume — same isolation guarantee as the pipeline).
+    """
+    from skills.tailor_resume import (
+        load_base_resume, tailor_resume_verbose, diff_resumes,
+        MIN_ATS_SCORE, NoResumeError, TEMPLATES, DEFAULT_TEMPLATE,
+    )
+
+    jd = (body.jd_text or "").strip()
+    if not jd:
+        raise HTTPException(status_code=400, detail="jd_text is required")
+
+    # Guard the LLM against overlong JDs: extra boilerplate past MAX_JD_CHARS
+    # dilutes the real signal and invites keyword-stuffing/hallucination. Clip
+    # and flag rather than fail, so the user still gets a tailored result.
+    jd_truncated = len(jd) > MAX_JD_CHARS
+    if jd_truncated:
+        jd = jd[:MAX_JD_CHARS]
+
+    try:
+        base_resume = load_base_resume(user_id)
+    except NoResumeError:
+        raise HTTPException(
+            status_code=400,
+            detail="No base resume on file. Upload a resume first.",
+        )
+
+    template = body.template if body.template in TEMPLATES else DEFAULT_TEMPLATE
+    company = (body.company or "").strip() or "the company"
+    role = (body.role or "").strip() or "this role"
+
+    # Single call to the configured tailoring model (chosen offline via the
+    # model benchmark) — fast and responsive, no runtime comparison.
+    result = tailor_resume_verbose(base_resume, company, role, jd)
+    tailored = result["tailored"]
+    coverage = result["keyword_coverage"]
+
+    return RephraseResponse(
+        base_json=base_resume,
+        tailored_json=tailored,
+        keyword_coverage=coverage,
+        ats_below_floor=coverage < MIN_ATS_SCORE,
+        model_used=result["model_used"],
+        escalated=result["escalated"],
+        template=template,
+        diff=diff_resumes(base_resume, tailored),
+        jd_truncated=jd_truncated,
+        max_jd_chars=MAX_JD_CHARS,
+    )
+
+
+class ResumeDownloadRequest(BaseModel):
+    """Render a resume to PDF. If resume_json is omitted, the user's current
+    base resume is used. template selects the visual layout (standard | jake)."""
+    resume_json: Optional[dict] = None
+    template: Optional[str] = "jake"
+    filename: Optional[str] = None
+
+
+@app.post("/api/resume/download")
+def download_resume_pdf(body: ResumeDownloadRequest, user_id: str = Depends(get_authenticated_user_id)):
+    """Render a resume (the on-screen edited version, or the user's base if
+    none is sent) to a PDF and stream it back. Template-aware so the download
+    matches the preview the user is looking at.
+    """
+    from fastapi.responses import Response
+    from skills.tailor_resume import (
+        load_base_resume, resume_to_pdf_bytes, NoResumeError, TEMPLATES, DEFAULT_TEMPLATE,
+    )
+
+    resume = body.resume_json
+    if not resume:
+        try:
+            resume = load_base_resume(user_id)
+        except NoResumeError:
+            raise HTTPException(status_code=400, detail="No base resume on file. Upload a resume first.")
+
+    template = body.template if body.template in TEMPLATES else DEFAULT_TEMPLATE
+    try:
+        pdf_bytes = resume_to_pdf_bytes(resume, template=template)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to render PDF: {e}")
+
+    name = (body.filename or (resume.get("name") if isinstance(resume, dict) else None) or "resume")
+    safe = "".join(c for c in str(name) if c.isalnum() or c in (" ", "-", "_")).strip().replace(" ", "_") or "resume"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{safe}.pdf"'},
+    )
+
+
+@app.get("/api/resume/tailored", response_model=list[TailoredResumeResponse])
+def list_tailored_resumes(user_id: str = Depends(get_authenticated_user_id)):
+    """History of every tailored resume version we've built for this user —
+    each with the company it was built for and its ATS score. Powers the
+    Resume page's history list. Tenant-scoped."""
+    rows = repo.get_tailored_resumes(user_id)
+    return [
+        TailoredResumeResponse(
+            id=str(r["id"]),
+            lead_id=str(r["lead_id"]) if r.get("lead_id") else None,
+            company=r.get("company"),
+            role=r.get("role"),
+            keyword_coverage=r.get("keyword_coverage"),
+            template=r.get("template") or "jake",
+            model_used=r.get("model_used"),
+            source=r.get("source") or "pipeline",
+            created_at=r["created_at"].isoformat() if r.get("created_at") else "",
+            tailored_json=r.get("tailored_json"),
+        )
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,9 @@ _FAKE_HIRING = [
 
 
 def test_run_catalog_writes_yc_jobs_and_they_are_matchable(monkeypatch):
+    # run_catalog now syncs the FULL YC directory (all batches) via
+    # fetch_all_companies, folding in the hiring feed for isHiring metadata.
+    monkeypatch.setattr(yc, "fetch_all_companies", lambda: list(_FAKE_HIRING))
     monkeypatch.setattr(yc, "fetch_hiring_companies", lambda: list(_FAKE_HIRING))
     monkeypatch.setattr(yc, "fetch_batch_companies", lambda batch: [])
 

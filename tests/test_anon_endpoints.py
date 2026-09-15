@@ -41,10 +41,10 @@ def _reset_rate_limits():
 
 def _seed_catalog_job(title="Backend Engineer", jd_text="Python and FastAPI required.") -> dict:
     company = repo.get_or_create_company(
-        "Anon Test Co", ats_type="greenhouse", ats_token=f"anon-test-{time.time_ns()}"
+        "Anon Test Co", ats_type="yc", ats_token=f"anon-test-{time.time_ns()}"
     )
     job = repo.add_job(
-        company["id"], source="greenhouse", external_id=f"ext-{time.time_ns()}",
+        company["id"], source="yc", external_id=f"ext-{time.time_ns()}",
         title=title, jd_text=jd_text, apply_url="https://example.com/apply",
     )
     return job

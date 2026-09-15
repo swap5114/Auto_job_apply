@@ -225,11 +225,38 @@ def _heuristic_resume_fallback(raw_text: str) -> dict:
     }
 
 
+# Token budget for the parse call. A structured resume (all bullets/projects/
+# skills re-emitted as JSON) routinely exceeds 4096 output tokens, which was
+# the root cause of resumes coming back truncated/half-empty. 8192 covers the
+# large majority; llm_generate_json also retries with a doubled budget on a
+# truncated response, so genuinely huge resumes still complete.
+PARSE_MAX_TOKENS = 8192
+
+
+def _looks_substantive(parsed: dict) -> bool:
+    """A confident LLM parse has real structure — at least a name plus some
+    experience/education/projects. Used to decide whether to trust the parse
+    or flag it as incomplete rather than silently saving a gutted resume."""
+    if not isinstance(parsed, dict):
+        return False
+    has_name = bool((parsed.get("name") or "").strip())
+    has_body = any(
+        parsed.get(k) for k in ("experience", "education", "projects")
+    )
+    return has_name and has_body
+
+
 def structure_resume_text(raw_text: str) -> dict:
     """The one LLM call in this module: raw extracted text -> structured
     resume JSON. Callers should go through parse_resume_cached() instead
     of calling this directly, so repeated uploads of the same resume text
     don't repeatedly pay for this call.
+
+    On a genuine LLM/JSON failure we fall back to the heuristic parser, but we
+    ANNOTATE the result with `_parse_incomplete: True` (and a reason) rather
+    than passing it off as a clean parse. Callers must not persist a
+    `_parse_incomplete` resume as the user's primary without surfacing that to
+    the user -- silently saving a gutted resume was the reported bug.
     """
     if not raw_text or not raw_text.strip():
         raise ResumeParseError("No text to parse (empty input).")
@@ -243,12 +270,26 @@ def structure_resume_text(raw_text: str) -> dict:
         result = llm_generate_json(
             system_prompt=SYSTEM_PROMPT,
             user_message=f"Resume text:\n\n{raw_text}",
-            max_tokens=4096,
+            max_tokens=PARSE_MAX_TOKENS,
         )
-        return result
     except Exception as e:
-        print(f"  ⚠️  structure_resume_text LLM call failed ({e}); falling back to heuristic parser.")
-        return _heuristic_resume_fallback(raw_text)
+        # LLM unavailable, still-truncated after retry, or unparseable JSON.
+        # Fall back to the heuristic, but mark it so callers don't treat a
+        # degraded parse as the real thing.
+        print(f"  ⚠️  structure_resume_text LLM call failed ({e}); using heuristic fallback (flagged incomplete).")
+        fallback = _heuristic_resume_fallback(raw_text)
+        fallback["_parse_incomplete"] = True
+        fallback["_parse_error"] = str(e)[:300]
+        return fallback
+
+    # The LLM returned valid JSON but it may be near-empty (e.g. it decided the
+    # text wasn't a resume, or a genuinely sparse resume). Only flag as
+    # incomplete when the raw text was clearly substantial yet the parse is
+    # thin — that mismatch is the signal something went wrong, not a short CV.
+    if not _looks_substantive(result) and len(raw_text.strip()) > 400:
+        result["_parse_incomplete"] = True
+        result["_parse_error"] = "LLM parse returned little structure for a substantial resume."
+    return result
 
 
 
@@ -282,7 +323,11 @@ def parse_resume_cached(file_bytes: bytes, filename: str, content_type: str = ""
         return _parse_cache[key], raw_text
 
     parsed = structure_resume_text(raw_text)
-    _parse_cache[key] = parsed
+    # Only cache a confident parse. Caching an incomplete/heuristic result
+    # would make a transient failure "sticky" -- re-uploading the same file
+    # would keep returning the gutted version until the process restarts.
+    if not parsed.get("_parse_incomplete"):
+        _parse_cache[key] = parsed
     return parsed, raw_text
 
 

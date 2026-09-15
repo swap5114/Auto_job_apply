@@ -161,7 +161,7 @@ def research_company_node(state: PipelineState) -> Dict[str, Any]:
 
 def tailor_resume_node(state: PipelineState) -> Dict[str, Any]:
     """Tailor resume for a lead using Claude/Gemini."""
-    from skills.tailor_resume import tailor_resume_for_lead
+    from skills.tailor_resume import tailor_resume_for_lead, NoResumeError
     
     company = state.get("company", "")
     role = state.get("role", "")
@@ -193,6 +193,12 @@ def tailor_resume_node(state: PipelineState) -> Dict[str, Any]:
         else:
             print(f"  ⚠️  tailor_resume_node: tailoring failed for {company}")
             return {"status": "tailor_failed"}
+    except NoResumeError as e:
+        # The user has no resume on file — do NOT tailor against a shared /
+        # someone else's resume. Surface a distinct status so the UI can
+        # prompt them to upload one.
+        print(f"  ⛔ tailor_resume_node: {e}")
+        return {"status": "no_resume"}
     except Exception as e:
         print(f"  ❌ tailor_resume_node failed for {company}: {e}")
         return {"status": "tailor_failed"}
@@ -360,7 +366,7 @@ def draft_node(state: PipelineState) -> Dict[str, Any]:
     """
     import json
     from skills.llm_client import llm_generate
-    from skills.draft_outreach import SYSTEM_PROMPT, load_tailored_resume
+    from skills.draft_outreach import SYSTEM_PROMPT, load_tailored_resume, sanitize_outreach_links
 
     company = state.get("company") or ""
     role = state.get("role") or ""
@@ -462,6 +468,8 @@ Candidate's tailored resume for this lead (JSON):
             user_message=user_message,
             max_tokens=1024,
         )
+        # Strip any link/email that isn't this user's own resume contact.
+        draft = sanitize_outreach_links(draft, tailored_resume)
         print(f"  ✍️  draft_node: {'follow-up' if is_followup else 'outreach'} drafted for {company}")
         return {
             "outreach_draft": draft,

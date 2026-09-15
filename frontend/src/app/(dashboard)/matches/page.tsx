@@ -15,6 +15,7 @@ import {
   ArrowRight,
   Flame,
 } from "lucide-react";
+import { Search, Send, X } from "lucide-react";
 import { toast } from "sonner";
 import { Header } from "@/components/layout/header";
 import { PageTransition } from "@/components/layout/page-transition";
@@ -22,7 +23,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { AnimatedCounter } from "@/components/ui/animated-counter";
 import { staggerContainer, fadeInUp, scaleIn } from "@/lib/motion";
-import { api, type MatchedJob } from "@/lib/api";
+import { api, type MatchedJob, type JobSearchResult } from "@/lib/api";
 import { Panel } from "@/components/ui/panel";
 
 export default function MatchesPage() {
@@ -32,6 +33,12 @@ export default function MatchesPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [savingId, setSavingId] = useState<string | null>(null);
+
+  // --- Search state --------------------------------------------------------
+  const [query, setQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<JobSearchResult[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [savingKey, setSavingKey] = useState<string | null>(null);
 
   async function load() {
     setLoading(true);
@@ -87,6 +94,70 @@ export default function MatchesPage() {
     }
   }
 
+  // Debounced company search. Empty query clears results and returns to the
+  // normal matched-jobs view.
+  useEffect(() => {
+    const q = query.trim();
+    if (!q) {
+      setSearchResults(null);
+      setSearching(false);
+      return;
+    }
+    setSearching(true);
+    const t = setTimeout(async () => {
+      try {
+        const res = await api.jobs.search(q);
+        setSearchResults(res.results);
+      } catch (e: any) {
+        toast.error(e?.message || "Search failed");
+        setSearchResults([]);
+      } finally {
+        setSearching(false);
+      }
+    }, 350);
+    return () => clearTimeout(t);
+  }, [query]);
+
+  function markResultSaved(key: string, leadId: string) {
+    setSearchResults((prev) =>
+      prev
+        ? prev.map((r) =>
+          (r.origin === "catalog" ? r.id : r.slug) === key
+            ? { ...r, already_saved_lead_id: leadId }
+            : r
+        )
+        : prev
+    );
+  }
+
+  async function handleSaveSearchResult(r: JobSearchResult) {
+    const key = (r.origin === "catalog" ? r.id : r.slug) || r.company_name;
+    setSavingKey(key);
+    try {
+      const lead =
+        r.origin === "catalog" && r.id
+          ? await api.jobs.save(r.id)
+          : await api.jobs.saveCold({
+            slug: r.slug || "",
+            company_name: r.company_name,
+            website: r.website,
+            jd_text: r.jd_text,
+            apply_url: r.apply_url,
+          });
+      markResultSaved(key, lead.id);
+      toast.success(
+        `${r.is_hiring ? "Saved" : "Added for cold outreach"}: ${r.company_name}`,
+        {
+          action: { label: "View", onClick: () => router.push(`/leads?lead=${lead.id}`) },
+        }
+      );
+    } catch (e: any) {
+      toast.error(e?.message || "Couldn't save this company");
+    } finally {
+      setSavingKey(null);
+    }
+  }
+
   return (
     <PageTransition>
       <Header
@@ -97,10 +168,30 @@ export default function MatchesPage() {
             : "Real, ranked matches from the shared job catalog, based on your saved profile."
         }
         action={
-          <Button variant="outline" size="sm" onClick={load} disabled={loading}>
-            <RefreshCw className={`mr-2 h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
-            Refresh
-          </Button>
+          <>
+            <div className="flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1.5 shadow-card">
+              <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search any YC company…"
+                className="w-40 bg-transparent text-xs text-foreground placeholder:text-muted-foreground focus:outline-none sm:w-52"
+              />
+              {query && (
+                <button
+                  onClick={() => setQuery("")}
+                  className="text-muted-foreground transition-colors hover:text-foreground"
+                  title="Clear search"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+            <Button variant="outline" size="sm" onClick={load} disabled={loading}>
+              <RefreshCw className={`mr-2 h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
+              Refresh
+            </Button>
+          </>
         }
       />
 
@@ -110,7 +201,16 @@ export default function MatchesPage() {
         </div>
       )}
 
-      {loading ? (
+      {searchResults !== null ? (
+        <SearchResultsView
+          query={query}
+          results={searchResults}
+          searching={searching}
+          savingKey={savingKey}
+          onSave={handleSaveSearchResult}
+          onView={(leadId) => router.push(`/leads?lead=${leadId}`)}
+        />
+      ) : loading ? (
         <LoadingSkeleton />
       ) : !hasCriteria ? (
         <NoCriteriaState />
@@ -345,5 +445,176 @@ function NoMatchesState({ onRefresh }: { onRefresh: () => void }) {
         </Button>
       </div>
     </motion.div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Search results
+// ---------------------------------------------------------------------------
+
+function SearchResultsView({
+  query,
+  results,
+  searching,
+  savingKey,
+  onSave,
+  onView,
+}: {
+  query: string;
+  results: JobSearchResult[];
+  searching: boolean;
+  savingKey: string | null;
+  onSave: (r: JobSearchResult) => void;
+  onView: (leadId: string) => void;
+}) {
+  const catalog = results.filter((r) => r.origin === "catalog");
+  const live = results.filter((r) => r.origin === "live_yc");
+
+  if (searching && results.length === 0) {
+    return (
+      <div className="flex items-center justify-center py-24 text-muted-foreground">
+        <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+        Searching YC companies…
+      </div>
+    );
+  }
+
+  if (results.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed py-24 text-center">
+        <div className="flex h-14 w-14 items-center justify-center rounded-full bg-muted">
+          <Building2 className="h-7 w-7 text-muted-foreground" />
+        </div>
+        <h3 className="mt-4 font-display text-xl text-foreground">
+          No YC company matches &ldquo;{query}&rdquo;
+        </h3>
+        <p className="mt-2 max-w-sm text-sm text-muted-foreground">
+          We searched both your matched roles and the full YC directory. Try a
+          different spelling or a shorter name.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-8 pb-16">
+      <p className="text-sm text-muted-foreground">
+        {results.length} result{results.length === 1 ? "" : "s"} for &ldquo;{query}&rdquo;
+      </p>
+
+      {catalog.length > 0 && (
+        <section>
+          <div className="mb-3 flex items-center gap-2">
+            <Flame className="h-3.5 w-3.5 text-accent1" />
+            <h3 className="text-sm font-semibold text-foreground">Actively hiring</h3>
+            <span className="text-xs text-muted-foreground">in your catalog</span>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            {catalog.map((r) => (
+              <SearchResultCard
+                key={`c-${r.id}`}
+                r={r}
+                busy={savingKey === (r.id || r.company_name)}
+                onSave={onSave}
+                onView={onView}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {live.length > 0 && (
+        <section>
+          <div className="mb-1 flex items-center gap-2">
+            <Send className="h-3.5 w-3.5 text-muted-foreground" />
+            <h3 className="text-sm font-semibold text-foreground">Cold outreach</h3>
+            <span className="text-xs text-muted-foreground">from the YC directory</span>
+          </div>
+          <p className="mb-3 text-xs text-muted-foreground">
+            These companies aren&apos;t in your matched roles (they may not be actively
+            hiring). Save one to send a cold intro anyway.
+          </p>
+          <div className="grid gap-3 md:grid-cols-2">
+            {live.map((r) => (
+              <SearchResultCard
+                key={`l-${r.slug}`}
+                r={r}
+                busy={savingKey === (r.slug || r.company_name)}
+                onSave={onSave}
+                onView={onView}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function SearchResultCard({
+  r,
+  busy,
+  onSave,
+  onView,
+}: {
+  r: JobSearchResult;
+  busy: boolean;
+  onSave: (r: JobSearchResult) => void;
+  onView: (leadId: string) => void;
+}) {
+  const saved = !!r.already_saved_lead_id;
+  return (
+    <Panel className="flex h-full flex-col p-5">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-muted font-display text-sm text-muted-foreground">
+            {r.company_name.charAt(0).toUpperCase()}
+          </div>
+          <div className="min-w-0">
+            <p className="truncate text-sm font-semibold text-foreground">{r.company_name}</p>
+            <p className="truncate text-sm text-muted-foreground">{r.title}</p>
+          </div>
+        </div>
+        <Badge
+          variant={r.is_hiring ? "secondary" : "outline"}
+          className="shrink-0 text-[10px]"
+        >
+          {r.is_hiring ? "Hiring" : "Not hiring"}
+        </Badge>
+      </div>
+
+      <div className="mt-4 flex flex-1 items-end justify-between gap-3 pt-2">
+        <div className="flex items-center gap-2">
+          {r.apply_url && (
+            <Button variant="ghost" size="icon" asChild className="h-8 w-8">
+              <a href={r.apply_url} target="_blank" rel="noopener noreferrer" title="View company">
+                <ExternalLink className="h-3.5 w-3.5 text-muted-foreground" />
+              </a>
+            </Button>
+          )}
+          <Badge variant="outline" className="text-[10px] uppercase">
+            YC
+          </Badge>
+        </div>
+
+        {saved ? (
+          <Button
+            size="sm"
+            variant="outline"
+            className="border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+            onClick={() => onView(r.already_saved_lead_id!)}
+          >
+            <CheckCircle2 className="mr-1.5 h-3.5 w-3.5" />
+            Saved — View
+            <ArrowRight className="ml-1.5 h-3 w-3" />
+          </Button>
+        ) : (
+          <Button size="sm" disabled={busy} onClick={() => onSave(r)}>
+            {busy ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+            {r.is_hiring ? "Save to pipeline" : "Cold outreach"}
+          </Button>
+        )}
+      </div>
+    </Panel>
   );
 }

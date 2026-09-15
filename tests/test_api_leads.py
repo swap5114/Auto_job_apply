@@ -180,10 +180,10 @@ def test_stats_reflect_seeded_leads():
 def _seed_catalog_job(title="Backend Engineer", jd_text="Python and FastAPI required.", apply_url="https://example.com/jobs/123/apply"):
     import time
     company = repo.get_or_create_company(
-        "Save Job Test Co", ats_type="greenhouse", ats_token=f"savejob-{time.time_ns()}"
+        "Save Job Test Co", ats_type="yc", ats_token=f"savejob-{time.time_ns()}"
     )
     return repo.add_job(
-        company["id"], source="greenhouse", external_id=f"ext-{time.time_ns()}",
+        company["id"], source="yc", external_id=f"ext-{time.time_ns()}",
         title=title, jd_text=jd_text, apply_url=apply_url,
     )
 

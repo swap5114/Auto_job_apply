@@ -98,6 +98,69 @@ export interface MatchedJob {
   already_saved_channel: string[];
 }
 
+export interface JobSearchResult {
+  /** "catalog" = already synced (actively hiring); "live_yc" = cold-mail candidate. */
+  origin: "catalog" | "live_yc";
+  /** Catalog job id (null for a live_yc result until it's saved). */
+  id: string | null;
+  company_name: string;
+  title: string;
+  apply_url: string | null;
+  source: string;
+  is_hiring: boolean;
+  slug: string | null;
+  website: string | null;
+  jd_text: string | null;
+  already_saved_lead_id: string | null;
+}
+
+export interface JobSearchResponse {
+  query: string;
+  results: JobSearchResult[];
+}
+
+export interface BaseResume {
+  resume_id: string | null;
+  parsed_json: Record<string, unknown> | null;
+  has_resume: boolean;
+}
+
+export type ResumeTemplate = "standard" | "jake";
+
+/** Positional change-map for live highlighting (mirrors diff_resumes). */
+export interface ResumeDiff {
+  summary?: boolean;
+  experience?: boolean[][];
+  projects?: boolean[][];
+  skills?: Record<string, boolean[]>;
+}
+
+export interface RephraseResult {
+  base_json: Record<string, unknown>;
+  tailored_json: Record<string, unknown>;
+  keyword_coverage: number;
+  ats_below_floor: boolean;
+  model_used: string;
+  escalated: boolean;
+  template: ResumeTemplate;
+  diff: ResumeDiff;
+  jd_truncated: boolean;
+  max_jd_chars: number;
+}
+
+export interface TailoredResumeItem {
+  id: string;
+  lead_id: string | null;
+  company: string | null;
+  role: string | null;
+  keyword_coverage: number | null;
+  template: ResumeTemplate;
+  model_used: string | null;
+  source: string;
+  created_at: string;
+  tailored_json: Record<string, unknown> | null;
+}
+
 export interface ParsedResume {
   name: string;
   contact: Record<string, unknown>;
@@ -313,6 +376,13 @@ export const api = {
         body: JSON.stringify({ outreach_draft }),
       }),
 
+    // Remove a lead from the pipeline entirely (the inverse of jobs.save).
+    // Used by the dashboard's "remove from pipeline" action on a saved match.
+    remove: (id: string) =>
+      request<{ status: string; lead_id: string }>(`/leads/${id}`, {
+        method: "DELETE",
+      }),
+
     // Auth is Bearer-token based (not cookies), so a plain <a href> to the
     // API route wouldn't carry the Authorization header -- this fetches
     // the PDF with the same auth headers every other api.* call uses and
@@ -425,6 +495,28 @@ export const api = {
       request<Lead>(`/jobs/${jobId}/save`, {
         method: "POST",
         body: JSON.stringify({}),
+      }),
+
+    // Search YC companies by name for the Matches search bar. Returns two
+    // tiers: "catalog" hits (already-synced, actively-hiring roles) and
+    // "live_yc" hits (found in the full YC directory but not in our catalog
+    // — e.g. not currently hiring — so the user can still cold-mail them).
+    search: (q: string) =>
+      request<JobSearchResponse>(`/jobs/search?q=${encodeURIComponent(q)}`),
+
+    // Save a live-YC company (a "live_yc" search result) as a cold-outreach
+    // lead. Materializes the catalog company/job server-side, then creates
+    // the lead — returns the new Lead.
+    saveCold: (body: {
+      slug: string;
+      company_name: string;
+      website?: string | null;
+      jd_text?: string | null;
+      apply_url?: string | null;
+    }) =>
+      request<Lead>("/jobs/search/save", {
+        method: "POST",
+        body: JSON.stringify(body),
       }),
   },
 
@@ -625,6 +717,57 @@ export const api = {
       ),
   },
 
+  resume: {
+    // The user's current base (primary) resume for the Resume page editor.
+    base: () => request<BaseResume>("/resume/base"),
+
+    // Live JD-rephrase preview of the base resume — NOT persisted.
+    rephrase: (body: {
+      jd_text: string;
+      company?: string;
+      role?: string;
+      template?: ResumeTemplate;
+    }) =>
+      request<RephraseResult>("/resume/rephrase", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
+
+    // History of every tailored version we've built (with company + ATS score).
+    tailored: () => request<TailoredResumeItem[]>("/resume/tailored"),
+
+    // Render a resume (the on-screen edited version, or the base if omitted)
+    // to a PDF and return a blob: URL the caller opens/downloads. Caller is
+    // responsible for URL.revokeObjectURL(...) when done.
+    downloadPdfBlobUrl: async (body: {
+      resume_json?: Record<string, unknown>;
+      template?: ResumeTemplate;
+      filename?: string;
+    }) => {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (getAuthToken) {
+        const token = await getAuthToken();
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+      }
+      const res = await fetch(`${BASE}/resume/download`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || `Failed to render PDF: ${res.status}`);
+      }
+      const blob = await res.blob();
+      return URL.createObjectURL(blob);
+    },
+  },
+
+  /** Max JD characters accepted by the tailoring engine (mirrors backend
+   *  MAX_JD_CHARS). Longer input is clipped server-side to avoid diluting the
+   *  signal / hallucination. */
+  RESUME_MAX_JD_CHARS: 12000,
+
   profile: {
     getSearchCriteria: () =>
       request<ProfileSearchCriteria>("/profile/search-criteria"),
@@ -636,6 +779,14 @@ export const api = {
       }),
 
     getResumes: () => request<ProfileResume[]>("/profile/resumes"),
+
+    // Save an edited/tailored resume JSON as a named, re-selectable version
+    // (non-primary — the base resume stays the tailoring source of truth).
+    saveResume: (body: { parsed_json: Record<string, unknown>; name?: string; is_primary?: boolean }) =>
+      request<ProfileResume>("/profile/resumes", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
 
     uploadResume: (file: File) => {
       const formData = new FormData();

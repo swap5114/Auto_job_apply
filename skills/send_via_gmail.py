@@ -225,13 +225,33 @@ def build_email_message(
 
 
 def resume_pdf_path(lead: dict) -> str:
-    """Resolve the tailored resume PDF path from a lead's resume_version."""
+    """Resolve a local filesystem path to the tailored resume PDF for a lead,
+    fetching from the artifact store (GCS in prod, local resumes/ in dev).
+
+    build_email_message attaches by opening a file path, so for the GCS
+    backend we materialize the bytes into a temp file and return that path;
+    for the local backend we return the existing resumes/ path directly.
+    Returns "" if there's no tailored PDF for this lead.
+    """
     version = (lead.get("resume_version") or "").strip()
     if not version:
         return ""
-    # resume_version is the base filename (no extension)
-    path = os.path.join(RESUMES_DIR, f"{version}.pdf")
-    return path if os.path.exists(path) else ""
+
+    from storage import artifact_store as store
+
+    key = f"{version}.pdf"
+    if store.backend() == "local":
+        path = os.path.join(RESUMES_DIR, f"{version}.pdf")
+        return path if os.path.exists(path) else ""
+
+    data = store.get_bytes(key)
+    if data is None:
+        return ""
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(prefix="resume_", suffix=".pdf")
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return tmp_path
 
 def extract_subject_and_body(outreach_draft: str, company: str, role: str) -> tuple[str, str]:
     """Parse the outreach draft into subject line and body.

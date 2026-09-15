@@ -15,7 +15,7 @@ import { motion } from "framer-motion";
  *
  * It's drawn on a 32x32 grid with a single consistent stroke, so it stays
  * crisp from a 16px favicon up to a hero lockup. Colour comes from the
- * landing page's signature coral -> peach accent gradient
+ * brand's neutral near-black accent gradient
  * (--accent-1 / --accent-2), with a `mono` option for single-colour contexts
  * (print, embossing, dark UI chrome).
  *
@@ -148,9 +148,9 @@ export function OutraLogo({
               y2="28"
               gradientUnits="userSpaceOnUse"
             >
-              {/* accent-1 (coral) -> accent-2 (peach) from globals.css */}
-              <stop offset="0%" stopColor="hsl(14 82% 63%)" />
-              <stop offset="100%" stopColor="hsl(28 88% 68%)" />
+              {/* accent-1 -> accent-2 (near-black neutral) from globals.css */}
+              <stop offset="0%" stopColor="hsl(220 9% 15%)" />
+              <stop offset="100%" stopColor="hsl(220 8% 28%)" />
             </linearGradient>
           </defs>
         )}

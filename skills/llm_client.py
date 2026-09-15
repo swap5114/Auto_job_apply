@@ -49,8 +49,19 @@ _TRANSIENT_MARKERS = (
 
 def _is_transient_error(exc: Exception) -> bool:
     """True if an exception looks like a transient provider error worth retrying."""
+    if isinstance(exc, LLMTruncatedError):
+        return True
     msg = str(exc).lower()
     return any(marker in msg for marker in _TRANSIENT_MARKERS)
+
+
+class LLMTruncatedError(RuntimeError):
+    """Raised when the provider stopped generating because it hit the output
+    token ceiling (finishReason == MAX_TOKENS), so the returned text is
+    incomplete (e.g. JSON cut off mid-string). Distinct from a generic error
+    so callers can retry with a larger max_tokens budget instead of silently
+    accepting a truncated/broken response -- the root cause of resumes that
+    parsed 'half-empty' or 'broke midway'."""
 
 # Claude defaults
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
@@ -68,6 +79,25 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 VERTEX_PROJECT = os.getenv("VERTEX_PROJECT", os.getenv("GCP_PROJECT", os.getenv("GOOGLE_CLOUD_PROJECT", "auto-job-apply-1859b")))
 VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
 VERTEX_MODEL = os.getenv("VERTEX_MODEL", "gemini-2.5-flash")
+# Bigger Google reasoning model for higher-quality output (e.g. resume
+# tailoring) — same Vertex generateContent path/region as Flash, no partner
+# quota needed. Used via the "vertex_pro" backend.
+VERTEX_PRO_MODEL = os.getenv("VERTEX_PRO_MODEL", "gemini-2.5-pro")
+# Claude served THROUGH Vertex AI (billed to GCP credits via ADC — no
+# Anthropic API key). Model ID + region per Google's Model Garden:
+# https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/claude/sonnet-4-5
+# IMPORTANT: Claude on Vertex is NOT served in us-central1 (where our Gemini
+# model runs). It's available in us-east5 / europe-west1 / asia-southeast1 /
+# the global endpoint — so Claude has its OWN region knob, defaulting to
+# us-east5, independent of VERTEX_LOCATION.
+VERTEX_CLAUDE_MODEL = os.getenv("VERTEX_CLAUDE_MODEL", "claude-sonnet-4-6")
+# Claude Sonnet 4.6 is served on the GLOBAL endpoint (per Google Model Garden
+# docs: region="global"). The global host is region-less; _call_vertex_claude
+# handles that. Override VERTEX_CLAUDE_LOCATION only if you enable Claude in a
+# specific region for lower latency / dedicated regional quota.
+VERTEX_CLAUDE_LOCATION = os.getenv("VERTEX_CLAUDE_LOCATION", "global")
+# Anthropic-on-Vertex API version string (fixed contract, not our choice).
+VERTEX_ANTHROPIC_VERSION = "vertex-2023-10-16"
 
 _vertex_token_cache: dict = {"token": None, "expires_at": 0}
 
@@ -156,15 +186,89 @@ def _call_vertex(system_prompt: str, user_message: str, max_tokens: int, model: 
 
     candidate = result["candidates"][0]
     content = candidate.get("content", {})
+    finish_reason = candidate.get("finishReason", "UNKNOWN")
     if not content.get("parts"):
-        finish_reason = candidate.get("finishReason", "UNKNOWN")
+        # Empty content with a MAX_TOKENS finish means the whole budget went
+        # to (thinking) tokens with nothing emitted -- retryable with a
+        # larger budget, not a hard failure.
+        if finish_reason == "MAX_TOKENS":
+            raise LLMTruncatedError(
+                f"Vertex AI hit MAX_TOKENS with no output (max_tokens={max_tokens})."
+            )
         raise RuntimeError(
             f"Vertex AI returned empty content (finish: {finish_reason}). "
             f"Try increasing max_tokens or simplifying the prompt."
         )
 
     text = content["parts"][0]["text"]
+    # A MAX_TOKENS finish with partial text means the response was cut off
+    # mid-generation -- surface it as truncated so llm_generate_json retries
+    # with a bigger budget rather than trying to json.loads a broken string.
+    if finish_reason == "MAX_TOKENS":
+        raise LLMTruncatedError(
+            f"Vertex AI response truncated at MAX_TOKENS (max_tokens={max_tokens}). "
+            f"Got {len(text)} chars before cutoff."
+        )
     return text.strip()
+
+
+def _call_vertex_claude(system_prompt: str, user_message: str, max_tokens: int, model: str) -> str:
+    """Call an Anthropic Claude model THROUGH Vertex AI (billed to GCP credits
+    via ADC — no Anthropic API key).
+
+    Claude-on-Vertex uses the Anthropic Messages API shape with two Vertex
+    differences: the model goes in the endpoint URL (not the body), and the
+    body carries "anthropic_version" instead of "model". Auth is the same ADC
+    bearer token the Gemini Vertex path uses.
+    """
+    import requests
+
+    token = _get_vertex_access_token()
+    location = VERTEX_CLAUDE_LOCATION
+    # The global endpoint uses a region-less host; regional endpoints prefix
+    # the host with the region (e.g. us-east5-aiplatform.googleapis.com).
+    host = "aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
+    url = (
+        f"https://{host}/v1/projects/{VERTEX_PROJECT}/"
+        f"locations/{location}/publishers/anthropic/models/{model}:rawPredict"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "X-Goog-User-Project": VERTEX_PROJECT,
+    }
+
+    payload = {
+        "anthropic_version": VERTEX_ANTHROPIC_VERSION,
+        "max_tokens": max(max_tokens, 1024),
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_message}],
+    }
+
+    _timeout = float(os.getenv("VERTEX_CLAUDE_TIMEOUT", "45"))
+    response = requests.post(url, headers=headers, json=payload, timeout=_timeout)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Vertex Claude API error {response.status_code}: {response.text}"
+        )
+
+    result = response.json()
+    blocks = result.get("content") or []
+    text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+
+    stop_reason = result.get("stop_reason")
+    if not text:
+        if stop_reason == "max_tokens":
+            raise LLMTruncatedError(
+                f"Vertex Claude hit max_tokens with no output (max_tokens={max_tokens})."
+            )
+        raise RuntimeError(f"Vertex Claude returned empty content: {result}")
+    if stop_reason == "max_tokens":
+        raise LLMTruncatedError(
+            f"Vertex Claude response truncated at max_tokens (max_tokens={max_tokens})."
+        )
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -262,15 +366,24 @@ def _call_gemini(system_prompt: str, user_message: str, max_tokens: int, model: 
     
     candidate = result["candidates"][0]
     content = candidate.get("content", {})
-    
+    finish_reason = candidate.get("finishReason", "UNKNOWN")
+
     if not content.get("parts"):
-        finish_reason = candidate.get("finishReason", "UNKNOWN")
+        if finish_reason == "MAX_TOKENS":
+            raise LLMTruncatedError(
+                f"Gemini hit MAX_TOKENS with no output (max_tokens={max_tokens})."
+            )
         raise RuntimeError(
             f"Gemini returned empty content (finish: {finish_reason}). "
             f"Try increasing max_tokens or simplifying the prompt."
         )
-    
+
     text = content["parts"][0]["text"]
+    if finish_reason == "MAX_TOKENS":
+        raise LLMTruncatedError(
+            f"Gemini response truncated at MAX_TOKENS (max_tokens={max_tokens}). "
+            f"Got {len(text)} chars before cutoff."
+        )
     return text.strip()
 
 
@@ -324,6 +437,18 @@ def llm_generate(
     elif chosen_backend in ("vertex", "vertex_ai"):
         chosen_model = model or VERTEX_MODEL
         call = lambda: _call_vertex(system_prompt, user_message, max_tokens, chosen_model)
+    elif chosen_backend in ("vertex_pro", "gemini_pro"):
+        # Bigger Google reasoning model (Gemini Pro) via Vertex — same path as
+        # the default Vertex/Gemini call, just a stronger model. No partner
+        # quota needed (unlike Claude, which isn't available on this tier).
+        chosen_model = model or VERTEX_PRO_MODEL
+        call = lambda: _call_vertex(system_prompt, user_message, max_tokens, chosen_model)
+    elif chosen_backend in ("vertex_claude", "claude_vertex"):
+        # Claude through Vertex AI (GCP credits, ADC — no Anthropic key).
+        # NOTE: Anthropic models are NOT available on this project's tier, so
+        # this path will 429/404. Kept for environments where it IS enabled.
+        chosen_model = model or VERTEX_CLAUDE_MODEL
+        call = lambda: _call_vertex_claude(system_prompt, user_message, max_tokens, chosen_model)
     elif chosen_backend == "gemini":
         # If GEMINI_API_KEY is available and not using vertex override, use AI Studio REST
         if GEMINI_API_KEY and not os.getenv("USE_VERTEX"):
@@ -334,7 +459,8 @@ def llm_generate(
             call = lambda: _call_vertex(system_prompt, user_message, max_tokens, chosen_model)
     else:
         raise ValueError(
-            f"Unknown MODEL_BACKEND '{chosen_backend}'. Must be 'vertex', 'gemini', 'claude', or 'ollama'."
+            f"Unknown MODEL_BACKEND '{chosen_backend}'. Must be 'vertex', 'vertex_pro', "
+            f"'vertex_claude', 'gemini', 'claude', or 'ollama'."
         )
 
     last_exc: Exception | None = None
@@ -359,6 +485,55 @@ def llm_generate(
     raise last_exc  # type: ignore[misc]
 
 
+def extract_json_object(raw: str) -> str:
+    """Pull the first complete, balanced JSON object out of a model response.
+
+    Robust to the common ways providers wrap/pollute JSON output:
+      - ```json ... ``` code fences,
+      - leading prose ("Here is the JSON:") before the object,
+      - trailing prose/notes after the closing brace.
+
+    Scans for the first '{' and walks braces (respecting string literals and
+    escapes) to find its matching '}', returning exactly that substring. Falls
+    back to the fence-stripped whole string if no balanced object is found, so
+    a genuinely-plain JSON string still round-trips.
+    """
+    s = raw.strip()
+    # Strip a leading/trailing code fence if the whole thing is fenced.
+    if s.startswith("```"):
+        s = re.sub(r"^```(json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
+
+    start = s.find("{")
+    if start == -1:
+        return s
+
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i + 1]
+    # Unbalanced (likely truncated) -- return from the first brace so the
+    # caller's json.loads raises a clear JSONDecodeError.
+    return s[start:]
+
+
 def llm_generate_json(
     system_prompt: str,
     user_message: str,
@@ -368,14 +543,43 @@ def llm_generate_json(
 ) -> dict:
     """Like llm_generate but parses the response as JSON.
 
-    Strips markdown code fences if present before parsing.
-    Raises json.JSONDecodeError if the response isn't valid JSON.
+    Production hardening for the resume/tailor path:
+      - Extracts the first balanced JSON object (tolerant of code fences and
+        leading/trailing prose), instead of assuming the whole response is
+        clean JSON.
+      - On a JSONDecodeError (usually a response cut off mid-object) OR an
+        LLMTruncatedError, retries ONCE with a doubled max_tokens budget
+        before giving up -- so a resume that would have parsed 'half-empty'
+        gets a real second chance instead of silently degrading.
+
+    Raises json.JSONDecodeError if the response still isn't valid JSON after
+    the retry, or the underlying provider error if generation fails outright.
     """
-    raw = llm_generate(system_prompt, user_message, max_tokens, backend, model)
+    budget = max_tokens
+    last_decode_err: json.JSONDecodeError | None = None
 
-    # Strip ```json ... ``` wrapping if present
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
+    for attempt in range(2):
+        try:
+            raw = llm_generate(system_prompt, user_message, budget, backend, model)
+        except LLMTruncatedError:
+            # Whole generation truncated -- bump the budget and retry once.
+            if attempt == 0:
+                budget = min(budget * 2, 16384)
+                print(f"  ⚠️  llm_generate_json: output truncated, retrying with max_tokens={budget}")
+                continue
+            raise
 
-    return json.loads(raw)
+        candidate = extract_json_object(raw)
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as e:
+            last_decode_err = e
+            if attempt == 0:
+                budget = min(budget * 2, 16384)
+                print(f"  ⚠️  llm_generate_json: invalid/truncated JSON, retrying with max_tokens={budget}")
+                continue
+            raise
+
+    # Unreachable, but keeps type checkers happy.
+    assert last_decode_err is not None
+    raise last_decode_err

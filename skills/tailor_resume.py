@@ -9,12 +9,31 @@ import html as html_lib
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from db import repository as repo
 from db.current_user import get_current_user_id
-from skills.llm_client import llm_generate_json
+from skills.llm_client import llm_generate_json, MODEL_BACKEND
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "config", ".env"))
 
 BASE_RESUME_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "base_resume.json")
 RESUMES_DIR = os.path.join(os.path.dirname(__file__), "..", "resumes")
+
+# Target ATS keyword-coverage. Used only to LABEL a tailored resume as
+# below-floor for the UI — production does NOT retry to chase it (single call).
+MIN_ATS_SCORE = 80.0
+
+# Which model production uses to tailor. Chosen ONCE, offline, by
+# scripts/benchmark_tailor_models.py (Gemini vs Claude on real ATS scores),
+# then pinned here / via the TAILOR_BACKEND env var. Production makes a SINGLE
+# call to this model — never a runtime comparison.
+#   unset / ""     -> global MODEL_BACKEND default (Vertex/Gemini)
+#   "vertex_claude" -> Claude via Vertex
+#   "vertex"        -> Gemini via Vertex
+TAILOR_BACKEND = os.getenv("TAILOR_BACKEND") or None
+
+# Resume templates the app supports (matches the frontend switcher + the two
+# PDF renderers). "jake" is the classic ruled/centered layout; "standard" is a
+# cleaner conventional layout.
+TEMPLATES = ("standard", "jake")
+DEFAULT_TEMPLATE = "jake"
 
 SYSTEM_PROMPT = """You are a resume-tailoring assistant. You will be given a candidate's base resume (as structured JSON) and a job description. Your job is to produce a tailored version of the resume for this specific job.
 
@@ -27,16 +46,61 @@ STRICT RULES -- violating any of these is a critical failure:
 6. You MAY reorder which projects/experience entries appear first, based on relevance to this job description.
 7. You MUST NOT change company names, job titles, dates, degree, GPA, or institution names -- copy these through exactly as given.
 8. When the base resume already truthfully supports a claim, use the job description's exact terminology where possible (e.g. if the JD says "Node.js" and the bullet already covers that, keep the term "Node.js" rather than paraphrasing) -- this matters for ATS keyword matching.
+9. MAXIMIZE ATS keyword coverage: aim to reflect as many of the job description's real skills/tools/responsibilities as the base resume TRUTHFULLY supports, using the JD's exact wording. The goal is high keyword overlap with the JD WITHOUT ever adding anything the base resume doesn't already contain. If the JD mentions something the candidate genuinely hasn't done, leave it out -- honesty always wins over coverage.
 
 Return ONLY valid JSON matching the exact same structure as the input base resume. No prose, no markdown code fences, no explanation -- just the JSON object."""
 
 
+class NoResumeError(Exception):
+    """Raised when we cannot resolve a real, user-owned base resume to tailor.
+
+    This is deliberately loud: silently falling back to a shared file
+    (config/base_resume.json) was the exact mechanism by which one person's
+    resume leaked into every user's outreach. For any real authenticated
+    user, "no resume on file" must fail cleanly here, never borrow someone
+    else's resume.
+    """
+
+
+def _is_local_operator(user_id: str | None) -> bool:
+    """True only for the single local-CLI operator user (db.current_user).
+
+    The config/base_resume.json fallback is exclusively for this identity --
+    the offline, single-tenant CLI dev flow -- never for a real multi-tenant
+    HTTP user. Any failure to resolve the operator id is treated as "not the
+    operator" so we err on the side of NOT using the shared file.
+    """
+    if not user_id:
+        return False
+    try:
+        from db.current_user import LOCAL_USER_FIREBASE_UID
+        operator = repo.get_user_by_firebase_uid(LOCAL_USER_FIREBASE_UID)
+        return bool(operator and str(operator.get("id")) == str(user_id))
+    except Exception:
+        return False
+
+
 def load_base_resume(user_id: str | None = None) -> dict:
+    """Return the base resume to tailor, strictly scoped to `user_id`.
+
+    Resolution order:
+      1) The user's OWN primary resume in the DB (per-tenant, the only path
+         a real user should ever hit).
+      2) config/base_resume.json — ONLY for the single local-CLI operator
+         (see _is_local_operator). Never for a real authenticated user.
+
+    Raises NoResumeError if a real user has no resume on file. Callers must
+    treat this as a hard "needs a resume" failure and NOT tailor, rather than
+    substituting anyone else's resume.
+    """
     if user_id is None:
+        # No explicit user only happens on the local CLI entry points; resolve
+        # the single operator so its config/base_resume.json can apply.
         try:
             user_id = get_current_user_id()
         except Exception:
             user_id = None
+
     if user_id:
         try:
             db_resume = repo.get_primary_resume(user_id)
@@ -45,10 +109,15 @@ def load_base_resume(user_id: str | None = None) -> dict:
         except Exception as e:
             print(f"  ⚠️  load_base_resume: failed to load DB resume for user {user_id}: {e}")
 
-    if os.path.exists(BASE_RESUME_PATH):
+    # Shared file fallback is restricted to the local CLI operator only.
+    if _is_local_operator(user_id) and os.path.exists(BASE_RESUME_PATH):
         with open(BASE_RESUME_PATH, encoding="utf-8") as f:
             return json.load(f)
-    return {}
+
+    raise NoResumeError(
+        f"No base resume on file for user {user_id or '(unknown)'}. "
+        "Upload a resume before tailoring — refusing to fall back to a shared resume."
+    )
 
 
 def slugify(text: str) -> str:
@@ -75,7 +144,26 @@ resume content to foreground -- this does NOT give you license to invent
 anything new):
 {json.dumps(company_research, indent=2)}"""
 
-    user_message = f"""Job description:
+    result = tailor_resume_verbose(base_resume, company, role, jd_text, company_research=company_research)
+    return result["tailored"]
+
+
+def build_tailor_message(
+    base_resume: dict, company: str, role: str, jd_text: str,
+    company_research: dict | None = None,
+) -> str:
+    """The user-message sent to the tailoring model. Shared by production and
+    the offline model benchmark so both exercise identical prompts."""
+    research_context = ""
+    if company_research:
+        research_context = f"""
+
+Additional context on this company (for prioritizing which existing, true
+resume content to foreground -- this does NOT give you license to invent
+anything new):
+{json.dumps(company_research, indent=2)}"""
+
+    return f"""Job description:
 Company: {company}
 Role: {role}
 
@@ -84,15 +172,306 @@ Role: {role}
 Base resume (JSON):
 {json.dumps(base_resume, indent=2)}"""
 
+
+def tailor_resume_verbose(
+    base_resume: dict, company: str, role: str, jd_text: str,
+    company_research: dict | None = None,
+) -> dict:
+    """Production tailoring: a SINGLE call to the configured model.
+
+    The model is chosen ONCE, offline, by comparing Gemini vs Claude on
+    tailoring quality (scripts/benchmark_tailor_models.py). Whichever wins is
+    set as TAILOR_BACKEND, and production always makes exactly one call to it
+    — no runtime multi-model comparison, no retry loop.
+
+    If the model's output fabricates content not in the base resume, it's
+    rejected and the untouched base resume is returned (we never ship a
+    fabricated resume). Returns {"tailored", "keyword_coverage", "model_used"}.
+    """
+    base_message = build_tailor_message(base_resume, company, role, jd_text, company_research)
+    backend = TAILOR_BACKEND  # None => global MODEL_BACKEND default (Vertex/Gemini)
+    label = backend or MODEL_BACKEND or "vertex"
+
+    candidate, score = _tailor_once(base_message, jd_text, base_resume, backend)
+    if candidate is not None:
+        note = "" if score >= MIN_ATS_SCORE else f"  ⚠️ below {MIN_ATS_SCORE}% ATS floor"
+        print(f"  tailor_resume: ATS {score}% via {label}{note}")
+        return _tailor_result(candidate, score, label)
+
+    # Only reached if the LLM call itself failed (network/parse) — return the
+    # untouched base so the user still gets their resume.
+    print("  ⚠️  tailor_resume: model call failed; using base resume.")
+    return _tailor_result(base_resume, keyword_coverage(jd_text, base_resume), label)
+
+
+def _tailor_once(
+    base_message: str, jd_text: str, base_resume: dict, backend: str | None,
+) -> tuple[dict | None, float]:
+    """One tailoring call on a single backend. Returns (candidate, score), or
+    (None, -1) if the call itself failed.
+
+    We do NOT discard the whole tailored resume when the validator flags
+    something — that was throwing away all the legitimate rewording and
+    JD-keyword alignment and silently handing back the untouched base. Instead
+    we SANITIZE: keep the model's reworded bullets, summary, skill rephrasing,
+    and reordering, but repair only genuine identity drift — restore any
+    company/title/institution/project name that changed, and drop only truly
+    new skills (a rephrased synonym of an existing skill is kept). This
+    guarantees honesty without nuking the tailoring itself."""
     try:
-        return llm_generate_json(
+        candidate = llm_generate_json(
             system_prompt=SYSTEM_PROMPT,
-            user_message=user_message,
+            user_message=base_message,
             max_tokens=4096,
+            backend=backend,
         )
     except Exception as e:
-        print(f"  ⚠️  tailor_resume LLM call failed ({e}); falling back to base resume.")
+        print(f"  ⚠️  tailor ({backend or 'default'}) failed: {e}")
+        return None, -1.0
+
+    cleaned = sanitize_tailored(base_resume, candidate)
+    return cleaned, keyword_coverage(jd_text, cleaned)
+
+
+def _is_skill_rephrase(new_skill: str, base_skills: set[str]) -> bool:
+    """True if `new_skill` is a legitimate rephrasing of an existing base skill
+    (a substring/superset overlap), not a genuinely new claim. E.g. base has
+    "rest apis" and the tailored version says "rest api design" — allowed by
+    SYSTEM_PROMPT rule 5. "kubernetes" with no base overlap is NOT a rephrase."""
+    n = _norm_token(new_skill)
+    if not n:
+        return True
+    for b in base_skills:
+        if not b:
+            continue
+        if n == b or n in b or b in n:
+            return True
+        # token overlap: share a significant word (e.g. "rest api design" vs "rest apis")
+        nb, bb = set(n.split()), set(b.split())
+        if nb & bb and (nb <= bb or bb <= nb or len(nb & bb) >= 2):
+            return True
+    return False
+
+
+def sanitize_tailored(base_resume: dict, tailored: dict) -> dict:
+    """Return a copy of `tailored` with identity drift repaired against
+    `base_resume`, WITHOUT discarding the rework:
+
+      - experience/education/projects: keep the model's bullets/tech/order,
+        but force company/title/institution/project-name/dates back to the
+        base entry they map to (matched positionally, then by fuzzy name), so
+        no employer/role/school/project can be invented or renamed.
+      - skills: keep reworded/reordered skills that overlap an existing base
+        skill (allowed synonym); drop only skills with no base overlap.
+      - name/contact: always taken from the base (never model-editable).
+    """
+    if not isinstance(tailored, dict):
         return base_resume
+
+    out = dict(tailored)
+
+    # Name + contact are never the model's to change.
+    out["name"] = base_resume.get("name")
+    out["contact"] = base_resume.get("contact")
+
+    base_exp = base_resume.get("experience") or []
+    base_edu = base_resume.get("education") or []
+    base_proj = base_resume.get("projects") or []
+
+    def _match(base_list, entry, key):
+        """Find the base entry this tailored entry corresponds to, by
+        normalized identity key (falls back to positional in caller)."""
+        target = _norm_token(entry.get(key, ""))
+        for b in base_list:
+            if _norm_token(b.get(key, "")) == target and target:
+                return b
+        return None
+
+    # Experience: pin company/title/dates to a base entry (positional first).
+    fixed_exp = []
+    for i, e in enumerate(out.get("experience") or []):
+        b = base_exp[i] if i < len(base_exp) else (_match(base_exp, e, "company") or {})
+        fixed = dict(e)
+        for f in ("company", "title", "start_date", "end_date"):
+            if b.get(f) is not None:
+                fixed[f] = b.get(f)
+        fixed_exp.append(fixed)
+    if out.get("experience") is not None:
+        out["experience"] = fixed_exp
+
+    # Education: pin institution/degree/dates.
+    fixed_edu = []
+    for i, e in enumerate(out.get("education") or []):
+        b = base_edu[i] if i < len(base_edu) else (_match(base_edu, e, "institution") or {})
+        fixed = dict(e)
+        for f in ("institution", "degree", "start_date", "end_date"):
+            if b.get(f) is not None:
+                fixed[f] = b.get(f)
+        fixed_edu.append(fixed)
+    if out.get("education") is not None:
+        out["education"] = fixed_edu
+
+    # Projects: pin name/date/link (bullets + tech_stack rework kept).
+    fixed_proj = []
+    for i, p in enumerate(out.get("projects") or []):
+        b = base_proj[i] if i < len(base_proj) else (_match(base_proj, p, "name") or {})
+        fixed = dict(p)
+        for f in ("name", "date", "link"):
+            if b.get(f) is not None:
+                fixed[f] = b.get(f)
+        fixed_proj.append(fixed)
+    if out.get("projects") is not None:
+        out["projects"] = fixed_proj
+
+    # Skills: keep rephrasings of existing skills; drop genuinely-new ones.
+    base_skill_set = _collect_source_facts(base_resume)["skill"]
+    tsk = out.get("skills")
+    if isinstance(tsk, dict):
+        cleaned_skills = {}
+        for cat, items in tsk.items():
+            kept = [it for it in (items or []) if _is_skill_rephrase(it, base_skill_set)]
+            if kept:
+                cleaned_skills[cat] = kept
+        # If the model wiped skills entirely, fall back to the base skills.
+        out["skills"] = cleaned_skills or base_resume.get("skills")
+    elif isinstance(tsk, list):
+        out["skills"] = [it for it in tsk if _is_skill_rephrase(it, base_skill_set)] or base_resume.get("skills")
+
+    return out
+
+
+def _tailor_result(tailored: dict, score: float, model_used: str, escalated: bool = False) -> dict:
+    return {
+        "tailored": tailored,
+        "keyword_coverage": score,
+        "model_used": model_used,
+        # Retained for response-shape compatibility; production uses a single
+        # configured model, so this is always False now.
+        "escalated": escalated,
+    }
+
+
+def diff_resumes(base: dict, tailored: dict) -> dict:
+    """Compute a change-map between the base and tailored resumes so the UI can
+    highlight exactly what tailoring changed. Positional (by section + index):
+
+      {
+        "experience": [ [changed_bool_per_bullet], ... ],   # per exp entry
+        "projects":    [ [changed_bool_per_bullet], ... ],
+        "skills":      { "Category": [changed_bool_per_skill] },
+        "summary":     changed_bool,
+      }
+
+    "changed" = the tailored text differs from the base text at that position
+    (after whitespace/case normalization). New positions the base didn't have
+    also count as changed. This is a presentation aid, not the anti-fabrication
+    check (that's find_fabrications)."""
+    def norm(s) -> str:
+        return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+    out: dict = {}
+
+    out["summary"] = norm(base.get("summary")) != norm(tailored.get("summary"))
+
+    def bullets_diff(base_entries, tail_entries):
+        result = []
+        for i, t in enumerate(tail_entries or []):
+            b = (base_entries or [])[i] if i < len(base_entries or []) else {}
+            b_bullets = b.get("bullets", []) or []
+            t_bullets = t.get("bullets", []) or []
+            flags = []
+            for j, tb in enumerate(t_bullets):
+                bb = b_bullets[j] if j < len(b_bullets) else None
+                flags.append(bb is None or norm(bb) != norm(tb))
+            result.append(flags)
+        return result
+
+    out["experience"] = bullets_diff(base.get("experience"), tailored.get("experience"))
+    out["projects"] = bullets_diff(base.get("projects"), tailored.get("projects"))
+
+    # Skills: per-category, which skills are new/reworded vs the base category.
+    base_skills = base.get("skills", {}) or {}
+    tail_skills = tailored.get("skills", {}) or {}
+    skills_flags: dict = {}
+    if isinstance(tail_skills, dict):
+        for cat, items in tail_skills.items():
+            base_items = [norm(x) for x in (base_skills.get(cat, []) if isinstance(base_skills, dict) else [])]
+            skills_flags[cat] = [norm(it) not in base_items for it in (items or [])]
+    out["skills"] = skills_flags
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Anti-fabrication validation
+# ---------------------------------------------------------------------------
+
+def _norm_token(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def _collect_source_facts(resume: dict) -> dict[str, set[str]]:
+    """Collect the atomic, checkable facts a tailored resume must not exceed:
+    company names, job titles, institutions, project names, and the flat set
+    of skills. Used to catch fabricated identity/scope, not phrasing changes.
+    """
+    companies: set[str] = set()
+    titles: set[str] = set()
+    institutions: set[str] = set()
+    projects: set[str] = set()
+    skills: set[str] = set()
+
+    for exp in resume.get("experience", []) or []:
+        if exp.get("company"):
+            companies.add(_norm_token(exp["company"]))
+        if exp.get("title"):
+            titles.add(_norm_token(exp["title"]))
+    for edu in resume.get("education", []) or []:
+        if edu.get("institution"):
+            institutions.add(_norm_token(edu["institution"]))
+    for proj in resume.get("projects", []) or []:
+        if proj.get("name"):
+            projects.add(_norm_token(proj["name"]))
+    sk = resume.get("skills", {}) or {}
+    if isinstance(sk, dict):
+        for items in sk.values():
+            for it in items or []:
+                skills.add(_norm_token(it))
+    elif isinstance(sk, list):
+        for it in sk:
+            skills.add(_norm_token(it))
+
+    return {
+        "company": companies,
+        "title": titles,
+        "institution": institutions,
+        "project": projects,
+        "skill": skills,
+    }
+
+
+def find_fabrications(base_resume: dict, tailored_resume: dict) -> list[str]:
+    """Return a list of human-readable fabrication descriptions: identity-level
+    facts (companies, titles, institutions, project names, skills) present in
+    the tailored resume but NOT in the base resume.
+
+    This is a structural subset check, not a phrasing check — bullets may be
+    reworded (that's the whole point of tailoring), but the set of employers,
+    roles, schools, projects, and skills must not grow. New skills are the
+    most common fabrication, so those are checked exactly against the base
+    skill set.
+    """
+    src = _collect_source_facts(base_resume)
+    tgt = _collect_source_facts(tailored_resume)
+
+    violations: list[str] = []
+    for kind in ("company", "title", "institution", "project", "skill"):
+        added = tgt[kind] - src[kind]
+        # Ignore empties.
+        added = {a for a in added if a}
+        for a in sorted(added):
+            violations.append(f"{kind} not in base resume: '{a}'")
+    return violations
 
 
 def tailor_resume_for_lead(lead: dict) -> dict:
@@ -114,20 +493,67 @@ def tailor_resume_for_lead(lead: dict) -> dict:
     if not jd_text.strip():
         jd_text = f"Role: {role} at {company}"
 
+    # NoResumeError intentionally propagates: a lead for a user with no resume
+    # on file must NOT be tailored against anyone else's resume. The caller
+    # (graph node / batch run) turns this into a "no_resume" failure.
     base_resume = load_base_resume(user_id)
-    try:
-        tailored = tailor_resume(base_resume, company, role, jd_text, company_research=company_research)
-    except Exception as e:
-        print(f"  ⚠️  tailor_resume_for_lead failed ({e}); using base resume.")
-        tailored = base_resume
+
+    result = tailor_resume_verbose(base_resume, company, role, jd_text, company_research=company_research)
+    tailored = result["tailored"]
+    coverage = result["keyword_coverage"]
+    model_used = result["model_used"]
 
     filename = save_resume(tailored, company, user_id=user_id)
-    coverage = keyword_coverage(jd_text, tailored)
+    below_floor = coverage < MIN_ATS_SCORE
+
+    # Persist the tailored version (JSON source-of-truth in Postgres, artifact
+    # keys pointing at the object store) for the Resume-page history + a
+    # multi-instance-safe attach path.
+    _persist_tailored_row(
+        user_id=user_id, lead_id=lead.get("id"), company=company, role=role,
+        tailored=tailored, coverage=coverage, base_filename=filename, source="pipeline",
+        model_used=model_used,
+    )
+
+    flag = "  ⚠️ below ATS floor" if below_floor else ""
     print(
         f"  tailor_resume_for_lead: tailored resume for {company} -> "
-        f"resumes/{filename}.json/.md (ATS keyword coverage: {coverage}%)"
+        f"{filename} (ATS keyword coverage: {coverage}% via {model_used}){flag}"
     )
-    return {"resume_version": filename, "keyword_coverage": coverage}
+    return {
+        "resume_version": filename,
+        "keyword_coverage": coverage,
+        "ats_below_floor": below_floor,
+        "model_used": model_used,
+    }
+
+
+def _persist_tailored_row(
+    user_id: str | None, lead_id, company: str, role: str,
+    tailored: dict, coverage: float, base_filename: str, source: str = "pipeline",
+    template: str = DEFAULT_TEMPLATE, model_used: str | None = None,
+) -> None:
+    """Best-effort persistence of a tailored version to Postgres. Never fails
+    the tailoring flow — the artifacts are already stored; this row is the
+    queryable index for the Resume page + attach path."""
+    if not user_id:
+        return
+    try:
+        repo.add_tailored_resume(user_id, {
+            "lead_id": lead_id if lead_id else None,
+            "company": company,
+            "role": role,
+            "tailored_json": tailored,
+            "keyword_coverage": coverage,
+            "template": template,
+            "model_used": model_used,
+            "pdf_key": f"{base_filename}.pdf",
+            "md_key": f"{base_filename}.md",
+            "legacy_version": base_filename,
+            "source": source,
+        })
+    except Exception as e:
+        print(f"  ⚠️  _persist_tailored_row: failed to record tailored resume row: {e}")
 
 
 
@@ -233,6 +659,19 @@ def esc(text: str) -> str:
     return html_lib.escape(sanitize_for_pdf(text or ""))
 
 
+def _normalize_url(url: str) -> str:
+    """Ensure a link has a scheme so the rendered PDF's <a href> is absolute.
+    A bare domain like "foo.vercel.app" would otherwise be treated as a
+    relative path by PDF/browser link handlers. mailto:/tel:/http(s) pass
+    through unchanged."""
+    u = (url or "").strip()
+    if not u:
+        return u
+    if u.lower().startswith(("http://", "https://", "mailto:", "tel:")):
+        return u
+    return "https://" + u.lstrip("/")
+
+
 RESUME_CSS = """
 @page { size: letter; margin: 0.3in 0.5in; }
 body { font-family: Helvetica, Arial, sans-serif; font-size: 9.6pt; line-height: 1.12; color: #000000; }
@@ -253,7 +692,37 @@ a { color: #1155cc; }
 """
 
 
-def resume_to_html(resume: dict) -> str:
+# "Standard" — a cleaner, more conventional layout: left-aligned header,
+# conventional single-column layout: centered name + contact, bold dark
+# uppercase section headers with a full-width rule, tight left-aligned bullets
+# (the clean "professional" resume look). Same HTML structure as the Jake
+# template so one renderer serves both and ATS text extraction is identical.
+STANDARD_CSS = """
+@page { size: letter; margin: 0.5in 0.6in; }
+body { font-family: Helvetica, Arial, sans-serif; font-size: 10pt; line-height: 1.3; color: #111111; }
+h1.name { text-align: center; font-size: 21pt; font-weight: 700; margin: 0 0 3px 0; line-height: 1.1; letter-spacing: 0.2px; }
+p.contact { text-align: center; font-size: 8.8pt; color: #333; margin: 0 0 10px 0; }
+h2.section { font-size: 10pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: #111; border-bottom: 1px solid #444444; margin: 11px 0 5px 0; padding-bottom: 2px; }
+table.row { width: 100%; border-collapse: collapse; }
+table.row td { padding: 0; vertical-align: top; line-height: 1.3; }
+td.left { text-align: left; font-weight: 700; }
+td.left.plain { font-weight: 400; font-style: italic; }
+td.right { text-align: right; color: #333; font-size: 9pt; }
+p.subtext { font-style: italic; color: #333; margin: 0; line-height: 1.3; }
+p.plain { margin: 0; line-height: 1.3; }
+ul.bullets { list-style-type: disc; margin: 3px 0 5px 0; padding-left: 16px; }
+ul.bullets li { text-align: left; margin-bottom: 1.5px; line-height: 1.32; }
+p.skills-line { margin: 1.5px 0; line-height: 1.32; }
+a { color: #1155cc; text-decoration: none; }
+"""
+
+
+def _template_css(template: str) -> str:
+    return STANDARD_CSS if template == "standard" else RESUME_CSS
+
+
+def resume_to_html(resume: dict, template: str = DEFAULT_TEMPLATE) -> str:
+    template = template if template in TEMPLATES else DEFAULT_TEMPLATE
     name = esc(resume.get("name", ""))
 
     contact = resume.get("contact", {})
@@ -265,11 +734,11 @@ def resume_to_html(resume: dict) -> str:
     if contact.get("email"):
         contact_parts.append(esc(contact["email"]))
     if contact.get("linkedin"):
-        contact_parts.append(f'<a href="{esc(contact["linkedin"])}">LinkedIn</a>')
+        contact_parts.append(f'<a href="{esc(_normalize_url(contact["linkedin"]))}">LinkedIn</a>')
     if contact.get("github"):
-        contact_parts.append(f'<a href="{esc(contact["github"])}">GitHub</a>')
+        contact_parts.append(f'<a href="{esc(_normalize_url(contact["github"]))}">GitHub</a>')
     if contact.get("portfolio"):
-        contact_parts.append(f'<a href="{esc(contact["portfolio"])}">Portfolio</a>')
+        contact_parts.append(f'<a href="{esc(_normalize_url(contact["portfolio"]))}">Portfolio</a>')
     contact_line = " | ".join(contact_parts)
 
     sections = []
@@ -306,13 +775,26 @@ def resume_to_html(resume: dict) -> str:
         rows = ['<h2 class="section">Experience</h2>']
         for exp in resume["experience"]:
             dates = f'{exp.get("start_date", "")} – {exp.get("end_date", "")}'
-            rows.append(
-                f'<table class="row"><tr>'
-                f'<td class="left">{esc(exp.get("title", ""))}</td>'
-                f'<td class="right">{esc(dates)}</td>'
-                f'</tr></table>'
-            )
-            rows.append(f'<p class="subtext">{esc(exp.get("company", ""))}</p>')
+            title = exp.get("title", "")
+            company = exp.get("company", "")
+            if template == "standard":
+                # Reference layout: "Company | Title" bold on the left line,
+                # dates right — no separate italic company line.
+                heading = " | ".join(x for x in [company, title] if x)
+                rows.append(
+                    f'<table class="row"><tr>'
+                    f'<td class="left">{esc(heading)}</td>'
+                    f'<td class="right">{esc(dates)}</td>'
+                    f'</tr></table>'
+                )
+            else:
+                rows.append(
+                    f'<table class="row"><tr>'
+                    f'<td class="left">{esc(title)}</td>'
+                    f'<td class="right">{esc(dates)}</td>'
+                    f'</tr></table>'
+                )
+                rows.append(f'<p class="subtext">{esc(company)}</p>')
             bullets = "".join(f"<li>{esc(b)}</li>" for b in exp.get("bullets", []))
             rows.append(f'<ul class="bullets">{bullets}</ul>')
         sections.append("".join(rows))
@@ -322,8 +804,11 @@ def resume_to_html(resume: dict) -> str:
         for proj in resume["projects"]:
             name_html = esc(proj.get("name", ""))
             if proj.get("link"):
-                link_label = "GitHub" if "github.com" in proj["link"].lower() else "Live Link"
-                name_html += f' (<a href="{esc(proj["link"])}">{link_label}</a>)'
+                _url = _normalize_url(proj["link"])
+                # Show the real (shortened) URL as the clickable text so the
+                # link is visible and verifiable, not a generic "Live Link".
+                _label = re.sub(r"^https?://", "", _url).rstrip("/")
+                name_html += f' (<a href="{esc(_url)}">{esc(_label)}</a>)'
             rows.append(
                 f'<table class="row"><tr>'
                 f'<td class="left">{name_html}</td>'
@@ -351,7 +836,7 @@ def resume_to_html(resume: dict) -> str:
         sections.append("".join(rows))
 
     return f"""<html>
-<head><meta charset="utf-8"><style>{RESUME_CSS}</style></head>
+<head><meta charset="utf-8"><style>{_template_css(template)}</style></head>
 <body>
 <h1 class="name">{name}</h1>
 <p class="contact">{contact_line}</p>
@@ -360,19 +845,42 @@ def resume_to_html(resume: dict) -> str:
 </html>"""
 
 
-def resume_to_pdf(resume: dict, output_path: str):
+def resume_to_pdf(resume: dict, output_path: str, template: str = DEFAULT_TEMPLATE):
     """Renders via HTML/CSS (xhtml2pdf) so we can match the actual visual
     template -- bold-left/date-right rows, justified bullets, section
     divider lines -- instead of a generic manually-positioned layout."""
-    html_str = resume_to_html(resume)
+    html_str = resume_to_html(resume, template=template)
     with open(output_path, "wb") as f:
         result = pisa.CreatePDF(html_str, dest=f)
     if result.err:
         raise RuntimeError(f"xhtml2pdf failed to render {output_path} ({result.err} errors)")
 
 
-def save_resume(resume: dict, company: str, user_id: str | None = None) -> str:
-    os.makedirs(RESUMES_DIR, exist_ok=True)
+def resume_to_pdf_bytes(resume: dict, template: str = DEFAULT_TEMPLATE) -> bytes:
+    """Render the resume to PDF bytes in-memory (no disk), for the artifact
+    store. Same HTML/CSS template as resume_to_pdf."""
+    import io
+    html_str = resume_to_html(resume, template=template)
+    buf = io.BytesIO()
+    result = pisa.CreatePDF(html_str, dest=buf)
+    if result.err:
+        raise RuntimeError(f"xhtml2pdf failed to render PDF ({result.err} errors)")
+    return buf.getvalue()
+
+
+def save_resume(resume: dict, company: str, user_id: str | None = None, template: str = DEFAULT_TEMPLATE) -> str:
+    """Render the tailored resume's JSON/MD/PDF artifacts and store them via
+    the artifact store (GCS in prod, local resumes/ in dev), keyed by a
+    stable, user-namespaced base filename. Returns that base filename, which
+    callers persist as the lead's `resume_version` (the store key).
+
+    Bytes go to object storage; the structured JSON is also persisted to
+    Postgres by the caller (via repo.add_tailored_resume) as the source of
+    truth. The base filename is unchanged from the legacy scheme so existing
+    resume_version references keep resolving.
+    """
+    from storage import artifact_store as store
+
     name_slug = slugify(resume.get("name", "resume"))
     company_slug = slugify(company)
     if user_id:
@@ -381,17 +889,13 @@ def save_resume(resume: dict, company: str, user_id: str | None = None) -> str:
     else:
         base_filename = f"{name_slug}_resume_{company_slug}"
 
-    json_path = os.path.join(RESUMES_DIR, f"{base_filename}.json")
-    md_path = os.path.join(RESUMES_DIR, f"{base_filename}.md")
-    pdf_path = os.path.join(RESUMES_DIR, f"{base_filename}.pdf")
+    json_bytes = json.dumps(resume, indent=2, ensure_ascii=False).encode("utf-8")
+    md_bytes = resume_to_markdown(resume).encode("utf-8")
+    pdf_bytes = resume_to_pdf_bytes(resume, template=template)
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(resume, f, indent=2, ensure_ascii=False)
-
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write(resume_to_markdown(resume))
-
-    resume_to_pdf(resume, pdf_path)
+    store.put_bytes(f"{base_filename}.json", json_bytes, "application/json")
+    store.put_bytes(f"{base_filename}.md", md_bytes, "text/markdown")
+    store.put_bytes(f"{base_filename}.pdf", pdf_bytes, "application/pdf")
 
     return base_filename
 
@@ -421,13 +925,26 @@ def run(user_id: str | None = None):
         print("MODEL_BACKEND=claude but ANTHROPIC_API_KEY not set -- skipping tailor_resume.")
         return
 
-    backfill_pdfs()
-
     if user_id is None:
         user_id = get_current_user_id()
-    base_resume = load_base_resume(user_id)
+
     leads = repo.get_leads(user_id)
     targets = [lead for lead in leads if not (lead.get("resume_version") or "").strip()]
+
+    # Resolve the user's OWN base resume up front. If they have none on file,
+    # do NOT tailor anything against a shared/other resume — mark every target
+    # lead as needing a resume and stop.
+    try:
+        base_resume = load_base_resume(user_id)
+    except NoResumeError as e:
+        print(f"  ⛔ tailor_resume.run: {e}")
+        for lead in targets:
+            try:
+                repo.update_lead(user_id, lead["id"], {"failure_reason": "no_resume"})
+            except Exception:
+                pass
+        print(f"tailor_resume: 0 resumes tailored (no base resume for user {user_id}).")
+        return
 
     tailored_count = 0
 
@@ -461,13 +978,22 @@ def run(user_id: str | None = None):
         # CLI/API route path was missing it, leaving a lead's status stuck
         # at "matched" even after a resume was actually tailored for it.
         # Clear any prior failure flag now that tailoring succeeded.
+        # Flag (don't fail) resumes that couldn't clear the ATS floor so they
+        # surface for review; clear the flag when they clear it.
+        below_floor = coverage < MIN_ATS_SCORE
         repo.update_lead(user_id, lead["id"], {
             "resume_version": filename, "keyword_coverage": coverage,
-            "status": "tailored", "failure_reason": None,
+            "status": "tailored",
+            "failure_reason": "ats_below_floor" if below_floor else None,
         })
+        _persist_tailored_row(
+            user_id=user_id, lead_id=lead["id"], company=company, role=role,
+            tailored=tailored, coverage=coverage, base_filename=filename, source="pipeline",
+        )
         tailored_count += 1
-        print(f"Tailored resume for {company} -> resumes/{filename}.json / .md "
-              f"(ATS keyword coverage: {coverage}%)")
+        floor_note = f"  ⚠️ below {MIN_ATS_SCORE}% ATS floor" if below_floor else ""
+        print(f"Tailored resume for {company} -> {filename} "
+              f"(ATS keyword coverage: {coverage}%){floor_note}")
 
     print(f"\ntailor_resume: {tailored_count} resumes tailored.")
 

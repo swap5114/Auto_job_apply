@@ -25,6 +25,16 @@ from db.current_user import get_current_user_id
 # YC OSS API endpoints (no auth required, updated daily)
 YC_API_BASE = "https://yc-oss.github.io/api"
 YC_HIRING_URL = f"{YC_API_BASE}/companies/hiring.json"
+# All publicly-launched YC companies (~6k), not just those currently hiring.
+# This is what powers the "cold-mail a company that isn't hiring" search
+# fallback -- see search_companies() below.
+YC_ALL_URL = f"{YC_API_BASE}/companies/all.json"
+
+# In-process cache for the full companies list. It's a few MB and changes at
+# most once a day upstream (GitHub Actions), so a short TTL keeps search snappy
+# without hammering the CDN on every keystroke-driven request.
+_ALL_COMPANIES_CACHE: dict = {"data": None, "fetched_at": 0.0}
+_ALL_COMPANIES_TTL_SECONDS = 6 * 60 * 60  # 6h
 
 # Recent batches to filter for (4-6 months window)
 # Adjust these based on current date - these are batches from ~Feb 2026 to Aug 2026
@@ -73,6 +83,73 @@ def fetch_batch_companies(batch_slug: str) -> list[dict]:
     except Exception as e:
         print(f"  ⚠️  Failed to fetch batch {batch_slug}: {e}")
         return []
+
+
+def fetch_all_companies() -> list[dict]:
+    """Fetch (and cache) every publicly-launched YC company from all.json.
+
+    Cached in-process for _ALL_COMPANIES_TTL_SECONDS so a burst of search
+    requests reuses one download. Returns [] on any network/parse error so
+    callers can degrade gracefully (search just returns no live results).
+    """
+    import time
+
+    now = time.time()
+    cached = _ALL_COMPANIES_CACHE.get("data")
+    if cached is not None and (now - _ALL_COMPANIES_CACHE.get("fetched_at", 0.0)) < _ALL_COMPANIES_TTL_SECONDS:
+        return cached
+
+    try:
+        response = requests.get(YC_ALL_URL, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list):
+            _ALL_COMPANIES_CACHE["data"] = data
+            _ALL_COMPANIES_CACHE["fetched_at"] = now
+            return data
+    except Exception as e:
+        print(f"  ⚠️  Failed to fetch YC all-companies list: {e}")
+    # Fall back to any stale cache we still hold, else empty.
+    return cached or []
+
+
+def search_companies(query: str, limit: int = 10) -> list[dict]:
+    """Search the full YC company directory by name for a cold-outreach
+    lookup, returning normalized lead-shaped dicts (same shape as
+    company_to_lead) plus an is_hiring flag.
+
+    This is the fallback for the Matches search bar: it lets a user find and
+    cold-mail a YC company that isn't in our locally-synced hiring catalog
+    (not currently hiring, or an older batch we don't sync).
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+
+    companies = fetch_all_companies()
+    scored: list[tuple[int, dict]] = []
+    for c in companies:
+        name = (c.get("name") or "").strip()
+        if not name:
+            continue
+        lname = name.lower()
+        # Rank: exact > prefix > substring. Skip non-matches.
+        if lname == q:
+            rank = 0
+        elif lname.startswith(q):
+            rank = 1
+        elif q in lname:
+            rank = 2
+        else:
+            continue
+        shaped = company_to_lead(c)
+        shaped["is_hiring"] = bool(c.get("isHiring"))
+        shaped["slug"] = c.get("slug") or str(c.get("id") or "")
+        shaped["website"] = c.get("website") or ""
+        scored.append((rank, shaped))
+
+    scored.sort(key=lambda pair: (pair[0], pair[1].get("company", "")))
+    return [s for _, s in scored[:limit]]
 
 
 def is_recent_batch(batch: str) -> bool:
@@ -281,10 +358,36 @@ def run(max_leads: int = 20, user_id: str | None = None):
     return added
 
 
-def _gather_candidates(max_count: int) -> list[dict]:
+def _gather_candidates(max_count: int, all_batches: bool = False) -> list[dict]:
     """Shared candidate-gathering: hiring + recent-batch, tech-first, deduped,
     topped up from all hiring companies / recent batches until we have up to max_count companies.
-    Used by both run() (per-user leads) and run_catalog() (shared catalog)."""
+    Used by both run() (per-user leads) and run_catalog() (shared catalog).
+
+    all_batches=True (used by the daily catalog sync) draws from the FULL YC
+    directory (all.json — every publicly-launched company, every batch), not
+    just the currently-hiring feed's recent batches. This is what makes the
+    shared catalog cover all batches so search can find any YC company, while
+    the per-user run() path keeps its recent-first, hiring-only bias.
+    """
+    if all_batches:
+        # Full directory: every publicly-launched YC company, all batches.
+        # Rank tech-first but keep everything (search/cold-outreach wants the
+        # whole universe, not just recent hiring companies).
+        everyone = fetch_all_companies()
+        tech = [c for c in everyone if is_tech_company(c)]
+        non_tech = [c for c in everyone if not is_tech_company(c)]
+        candidates = tech + non_tech
+
+        # Fold in the hiring feed too, so isHiring/most-recent metadata is
+        # present for companies that also appear there (all.json + hiring.json
+        # overlap on id). Dedup by id, preferring the richer hiring record.
+        by_id = {c.get("id"): c for c in candidates if c.get("id") is not None}
+        for c in fetch_hiring_companies():
+            cid = c.get("id")
+            if cid is not None:
+                by_id[cid] = {**by_id.get(cid, {}), **c}
+        return list(by_id.values())
+
     hiring = fetch_hiring_companies()
     recent = [c for c in hiring if is_recent_batch(c.get("batch", ""))]
     other_hiring = [c for c in hiring if not is_recent_batch(c.get("batch", ""))]
@@ -306,10 +409,16 @@ def _gather_candidates(max_count: int) -> list[dict]:
     return candidates
 
 
-def run_catalog(max_companies: int = 500) -> dict:
+def run_catalog(max_companies: int = 10000, all_batches: bool = True) -> dict:
     """Sync YC startups into the SHARED catalog (companies/jobs), NOT per-user
     leads -- this is what makes YC startups matchable by skills/match_jobs.py
-    for the hero-chat onboarding (v1 Task 8).
+    for the hero-chat onboarding (v1 Task 8) and searchable by name.
+
+    all_batches defaults to True: the daily catalog sync ingests the FULL YC
+    directory (every publicly-launched company across all batches, ~6k), so a
+    user can search and cold-mail any YC company, not just recently-hiring
+    ones. max_companies is a safety cap only; the default is high enough to
+    hold the whole directory.
 
     Mirrors the ATS connectors (greenhouse/lever/ashby): each YC company
     becomes a Company (ats_type="yc", ats_token=slug) with one Job row
@@ -321,7 +430,7 @@ def run_catalog(max_companies: int = 500) -> dict:
     print("YC Catalog Sync (shared companies/jobs)")
     print(f"{'='*60}")
 
-    candidates = _gather_candidates(max_companies)
+    candidates = _gather_candidates(max_companies, all_batches=all_batches)
 
     added = 0
     skipped = 0
