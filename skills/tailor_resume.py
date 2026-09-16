@@ -977,23 +977,22 @@ def run(user_id: str | None = None):
         # (the graph-driven path already sets this) -- the standalone
         # CLI/API route path was missing it, leaving a lead's status stuck
         # at "matched" even after a resume was actually tailored for it.
-        # Clear any prior failure flag now that tailoring succeeded.
-        # Flag (don't fail) resumes that couldn't clear the ATS floor so they
-        # surface for review; clear the flag when they clear it.
-        below_floor = coverage < MIN_ATS_SCORE
+        # Tailoring succeeded — clear any prior failure flag. Keyword coverage
+        # is an internal signal only; a "low" score is NOT a failure (the
+        # resume is honestly tailored to what the candidate actually has), so
+        # we never set a failure_reason for it.
         repo.update_lead(user_id, lead["id"], {
             "resume_version": filename, "keyword_coverage": coverage,
             "status": "tailored",
-            "failure_reason": "ats_below_floor" if below_floor else None,
+            "failure_reason": None,
         })
         _persist_tailored_row(
             user_id=user_id, lead_id=lead["id"], company=company, role=role,
             tailored=tailored, coverage=coverage, base_filename=filename, source="pipeline",
         )
         tailored_count += 1
-        floor_note = f"  ⚠️ below {MIN_ATS_SCORE}% ATS floor" if below_floor else ""
         print(f"Tailored resume for {company} -> {filename} "
-              f"(ATS keyword coverage: {coverage}%){floor_note}")
+              f"(ATS keyword coverage: {coverage}%)")
 
     print(f"\ntailor_resume: {tailored_count} resumes tailored.")
 

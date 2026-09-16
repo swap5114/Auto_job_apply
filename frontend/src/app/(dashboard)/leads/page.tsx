@@ -1,9 +1,10 @@
 "use client";
 
 import { Suspense, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
-import { FileText, ChevronRight, Sparkles, Loader2, RefreshCw, Search, Mail, User, Briefcase } from "lucide-react";
+import { FileText, ChevronRight, Sparkles, Loader2, RefreshCw, Search, Mail, User, Briefcase, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 import { Header } from "@/components/layout/header";
 import { PageTransition } from "@/components/layout/page-transition";
@@ -46,17 +47,64 @@ function statusLabel(status: string) {
   return labels[status] || status || "New";
 }
 
-const FAILURE_LABELS: Record<string, string> = {
-  no_contact_found: "No contact email found",
-  no_job_description: "No job description",
-  tailor_failed: "Resume tailoring failed",
-  draft_failed: "Draft generation failed",
-  send_failed: "Send failed",
+// Short chip label + a full, actionable explanation (what went wrong, why,
+// and exactly what to do) for each failure reason.
+const FAILURE_INFO: Record<string, { label: string; detail: string; action?: { text: string; href: string } }> = {
+  no_resume: {
+    label: "No resume on file",
+    detail:
+      "We can't tailor a resume for this lead because you haven't uploaded one yet. To protect you, we never send someone else's resume — so tailoring is skipped until your resume is on file. Upload your resume, then re-run the pipeline.",
+    action: { text: "Upload resume", href: "/resume" },
+  },
+  no_contact_found: {
+    label: "No contact email found",
+    detail:
+      "We couldn't find a contact email for this company, so outreach can't be sent. You can add an email manually, or retry — we'll search again.",
+  },
+  no_job_description: {
+    label: "No job description",
+    detail:
+      "This lead has no job description text, so there's nothing to tailor the resume against. Add a JD (or re-scrape the listing), then retry.",
+  },
+  tailor_failed: {
+    label: "Resume tailoring failed",
+    detail:
+      "The AI couldn't tailor your resume for this role (usually a temporary model error). Your resume is safe — just retry.",
+  },
+  draft_failed: {
+    label: "Draft generation failed",
+    detail:
+      "The AI couldn't generate the outreach draft (usually a temporary model error). Retry to try again.",
+  },
+  send_failed: {
+    label: "Send failed",
+    detail:
+      "The outreach email couldn't be sent. This is often a Gmail connection issue — reconnect Gmail in Settings, then retry.",
+    action: { text: "Open Settings", href: "/settings" },
+  },
 };
 
+// Reasons that are NOT real failures and should never show as a red flag.
+// "ats_below_floor" just means keyword coverage was modest — the resume is
+// still honestly tailored, so we treat it as success.
+const NON_FAILURE_REASONS = new Set(["ats_below_floor"]);
+
+function isRealFailure(reason?: string): boolean {
+  return !!reason && !NON_FAILURE_REASONS.has(reason);
+}
+
+function failureInfo(reason?: string) {
+  if (!reason || NON_FAILURE_REASONS.has(reason)) return null;
+  return (
+    FAILURE_INFO[reason] || {
+      label: reason.replace(/_/g, " "),
+      detail: "Something went wrong with this lead. Try retrying.",
+    }
+  );
+}
+
 function failureLabel(reason?: string) {
-  if (!reason) return "";
-  return FAILURE_LABELS[reason] || reason.replace(/_/g, " ");
+  return failureInfo(reason)?.label || "";
 }
 
 const filters = [
@@ -294,7 +342,7 @@ function LeadsPageInner() {
                             {ch}
                           </Badge>
                         ))}
-                        {lead.failure_reason && (
+                        {isRealFailure(lead.failure_reason) && (
                           <Badge variant="rejected" className="text-[10px]">
                             {failureLabel(lead.failure_reason)}
                           </Badge>
@@ -358,17 +406,35 @@ function LeadsPageInner() {
 
                 {/* Overview */}
                 <TabsContent value="overview" className="mt-4 space-y-4">
-                  {selectedLead.failure_reason && (
-                    <div className="flex items-center justify-between gap-3 rounded-xl border border-red-200 bg-red-50 p-4">
-                      <div>
-                        <p className="text-xs font-medium text-red-700">Needs attention</p>
-                        <p className="mt-0.5 text-sm text-red-700">{failureLabel(selectedLead.failure_reason)}</p>
+                  {isRealFailure(selectedLead.failure_reason) && (() => {
+                    const info = failureInfo(selectedLead.failure_reason)!;
+                    return (
+                      <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
+                        <div className="flex items-start gap-2.5">
+                          <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-600" />
+                          <div className="min-w-0 flex-1">
+                            <p className="text-sm font-semibold text-amber-800">{info.label}</p>
+                            <p className="mt-1 text-xs leading-relaxed text-amber-800/90">{info.detail}</p>
+                            <div className="mt-3 flex flex-wrap items-center gap-2">
+                              {info.action && (
+                                <Button size="sm" asChild>
+                                  <Link href={info.action.href}>{info.action.text}</Link>
+                                </Button>
+                              )}
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                disabled={actionBusy}
+                                onClick={() => doRetry(selectedLead)}
+                              >
+                                {actionBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Retry"}
+                              </Button>
+                            </div>
+                          </div>
+                        </div>
                       </div>
-                      <Button size="sm" variant="outline" disabled={actionBusy} onClick={() => doRetry(selectedLead)}>
-                        {actionBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Retry"}
-                      </Button>
-                    </div>
-                  )}
+                    );
+                  })()}
 
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                     <div className="rounded-xl border bg-card p-3.5">
