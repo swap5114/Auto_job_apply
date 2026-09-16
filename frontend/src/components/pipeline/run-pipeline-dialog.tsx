@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 import {
@@ -74,11 +74,34 @@ export function RunPipelineDialog({
   const [ycMax, setYcMax] = useState(5);
   const [starting, setStarting] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [remaining, setRemaining] = useState<number | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
 
   const { state, refresh, abort, aborting } = usePipelineStatus();
   const running = state?.running ?? false;
   const finished = !running && !!state?.finished_at;
+
+  // Load the user's remaining credit balance (the backend source of truth)
+  // when the dialog opens, so we can warn before a run that can't be paid for.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    api.outreach
+      .quota()
+      .then((q) => {
+        if (!cancelled) setRemaining(Math.max(0, q.remaining));
+      })
+      .catch(() => {
+        if (!cancelled) setRemaining(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, finished]);
+
+  // 1 credit per lead the run will attempt. If we know the balance and it's
+  // short, block the run client-side (the backend enforces this too).
+  const insufficientCredits = remaining !== null && ycMax > remaining;
 
   async function handleAbort() {
     try {
@@ -97,6 +120,12 @@ export function RunPipelineDialog({
     const sources = (Object.keys(selected) as SourceKey[]).filter((k) => selected[k]);
     if (sources.length === 0) {
       toast.error("Pick at least one source");
+      return;
+    }
+    if (remaining !== null && ycMax > remaining) {
+      toast.error(
+        `Not enough credits: this run needs ${ycMax} but you have ${remaining} left.`
+      );
       return;
     }
     setStarting(true);
@@ -179,6 +208,24 @@ export function RunPipelineDialog({
           })}
         </div>
 
+        {/* Credits pre-flight: 1 credit burns per lead that completes to a
+            real outreach. Warn before a run that can't be paid for. */}
+        {remaining !== null && (
+          <div
+            className={`flex items-center justify-between rounded-lg border px-3 py-2 text-xs ${insufficientCredits
+              ? "border-red-200 bg-red-50 text-red-700"
+              : "border-border bg-muted/30 text-muted-foreground"
+              }`}
+          >
+            <span>
+              {insufficientCredits
+                ? `This run needs ${ycMax} credits — you have ${remaining} left.`
+                : `Uses up to ${ycMax} credit${ycMax === 1 ? "" : "s"} (1 per lead).`}
+            </span>
+            <span className="font-medium">{remaining} credits left</span>
+          </div>
+        )}
+
         {/* Animated stage pipeline — the redesigned centerpiece */}
         <StagePipeline steps={state?.steps} running={running} finished={finished} />
 
@@ -241,7 +288,7 @@ export function RunPipelineDialog({
                 </Button>
               </>
             ) : (
-              <Button onClick={handleRun} disabled={starting}>
+              <Button onClick={handleRun} disabled={starting || insufficientCredits}>
                 {starting ? (
                   <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
                 ) : finished ? (

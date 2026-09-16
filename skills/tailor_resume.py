@@ -503,7 +503,7 @@ def tailor_resume_for_lead(lead: dict) -> dict:
     coverage = result["keyword_coverage"]
     model_used = result["model_used"]
 
-    filename = save_resume(tailored, company, user_id=user_id)
+    filename = save_resume(tailored, company, user_id=user_id, jd_text=jd_text)
     below_floor = coverage < MIN_ATS_SCORE
 
     # Persist the tailored version (JSON source-of-truth in Postgres, artifact
@@ -573,6 +573,78 @@ def keyword_coverage(jd_text: str, tailored_resume: dict) -> float:
     resume_text = json.dumps(tailored_resume).lower()
     matched = sum(1 for word in jd_words if word in resume_text)
     return round(100 * matched / len(jd_words), 1)
+
+
+# Stopwords shared by the JD keyword-coverage signal and the per-bullet
+# JD-relevance scoring used when trimming to fit one page.
+_JD_STOPWORDS = {
+    "the", "and", "for", "with", "you", "your", "our", "are", "will",
+    "this", "that", "have", "from", "who", "a", "an", "to", "of", "in",
+    "on", "we", "is", "as", "be", "or", "at", "can", "not", "by", "an",
+}
+
+
+def _jd_keywords(jd_text: str) -> set[str]:
+    """Significant (non-stopword) tokens from the JD, used to score how
+    relevant a given resume bullet is to this specific job."""
+    return set(re.findall(r"[a-zA-Z][a-zA-Z0-9+.#]{2,}", (jd_text or "").lower())) - _JD_STOPWORDS
+
+
+def _bullet_jd_score(bullet: str, jd_words: set[str]) -> int:
+    """How many distinct JD keywords a bullet touches. Higher = more relevant
+    to the job. Ties broken elsewhere by preferring to drop LATER (lower on
+    the page) and LONGER bullets first."""
+    if not bullet or not jd_words:
+        return 0
+    words = set(re.findall(r"[a-zA-Z][a-zA-Z0-9+.#]{2,}", bullet.lower()))
+    return len(words & jd_words)
+
+
+def _trim_one_least_relevant_bullet(resume: dict, jd_text: str) -> dict | None:
+    """Return a COPY of `resume` with exactly one bullet removed — the single
+    least JD-relevant bullet across experience + projects — or None when
+    nothing can be safely removed.
+
+    Safety rules so trimming only ever drops genuinely low-value content:
+      - Only experience/project BULLETS are eligible. Names, titles,
+        companies, dates, education, skills, and summary are never touched.
+      - An entry's LAST remaining bullet is protected, so no experience/project
+        is left with zero bullets (which would look broken/empty).
+      - The lowest JD-relevance bullet wins; ties prefer the later entry and
+        the longer bullet (takes more space, adds least keyword value).
+    """
+    jd_words = _jd_keywords(jd_text)
+    if not jd_words:
+        return None
+
+    import copy
+
+    candidates = []  # (score, entry_index_desc, length, section, entry_i, bullet_i)
+    for section in ("experience", "projects"):
+        entries = resume.get(section) or []
+        for ei, entry in enumerate(entries):
+            bullets = entry.get("bullets") or []
+            # Protect the last bullet so the entry never becomes empty.
+            if len(bullets) <= 1:
+                continue
+            for bi, b in enumerate(bullets):
+                candidates.append((
+                    _bullet_jd_score(b, jd_words),  # fewer JD hits -> drop first
+                    -ei,                            # later entry -> drop first
+                    -len(b or ""),                  # longer -> drop first
+                    section, ei, bi,
+                ))
+
+    if not candidates:
+        return None
+
+    # Lowest score, then later entry, then longer bullet.
+    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+    _, _, _, section, ei, bi = candidates[0]
+
+    trimmed = copy.deepcopy(resume)
+    trimmed[section][ei]["bullets"].pop(bi)
+    return trimmed
 
 
 def resume_to_markdown(resume: dict) -> str:
@@ -688,7 +760,7 @@ p.plain { margin: 0; line-height: 1.1; }
 ul.bullets { list-style-type: disc; margin: 0 0 2px 0; padding-left: 13px; }
 ul.bullets li { text-align: justify; margin-bottom: 0px; line-height: 1.15; }
 p.skills-line { margin: 0; line-height: 1.2; }
-a { color: #1155cc; }
+a { color: #1155cc; text-decoration: underline; }
 """
 
 
@@ -713,15 +785,167 @@ p.plain { margin: 0; line-height: 1.3; }
 ul.bullets { list-style-type: disc; margin: 3px 0 5px 0; padding-left: 16px; }
 ul.bullets li { text-align: left; margin-bottom: 1.5px; line-height: 1.32; }
 p.skills-line { margin: 1.5px 0; line-height: 1.32; }
-a { color: #1155cc; text-decoration: none; }
+a { color: #1155cc; text-decoration: underline; }
+"""
+
+
+# Per-template layout metrics. A single parameterized stylesheet is built from
+# these so the same rules can be emitted at a reduced scale for content-heavy
+# resumes (single-page fit) WITHOUT duplicating selectors — xhtml2pdf does not
+# cascade a second rule for the same selector, so we must emit each selector
+# exactly once with its final (possibly scaled) values.
+_TEMPLATE_METRICS = {
+    "jake": {
+        "page_margin_v": 0.30, "page_margin_h": 0.5,
+        "body_font": 9.6, "body_lh": 1.12,
+        "name_font": 18.0, "contact_font": 9.3, "contact_mb": 4.0,
+        "section_font": 11.0, "section_mt": 4.0,
+        "bullet_lh": 1.15, "bullets_mb": 2.0, "skills_lh": 1.2,
+        "section_rule": "1px solid #000000", "body_color": "#000000",
+        "bullet_align": "justify", "section_upper": False,
+        "right_color": "", "right_font": "",
+    },
+    "standard": {
+        "page_margin_v": 0.50, "page_margin_h": 0.6,
+        "body_font": 10.0, "body_lh": 1.3,
+        "name_font": 21.0, "contact_font": 8.8, "contact_mb": 10.0,
+        "section_font": 10.0, "section_mt": 11.0,
+        "bullet_lh": 1.32, "bullets_mb": 5.0, "skills_lh": 1.32,
+        "section_rule": "1px solid #444444", "body_color": "#111111",
+        "bullet_align": "left", "section_upper": True,
+        "right_color": "#333", "right_font": "9pt",
+    },
+}
+
+
+def _build_css(template: str, scale: float = 1.0) -> str:
+    """Emit the resume stylesheet for `template`, with all vertical sizing
+    multiplied by `scale` (<= 1.0). scale=1.0 reproduces the original template
+    CSS byte-for-visual-equivalence; a smaller scale compresses font sizes,
+    line-heights, and margins to keep heavy content on one page.
+
+    Each selector is emitted exactly once (xhtml2pdf ignores a redefined
+    selector), so scaling happens by generating the numbers, never by layering
+    an override rule on top.
+    """
+    m = _TEMPLATE_METRICS.get(template, _TEMPLATE_METRICS["jake"])
+
+    def s(v: float, lo: float = 0.0) -> float:
+        return round(max(lo, v * scale), 2)
+
+    # Page margins shrink only mildly (keep a safe printable border).
+    margin_scale = max(0.6, scale)
+    pm_v = round(m["page_margin_v"] * margin_scale, 3)
+    pm_h = round(m["page_margin_h"] * margin_scale, 3)
+
+    right_extra = ""
+    if m["right_color"]:
+        right_extra = f" color: {m['right_color']}; font-size: {s(float(m['right_font'][:-2]))}pt;"
+    section_upper = " text-transform: uppercase; letter-spacing: 0.6px;" if m["section_upper"] else ""
+    name_extra = " font-weight: 700; letter-spacing: 0.2px;" if template == "standard" else ""
+    subtext_color = " color: #333;" if template == "standard" else ""
+    plain_left = " font-style: italic;" if template == "standard" else ""
+
+    return f"""
+@page {{ size: letter; margin: {pm_v}in {pm_h}in; }}
+body {{ font-family: Helvetica, Arial, sans-serif; font-size: {s(m['body_font'], 7.4)}pt; line-height: {s(m['body_lh'], 1.02)}; color: {m['body_color']}; }}
+h1.name {{ text-align: center; font-size: {s(m['name_font'], 14.0)}pt; margin: 0 0 {s(2.0)}px 0; line-height: 1.1;{name_extra} }}
+p.contact {{ text-align: center; font-size: {s(m['contact_font'], 7.4)}pt; margin: 0 0 {s(m['contact_mb'], 2.0)}px 0;{subtext_color} }}
+h2.section {{ font-size: {s(m['section_font'], 9.0)}pt; font-weight: 700;{section_upper} color: {m['body_color']}; border-bottom: {m['section_rule']}; margin: {s(m['section_mt'], 2.0)}px 0 1px 0; padding-bottom: 1px; line-height: 1.1; }}
+table.row {{ width: 100%; border-collapse: collapse; }}
+table.row td {{ padding: 0; vertical-align: top; line-height: {s(m['body_lh'], 1.02)}; }}
+td.left {{ text-align: left; font-weight: 700; }}
+td.left.plain {{ font-weight: 400;{plain_left} }}
+td.right {{ text-align: right;{right_extra} }}
+p.subtext {{ font-style: italic; margin: 0; line-height: {s(m['body_lh'], 1.02)};{subtext_color} }}
+p.plain {{ margin: 0; line-height: {s(m['body_lh'], 1.02)}; }}
+ul.bullets {{ list-style-type: disc; margin: {s(1.5)}px 0 {s(m['bullets_mb'], 1.0)}px 0; padding-left: {s(14.0, 10.0)}px; }}
+ul.bullets li {{ text-align: {m['bullet_align']}; margin-bottom: {s(1.0)}px; line-height: {s(m['bullet_lh'], 1.02)}; }}
+p.skills-line {{ margin: {s(1.0)}px 0; line-height: {s(m['skills_lh'], 1.02)}; }}
+a {{ color: #1155cc; text-decoration: underline; }}
 """
 
 
 def _template_css(template: str) -> str:
+    """Original (unscaled) stylesheet. Retained for callers/tests that expect
+    the base template CSS; the render path uses _build_css with a fit scale."""
     return STANDARD_CSS if template == "standard" else RESUME_CSS
 
 
-def resume_to_html(resume: dict, template: str = DEFAULT_TEMPLATE) -> str:
+def _content_weight(resume: dict) -> int:
+    """A rough measure of how much vertical space a resume needs.
+
+    Counts the "line-generating" units — summary, each experience/education/
+    project entry and its bullets, each skill category, certifications — plus
+    a character-length signal for long bullets/summaries that wrap onto extra
+    lines. Used only to decide how aggressively to compress so the PDF stays
+    on one page; it never changes the resume content itself.
+    """
+    weight = 0
+    chars = 0
+
+    summary = resume.get("summary") or ""
+    if summary:
+        weight += 2
+        chars += len(summary)
+
+    for exp in resume.get("experience", []) or []:
+        weight += 2  # heading + company/subtext line
+        for b in exp.get("bullets", []) or []:
+            weight += 1
+            chars += len(b or "")
+
+    for edu in resume.get("education", []) or []:
+        weight += 2
+        if edu.get("details"):
+            weight += 1
+            chars += len(edu["details"])
+
+    for proj in resume.get("projects", []) or []:
+        weight += 2
+        for b in proj.get("bullets", []) or []:
+            weight += 1
+            chars += len(b or "")
+
+    skills = resume.get("skills") or {}
+    if isinstance(skills, dict):
+        weight += len(skills)
+        for items in skills.values():
+            chars += len(", ".join(str(i) for i in (items or [])))
+    elif isinstance(skills, list):
+        weight += 1
+        chars += len(", ".join(str(i) for i in skills))
+
+    weight += len(resume.get("certifications", []) or [])
+
+    # Every ~90 chars of body text tends to wrap to roughly one extra line.
+    weight += chars // 90
+    return weight
+
+
+def _fit_scale(resume: dict, template: str) -> float:
+    """Compute a layout scale factor (<= 1.0) that keeps a content-heavy resume
+    on one page. Returns 1.0 (no compression) for resumes that already fit
+    comfortably, so their rendering is unchanged. For heavier resumes it scales
+    down proportionally to how far over the fit threshold the content is,
+    clamped to a readable floor so no content is ever dropped.
+    """
+    weight = _content_weight(resume)
+
+    # At/below this weight the default template fits one page — render as-is.
+    threshold = 74 if template == "standard" else 84
+    if weight <= threshold:
+        return 1.0
+
+    over = (weight - threshold) / float(threshold)
+    # Map "how far over" to a readable scale in [0.82, 1.0). Heavier content is
+    # handled by JD-aware bullet trimming (and, only as a last resort, the
+    # extreme scale tier) rather than shrinking text below readability here.
+    scale = 1.0 - min(over, 1.0) * 0.18
+    return round(max(0.82, scale), 3)
+
+
+def resume_to_html(resume: dict, template: str = DEFAULT_TEMPLATE, scale: float | None = None) -> str:
     template = template if template in TEMPLATES else DEFAULT_TEMPLATE
     name = esc(resume.get("name", ""))
 
@@ -730,9 +954,12 @@ def resume_to_html(resume: dict, template: str = DEFAULT_TEMPLATE) -> str:
     if contact.get("location"):
         contact_parts.append(esc(contact["location"]))
     if contact.get("phone"):
-        contact_parts.append(esc(contact["phone"]))
+        _phone = contact["phone"]
+        _tel = "tel:" + re.sub(r"[^0-9+]", "", str(_phone))
+        contact_parts.append(f'<a href="{esc(_tel)}">{esc(_phone)}</a>')
     if contact.get("email"):
-        contact_parts.append(esc(contact["email"]))
+        _email = contact["email"]
+        contact_parts.append(f'<a href="mailto:{esc(_email)}">{esc(_email)}</a>')
     if contact.get("linkedin"):
         contact_parts.append(f'<a href="{esc(_normalize_url(contact["linkedin"]))}">LinkedIn</a>')
     if contact.get("github"):
@@ -835,8 +1062,11 @@ def resume_to_html(resume: dict, template: str = DEFAULT_TEMPLATE) -> str:
         rows.append(f'<ul class="bullets">{bullets}</ul>')
         sections.append("".join(rows))
 
+    if scale is None:
+        scale = _fit_scale(resume, template)
+    css = _template_css(template) if scale >= 1.0 else _build_css(template, scale)
     return f"""<html>
-<head><meta charset="utf-8"><style>{_template_css(template)}</style></head>
+<head><meta charset="utf-8"><style>{css}</style></head>
 <body>
 <h1 class="name">{name}</h1>
 <p class="contact">{contact_line}</p>
@@ -845,30 +1075,126 @@ def resume_to_html(resume: dict, template: str = DEFAULT_TEMPLATE) -> str:
 </html>"""
 
 
-def resume_to_pdf(resume: dict, output_path: str, template: str = DEFAULT_TEMPLATE):
+def _pdf_page_count(pdf_bytes: bytes) -> int:
+    """Count page objects in a PDF (/Type /Page, not /Pages). Used to enforce
+    the single-page guarantee without a heavy PDF dependency."""
+    if not pdf_bytes:
+        return 0
+    return len(re.findall(rb"/Type\s*/Page\b(?!s)", pdf_bytes))
+
+
+# Scale steps tried to fit a resume onto one page. Split into two tiers so we
+# prefer dropping a low-value bullet over shrinking text to tiny sizes:
+#   - READABLE: mild compression that keeps text comfortably legible. We stay
+#     within this tier first; if content still overflows and a JD is known, we
+#     trim the least-relevant bullet rather than compress further.
+#   - EXTREME: a final safety net (smaller fonts) used only when nothing more
+#     can be safely trimmed, so the one-page guarantee still holds.
+# The first step (1.0) is the untouched template; a short resume fits there and
+# is never recompressed.
+_FIT_SCALE_READABLE = (1.0, 0.95, 0.9, 0.86, 0.82)
+_FIT_SCALE_EXTREME = (0.78, 0.74, 0.7, 0.66, 0.62)
+_FIT_SCALE_STEPS = _FIT_SCALE_READABLE + _FIT_SCALE_EXTREME
+
+
+def _render_at_scales(resume: dict, template: str, scales) -> tuple[bytes, int]:
+    """Render `resume` stepping through `scales` (already filtered/ordered),
+    returning (pdf_bytes, page_count) for the FIRST scale that fits one page —
+    or the tightest render tried if none fit."""
+    import io
+
+    last_bytes = b""
+    last_pages = 0
+    for scale in scales:
+        html_str = resume_to_html(resume, template=template, scale=scale)
+        buf = io.BytesIO()
+        result = pisa.CreatePDF(html_str, dest=buf)
+        if result.err:
+            raise RuntimeError(f"xhtml2pdf failed to render PDF ({result.err} errors)")
+        last_bytes = buf.getvalue()
+        last_pages = _pdf_page_count(last_bytes)
+        if last_pages <= 1:
+            break
+    return last_bytes, last_pages
+
+
+def _readable_scales(resume: dict, template: str) -> list[float]:
+    initial = _fit_scale(resume, template)
+    return [s for s in _FIT_SCALE_READABLE if s <= initial] or [min(initial, _FIT_SCALE_READABLE[-1])]
+
+
+def _render_at_smallest_scale(resume: dict, template: str) -> tuple[bytes, int]:
+    """Render `resume` across ALL scale steps (readable then extreme) and
+    return the first single-page fit, or the tightest render. Used when no JD
+    is available to guide trimming — pure layout compression."""
+    initial = _fit_scale(resume, template)
+    steps = [s for s in _FIT_SCALE_STEPS if s <= initial] or [initial]
+    return _render_at_scales(resume, template, steps)
+
+
+def _render_pdf_single_page(resume: dict, template: str, jd_text: str = "") -> bytes:
+    """Render the resume to a single-page PDF (bytes).
+
+    Single-page guarantee, ordered to preserve readability and JD relevance:
+      1. Try READABLE layout compression. A resume that already fits at scale
+         1.0 is rendered once, unchanged.
+      2. If it still overflows AND a job description is available, drop the
+         least JD-relevant experience/project bullet (never identity, skills,
+         summary, or an entry's last bullet) and retry the readable scales —
+         repeating so we shed low-value content instead of shrinking text.
+      3. Only if nothing more can be safely trimmed, fall back to EXTREME
+         (smaller) scales so the one-page guarantee always holds.
+
+    Without a `jd_text`, steps 1+3 run as pure compression (behavior matches
+    the prior scale-only fit).
+    """
+    # Step 1: readable compression only.
+    current = resume
+    pdf_bytes, pages = _render_at_scales(current, template, _readable_scales(current, template))
+    if pages <= 1:
+        return pdf_bytes
+
+    # Step 2: prefer trimming the least JD-relevant bullets (retrying readable
+    # scales after each drop) over shrinking text further.
+    if jd_text:
+        for _ in range(40):
+            trimmed = _trim_one_least_relevant_bullet(current, jd_text)
+            if trimmed is None:
+                break  # nothing safe left to remove
+            current = trimmed
+            pdf_bytes, pages = _render_at_scales(current, template, _readable_scales(current, template))
+            if pages <= 1:
+                return pdf_bytes
+
+    # Step 3: final safety net — extreme scales on whatever content remains.
+    pdf_bytes, pages = _render_at_scales(current, template, _FIT_SCALE_EXTREME)
+    return pdf_bytes
+
+
+def resume_to_pdf(resume: dict, output_path: str, template: str = DEFAULT_TEMPLATE, jd_text: str = ""):
     """Renders via HTML/CSS (xhtml2pdf) so we can match the actual visual
     template -- bold-left/date-right rows, justified bullets, section
-    divider lines -- instead of a generic manually-positioned layout."""
-    html_str = resume_to_html(resume, template=template)
+    divider lines -- instead of a generic manually-positioned layout.
+
+    Guarantees a single-page PDF: content is auto-compressed and, if a
+    `jd_text` is given, the least JD-relevant bullets are dropped until it
+    fits one letter page (a resume that already fits renders unchanged)."""
+    pdf_bytes = _render_pdf_single_page(resume, template, jd_text=jd_text)
     with open(output_path, "wb") as f:
-        result = pisa.CreatePDF(html_str, dest=f)
-    if result.err:
-        raise RuntimeError(f"xhtml2pdf failed to render {output_path} ({result.err} errors)")
+        f.write(pdf_bytes)
 
 
-def resume_to_pdf_bytes(resume: dict, template: str = DEFAULT_TEMPLATE) -> bytes:
-    """Render the resume to PDF bytes in-memory (no disk), for the artifact
-    store. Same HTML/CSS template as resume_to_pdf."""
-    import io
-    html_str = resume_to_html(resume, template=template)
-    buf = io.BytesIO()
-    result = pisa.CreatePDF(html_str, dest=buf)
-    if result.err:
-        raise RuntimeError(f"xhtml2pdf failed to render PDF ({result.err} errors)")
-    return buf.getvalue()
+def resume_to_pdf_bytes(resume: dict, template: str = DEFAULT_TEMPLATE, jd_text: str = "") -> bytes:
+    """Render the resume to a single-page PDF in-memory (no disk), for the
+    artifact store. Same HTML/CSS template + single-page guarantee as
+    resume_to_pdf; pass `jd_text` to enable JD-aware bullet trimming."""
+    return _render_pdf_single_page(resume, template, jd_text=jd_text)
 
 
-def save_resume(resume: dict, company: str, user_id: str | None = None, template: str = DEFAULT_TEMPLATE) -> str:
+def save_resume(
+    resume: dict, company: str, user_id: str | None = None,
+    template: str = DEFAULT_TEMPLATE, jd_text: str = "",
+) -> str:
     """Render the tailored resume's JSON/MD/PDF artifacts and store them via
     the artifact store (GCS in prod, local resumes/ in dev), keyed by a
     stable, user-namespaced base filename. Returns that base filename, which
@@ -878,6 +1204,11 @@ def save_resume(resume: dict, company: str, user_id: str | None = None, template
     Postgres by the caller (via repo.add_tailored_resume) as the source of
     truth. The base filename is unchanged from the legacy scheme so existing
     resume_version references keep resolving.
+
+    The stored JSON/MD keep the FULL tailored resume (source of truth for the
+    Resume-page editor). The PDF is the one-page artifact: `jd_text`, when
+    given, lets the renderer drop the least JD-relevant bullets to fit a
+    single page after layout compression alone isn't enough.
     """
     from storage import artifact_store as store
 
@@ -891,7 +1222,7 @@ def save_resume(resume: dict, company: str, user_id: str | None = None, template
 
     json_bytes = json.dumps(resume, indent=2, ensure_ascii=False).encode("utf-8")
     md_bytes = resume_to_markdown(resume).encode("utf-8")
-    pdf_bytes = resume_to_pdf_bytes(resume, template=template)
+    pdf_bytes = resume_to_pdf_bytes(resume, template=template, jd_text=jd_text)
 
     store.put_bytes(f"{base_filename}.json", json_bytes, "application/json")
     store.put_bytes(f"{base_filename}.md", md_bytes, "text/markdown")
@@ -971,7 +1302,7 @@ def run(user_id: str | None = None):
                 pass
             continue
 
-        filename = save_resume(tailored, company, user_id=user_id)
+        filename = save_resume(tailored, company, user_id=user_id, jd_text=jd_text)
         coverage = keyword_coverage(jd_text, tailored)
         # status: "tailored" mirrors graph/pipeline.py's tailor_resume_node
         # (the graph-driven path already sets this) -- the standalone

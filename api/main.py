@@ -479,11 +479,56 @@ def get_lead_resume_pdf(lead_id: str, user_id: str = Depends(get_authenticated_u
     if pdf_bytes is None:
         raise HTTPException(status_code=404, detail="Tailored resume PDF not found")
 
+    # Serve with a clean, human-readable filename (name + company) instead of
+    # the internal ID-bearing store key. The store key (resume_version) stays
+    # untouched — it's only used to fetch the bytes above, never shown.
+    download_name = _clean_resume_filename(user_id, lead)
+
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{resume_version}.pdf"'},
+        headers={"Content-Disposition": f'inline; filename="{download_name}.pdf"'},
     )
+
+
+def _clean_resume_filename(user_id: str, lead: dict) -> str:
+    """Build a readable resume download filename as `{Name}_{Company}`.
+
+    The candidate's name comes from the tailored-resume JSON (falling back to
+    the user record), and the company from the lead. Sanitized to
+    filesystem-safe characters (mirrors download_resume_pdf), falling back to
+    a sensible default when a part is missing.
+    """
+    def _safe(value: str | None) -> str:
+        return "".join(
+            c for c in str(value or "") if c.isalnum() or c in (" ", "-", "_")
+        ).strip().replace(" ", "_")
+
+    # Name: prefer the tailored resume's own name, then the user record.
+    name = ""
+    resume_version = (lead.get("resume_version") or "").strip()
+    if resume_version:
+        try:
+            from storage import artifact_store as store
+            json_bytes = store.get_bytes(f"{resume_version}.json")
+            if json_bytes:
+                resume_json = json.loads(json_bytes.decode("utf-8"))
+                name = (resume_json or {}).get("name") or ""
+        except Exception:
+            name = ""
+    if not name:
+        try:
+            user = repo.get_user(user_id)
+            name = (user or {}).get("name") or ""
+        except Exception:
+            name = ""
+
+    company = lead.get("company") or lead.get("x_handle") or ""
+
+    name_part = _safe(name)
+    company_part = _safe(company)
+    parts = [p for p in (name_part, company_part) if p]
+    return "_".join(parts) or "resume"
 
 
 @app.post("/api/jobs/{job_id}/save", response_model=LeadResponse)
@@ -1472,6 +1517,30 @@ def _pipeline_run_to_response(run: Optional[dict]) -> dict:
     }
 
 
+def _require_sufficient_credits(user_id: str, requested_leads: int) -> None:
+    """Reject a pipeline start when the user lacks enough credits for the
+    number of leads it will attempt.
+
+    1 credit = 1 lead that completes to a real outreach (tailored resume +
+    draft/sent). We gate the run up front against the user's remaining
+    balance (the backend source of truth from get_outreach_quota) so a run can
+    never process more leads than the user can pay for. Raises HTTP 402 with a
+    clear {needed, remaining} message when the balance is insufficient.
+    """
+    needed = max(1, int(requested_leads or 0))
+    quota = repo.get_outreach_quota(user_id)
+    remaining = int(quota.get("remaining", 0))
+    if remaining < needed:
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                f"Not enough credits: this run needs {needed} "
+                f"credit{'s' if needed != 1 else ''} but you have {remaining} left. "
+                "Reduce the number of leads or upgrade your plan."
+            ),
+        )
+
+
 @app.post("/api/pipeline/run")
 def run_pipeline(body: RunPipelineRequest, user_id: str = Depends(get_authenticated_user_id)):
     """Start the full sourcing+processing pipeline on demand (non-blocking),
@@ -1484,10 +1553,16 @@ def run_pipeline(body: RunPipelineRequest, user_id: str = Depends(get_authentica
     if repo.get_running_pipeline_run(user_id):
         raise HTTPException(status_code=409, detail="Pipeline already running")
 
-    run = repo.create_pipeline_run(user_id)
     # v1: YC is the only automated source (all other boards parked).
     sources = body.sources or ["yc"]
     yc_max = min(max(1, body.yc_max_leads or 5), 15)
+
+    # Pre-flight credit check: each lead that completes to a real outreach
+    # (tailored resume + draft/sent) burns 1 credit, so require enough credits
+    # for the number of leads this run will attempt before starting.
+    _require_sufficient_credits(user_id, yc_max)
+
+    run = repo.create_pipeline_run(user_id)
     threading.Thread(
         target=_run_pipeline_bg,
         args=(user_id, run["id"], sources, yc_max, body.x_max_leads, body.csv_path),
@@ -1548,6 +1623,9 @@ def run_for_leads(body: RunForLeadsRequest, user_id: str = Depends(get_authentic
 
     if repo.get_running_pipeline_run(user_id):
         raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    # Pre-flight credit check: 1 credit per lead that completes to outreach.
+    _require_sufficient_credits(user_id, len(body.lead_ids))
 
     run = repo.create_pipeline_run(user_id)
     threading.Thread(
