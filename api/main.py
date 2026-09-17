@@ -2994,6 +2994,7 @@ class RephraseRequest(BaseModel):
     company: Optional[str] = None
     role: Optional[str] = None
     template: Optional[str] = "jake"  # standard | jake
+    current_tailored_json: Optional[dict] = None
 
 
 class RephraseResponse(BaseModel):
@@ -3254,9 +3255,13 @@ def rephrase_resume(body: RephraseRequest, user_id: str = Depends(get_authentica
     company = (body.company or "").strip() or "the company"
     role = (body.role or "").strip() or "this role"
 
+    # If the caller provides current_tailored_json (the active resume state in memory/editor),
+    # build incrementally on top of it so follow-up prompts don't reset previous edits.
+    input_resume = body.current_tailored_json if (isinstance(body.current_tailored_json, dict) and body.current_tailored_json) else base_resume
+
     # Single call to the configured tailoring model (chosen offline via the
     # model benchmark) — fast and responsive, no runtime comparison.
-    result = tailor_resume_verbose(base_resume, company, role, jd)
+    result = tailor_resume_verbose(input_resume, company, role, jd)
     tailored = result["tailored"]
     coverage = result["keyword_coverage"]
 

@@ -721,12 +721,12 @@ export const api = {
     // The user's current base (primary) resume for the Resume page editor.
     base: () => request<BaseResume>("/resume/base"),
 
-    // Live JD-rephrase preview of the base resume — NOT persisted.
     rephrase: (body: {
       jd_text: string;
       company?: string;
       role?: string;
       template?: ResumeTemplate;
+      current_tailored_json?: Record<string, unknown>;
     }) =>
       request<RephraseResult>("/resume/rephrase", {
         method: "POST",

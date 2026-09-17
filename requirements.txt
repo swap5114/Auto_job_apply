@@ -5,6 +5,7 @@ beautifulsoup4
 anthropic
 ollama
 xhtml2pdf
+playwright
 pypdf # PDF text extraction for the anonymous resume-upload hook (Phase 2) -- already a transitive dep of xhtml2pdf, pinned explicitly since parse_resume.py depends on it directly
 python-docx # DOCX text extraction for the anonymous resume-upload hook (Phase 2)
 langgraph

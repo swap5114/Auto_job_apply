@@ -10,6 +10,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from db import repository as repo
 from db.current_user import get_current_user_id
 from skills.llm_client import llm_generate_json, MODEL_BACKEND
+from skills.skill_gap import classify_skill_gap
+from skills.verify_facts import verify_tailored_facts
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "config", ".env"))
 
@@ -47,6 +49,9 @@ STRICT RULES -- violating any of these is a critical failure:
 7. You MUST NOT change company names, job titles, dates, degree, GPA, or institution names -- copy these through exactly as given.
 8. When the base resume already truthfully supports a claim, use the job description's exact terminology where possible (e.g. if the JD says "Node.js" and the bullet already covers that, keep the term "Node.js" rather than paraphrasing) -- this matters for ATS keyword matching.
 9. MAXIMIZE ATS keyword coverage: aim to reflect as many of the job description's real skills/tools/responsibilities as the base resume TRUTHFULLY supports, using the JD's exact wording. The goal is high keyword overlap with the JD WITHOUT ever adding anything the base resume doesn't already contain. If the JD mentions something the candidate genuinely hasn't done, leave it out -- honesty always wins over coverage.
+10. RECRUITER SCANNING & BOLDING: Wrap key quantified metrics, dollar amounts, performance numbers, and major impact results in `**...**` markdown syntax (e.g., `**120 ms**`, `**35% increase**`, `**$500k ARR**`) so recruiters spot evidence immediately during quick scans.
+11. PROJECT LINKS: Preserve valid project links (`link`) from the base resume or apply URL updates if explicitly requested in the prompt. Never invent fake or hallucinated URLs.
+12. CONTACT INFO: If the prompt explicitly asks to update contact information (LinkedIn, GitHub, Portfolio, Email, Phone), you MUST update the `contact` block with those exact values.
 
 Return ONLY valid JSON matching the exact same structure as the input base resume. No prose, no markdown code fences, no explanation -- just the JSON object."""
 
@@ -163,11 +168,20 @@ resume content to foreground -- this does NOT give you license to invent
 anything new):
 {json.dumps(company_research, indent=2)}"""
 
+    # Perform zero-LLM skill gap classification
+    sg_result = classify_skill_gap(jd_text, base_resume)
+    skill_gap_context = f"""
+
+Skill Classification against Base Resume:
+- Existing Named Skills: {json.dumps(sg_result['existing'])}
+- Supported by Resume Experience/Projects: {json.dumps(sg_result['supported_by_resume'])}
+- Unverified Gap Skills (DO NOT FABRICATE): {json.dumps(sg_result['gap'])}"""
+
     return f"""Job description:
 Company: {company}
 Role: {role}
 
-{jd_text}{research_context}
+{jd_text}{research_context}{skill_gap_context}
 
 Base resume (JSON):
 {json.dumps(base_resume, indent=2)}"""
@@ -229,7 +243,13 @@ def _tailor_once(
         print(f"  ⚠️  tailor ({backend or 'default'}) failed: {e}")
         return None, -1.0
 
-    cleaned = sanitize_tailored(base_resume, candidate)
+    cleaned = sanitize_tailored(base_resume, candidate, prompt_text=jd_text)
+    
+    # Run fact verification to detect unverified metrics
+    is_fact_valid, warnings = verify_tailored_facts(base_resume, cleaned)
+    if not is_fact_valid:
+        print(f"  ⚠️  tailor_resume fact gate warnings: {warnings}")
+
     return cleaned, keyword_coverage(jd_text, cleaned)
 
 
@@ -253,7 +273,25 @@ def _is_skill_rephrase(new_skill: str, base_skills: set[str]) -> bool:
     return False
 
 
-def sanitize_tailored(base_resume: dict, tailored: dict) -> dict:
+def _apply_contact_overrides_from_prompt(contact: dict, prompt_text: str) -> dict:
+    """Extract contact updates (LinkedIn, GitHub, Portfolio, Email, Phone) if explicitly mentioned in user prompt."""
+    out = dict(contact or {})
+    text = prompt_text or ""
+    # Look for URLs and domain patterns in prompt
+    urls = re.findall(r"(?:https?://|github\.com/|linkedin\.com/)[^\s,\"\'>]+", text, re.IGNORECASE)
+    for u in urls:
+        u_clean = u.strip().rstrip(".")
+        u_lower = u_clean.lower()
+        if "linkedin" in u_lower:
+            out["linkedin"] = _normalize_url(u_clean)
+        elif "github" in u_lower:
+            out["github"] = _normalize_url(u_clean)
+        elif any(k in u_lower for k in ("portfolio", "vercel.app", "github.io", "dev")):
+            out["portfolio"] = _normalize_url(u_clean)
+    return out
+
+
+def sanitize_tailored(base_resume: dict, tailored: dict, prompt_text: str | None = None) -> dict:
     """Return a copy of `tailored` with identity drift repaired against
     `base_resume`, WITHOUT discarding the rework:
 
@@ -263,16 +301,32 @@ def sanitize_tailored(base_resume: dict, tailored: dict) -> dict:
         no employer/role/school/project can be invented or renamed.
       - skills: keep reworded/reordered skills that overlap an existing base
         skill (allowed synonym); drop only skills with no base overlap.
-      - name/contact: always taken from the base (never model-editable).
+      - name: always taken from the base (never model-editable).
+      - contact: merges base contact with tailored contact & prompt overrides so
+        topbar contact edits (LinkedIn, GitHub, Portfolio, Email, Phone) are preserved.
     """
     if not isinstance(tailored, dict):
         return base_resume
 
     out = dict(tailored)
 
-    # Name + contact are never the model's to change.
+    # Name is pinned to base_resume (prevent identity changes).
     out["name"] = base_resume.get("name")
-    out["contact"] = base_resume.get("contact")
+
+    # Contact info: merge base contact info with tailored contact info so user contact updates are preserved
+    base_contact = base_resume.get("contact") or {}
+    tailored_contact = dict(out.get("contact") or {})
+    merged_contact = dict(base_contact)
+
+    for field in ("email", "phone", "location", "linkedin", "github", "portfolio"):
+        t_val = (tailored_contact.get(field) or "").strip()
+        if t_val:
+            merged_contact[field] = _normalize_url(t_val) if field in ("linkedin", "github", "portfolio") else t_val
+
+    if prompt_text:
+        merged_contact = _apply_contact_overrides_from_prompt(merged_contact, prompt_text)
+
+    out["contact"] = merged_contact
 
     base_exp = base_resume.get("experience") or []
     base_edu = base_resume.get("education") or []
@@ -280,17 +334,37 @@ def sanitize_tailored(base_resume: dict, tailored: dict) -> dict:
 
     def _match(base_list, entry, key):
         """Find the base entry this tailored entry corresponds to, by
-        normalized identity key (falls back to positional in caller)."""
+        normalized identity key or token overlap (falls back to positional in caller)."""
         target = _norm_token(entry.get(key, ""))
+        if not target:
+            return None
+        # 1. Exact normalized match
         for b in base_list:
-            if _norm_token(b.get(key, "")) == target and target:
+            if _norm_token(b.get(key, "")) == target:
                 return b
+        # 2. Substring or token overlap match (handles reordering & slight rephrasing of names)
+        target_tokens = set(target.split())
+        best_match = None
+        best_score = 0
+        for b in base_list:
+            b_val = _norm_token(b.get(key, ""))
+            if not b_val:
+                continue
+            if target in b_val or b_val in target:
+                return b
+            b_tokens = set(b_val.split())
+            overlap = len(target_tokens & b_tokens)
+            if overlap > best_score:
+                best_score = overlap
+                best_match = b
+        if best_score >= 1:
+            return best_match
         return None
 
-    # Experience: pin company/title/dates to a base entry (positional first).
+    # Experience: match base entry by company FIRST (supports reordering).
     fixed_exp = []
     for i, e in enumerate(out.get("experience") or []):
-        b = base_exp[i] if i < len(base_exp) else (_match(base_exp, e, "company") or {})
+        b = _match(base_exp, e, "company") or (base_exp[i] if i < len(base_exp) else {})
         fixed = dict(e)
         for f in ("company", "title", "start_date", "end_date"):
             if b.get(f) is not None:
@@ -299,10 +373,10 @@ def sanitize_tailored(base_resume: dict, tailored: dict) -> dict:
     if out.get("experience") is not None:
         out["experience"] = fixed_exp
 
-    # Education: pin institution/degree/dates.
+    # Education: match base entry by institution FIRST (supports reordering).
     fixed_edu = []
     for i, e in enumerate(out.get("education") or []):
-        b = base_edu[i] if i < len(base_edu) else (_match(base_edu, e, "institution") or {})
+        b = _match(base_edu, e, "institution") or (base_edu[i] if i < len(base_edu) else {})
         fixed = dict(e)
         for f in ("institution", "degree", "start_date", "end_date"):
             if b.get(f) is not None:
@@ -311,14 +385,30 @@ def sanitize_tailored(base_resume: dict, tailored: dict) -> dict:
     if out.get("education") is not None:
         out["education"] = fixed_edu
 
-    # Projects: pin name/date/link (bullets + tech_stack rework kept).
+    # Projects: match base entry by name FIRST (supports reordering). Link preserved or updated if valid URL.
     fixed_proj = []
     for i, p in enumerate(out.get("projects") or []):
-        b = base_proj[i] if i < len(base_proj) else (_match(base_proj, p, "name") or {})
+        b = _match(base_proj, p, "name") or (base_proj[i] if i < len(base_proj) else {})
         fixed = dict(p)
-        for f in ("name", "date", "link"):
+        for f in ("name", "date"):
             if b.get(f) is not None:
                 fixed[f] = b.get(f)
+
+        # Smart Link Sanitization:
+        # 1. If tailored link is a valid HTTP/HTTPS URL, keep it (allows user link updates via prompt).
+        # 2. Else if base_resume link is a valid HTTP/HTTPS URL, restore it.
+        # 3. If base_resume link is a placeholder like 'Live Link' or 'GitHub', do not treat as URL.
+        t_link = (p.get("link") or "").strip()
+        b_link = (b.get("link") or "").strip()
+        if t_link.lower().startswith(("http://", "https://")):
+            fixed["link"] = t_link
+        elif b_link.lower().startswith(("http://", "https://")):
+            fixed["link"] = b_link
+        elif b_link and b_link.lower() not in ("live link", "github", "portfolio", "[live link]", "[github]"):
+            fixed["link"] = b_link
+        else:
+            fixed["link"] = None
+
         fixed_proj.append(fixed)
     if out.get("projects") is not None:
         out["projects"] = fixed_proj
@@ -731,6 +821,14 @@ def esc(text: str) -> str:
     return html_lib.escape(sanitize_for_pdf(text or ""))
 
 
+def _format_markdown_bold(text: str) -> str:
+    """Escape text for HTML and convert **bold** markdown markers into <strong> tags."""
+    if not text:
+        return ""
+    safe = esc(text)
+    return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", safe)
+
+
 def _normalize_url(url: str) -> str:
     """Ensure a link has a scheme so the rendered PDF's <a href> is absolute.
     A bare domain like "foo.vercel.app" would otherwise be treated as a
@@ -745,22 +843,24 @@ def _normalize_url(url: str) -> str:
 
 
 RESUME_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,400;0,500;0,700;1,400&family=Space+Grotesk:wght@600;700&display=swap');
 @page { size: letter; margin: 0.3in 0.5in; }
-body { font-family: Helvetica, Arial, sans-serif; font-size: 9.6pt; line-height: 1.12; color: #000000; }
-h1.name { text-align: center; font-size: 18pt; margin: 0 0 1px 0; line-height: 1.1; }
-p.contact { text-align: center; font-size: 9.3pt; margin: 0 0 4px 0; }
-h2.section { font-size: 11pt; border-bottom: 1px solid #000000; margin: 4px 0 1px 0; padding-bottom: 0px; line-height: 1.1; }
+body { font-family: "DM Sans", Helvetica, Arial, sans-serif; font-size: 9.6pt; line-height: 1.15; color: #1e293b; }
+h1.name { text-align: center; font-family: "Space Grotesk", sans-serif; font-size: 20pt; font-weight: 700; margin: 0 0 2px 0; line-height: 1.1; color: #0f172a; }
+p.contact { text-align: center; font-size: 9pt; color: #475569; margin: 0 0 6px 0; }
+h2.section { font-family: "Space Grotesk", sans-serif; font-size: 11pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #0f172a; border-bottom: 1.5px solid #2563eb; margin: 6px 0 2px 0; padding-bottom: 1px; line-height: 1.1; }
 table.row { width: 100%; border-collapse: collapse; }
-table.row td { padding: 0; vertical-align: top; line-height: 1.1; }
-td.left { text-align: left; font-weight: bold; }
-td.left.plain { font-weight: normal; }
-td.right { text-align: right; }
-p.subtext { font-style: italic; margin: 0; line-height: 1.1; }
-p.plain { margin: 0; line-height: 1.1; }
-ul.bullets { list-style-type: disc; margin: 0 0 2px 0; padding-left: 13px; }
-ul.bullets li { text-align: justify; margin-bottom: 0px; line-height: 1.15; }
-p.skills-line { margin: 0; line-height: 1.2; }
-a { color: #1155cc; text-decoration: underline; }
+table.row td { padding: 0; vertical-align: top; line-height: 1.15; }
+td.left { text-align: left; font-weight: 700; color: #0f172a; }
+td.left.plain { font-weight: 400; color: #334155; }
+td.right { text-align: right; color: #475569; font-size: 9pt; }
+p.subtext { font-style: italic; color: #475569; margin: 0; line-height: 1.15; }
+p.plain { margin: 0; line-height: 1.15; color: #334155; }
+ul.bullets { list-style-type: disc; margin: 1px 0 3px 0; padding-left: 14px; }
+ul.bullets li { text-align: left; margin-bottom: 1px; line-height: 1.18; color: #1e293b; }
+p.skills-line { margin: 1px 0; line-height: 1.2; color: #1e293b; }
+strong { font-weight: 700; color: #0f172a; }
+a { color: #2563eb; text-decoration: none; }
 """
 
 
@@ -770,22 +870,24 @@ a { color: #1155cc; text-decoration: underline; }
 # (the clean "professional" resume look). Same HTML structure as the Jake
 # template so one renderer serves both and ATS text extraction is identical.
 STANDARD_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,400;0,500;0,700;1,400&family=Space+Grotesk:wght@600;700&display=swap');
 @page { size: letter; margin: 0.5in 0.6in; }
-body { font-family: Helvetica, Arial, sans-serif; font-size: 10pt; line-height: 1.3; color: #111111; }
-h1.name { text-align: center; font-size: 21pt; font-weight: 700; margin: 0 0 3px 0; line-height: 1.1; letter-spacing: 0.2px; }
-p.contact { text-align: center; font-size: 8.8pt; color: #333; margin: 0 0 10px 0; }
-h2.section { font-size: 10pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: #111; border-bottom: 1px solid #444444; margin: 11px 0 5px 0; padding-bottom: 2px; }
+body { font-family: "DM Sans", Helvetica, Arial, sans-serif; font-size: 10pt; line-height: 1.3; color: #1e293b; }
+h1.name { text-align: center; font-family: "Space Grotesk", sans-serif; font-size: 22pt; font-weight: 700; margin: 0 0 3px 0; line-height: 1.1; letter-spacing: 0.2px; color: #0f172a; }
+p.contact { text-align: center; font-size: 9pt; color: #475569; margin: 0 0 10px 0; }
+h2.section { font-family: "Space Grotesk", sans-serif; font-size: 10.5pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #0f172a; border-bottom: 1.5px solid #0284c7; margin: 11px 0 5px 0; padding-bottom: 2px; }
 table.row { width: 100%; border-collapse: collapse; }
 table.row td { padding: 0; vertical-align: top; line-height: 1.3; }
-td.left { text-align: left; font-weight: 700; }
-td.left.plain { font-weight: 400; font-style: italic; }
-td.right { text-align: right; color: #333; font-size: 9pt; }
-p.subtext { font-style: italic; color: #333; margin: 0; line-height: 1.3; }
-p.plain { margin: 0; line-height: 1.3; }
+td.left { text-align: left; font-weight: 700; color: #0f172a; }
+td.left.plain { font-weight: 400; font-style: italic; color: #334155; }
+td.right { text-align: right; color: #475569; font-size: 9pt; }
+p.subtext { font-style: italic; color: #475569; margin: 0; line-height: 1.3; }
+p.plain { margin: 0; line-height: 1.3; color: #334155; }
 ul.bullets { list-style-type: disc; margin: 3px 0 5px 0; padding-left: 16px; }
-ul.bullets li { text-align: left; margin-bottom: 1.5px; line-height: 1.32; }
-p.skills-line { margin: 1.5px 0; line-height: 1.32; }
-a { color: #1155cc; text-decoration: underline; }
+ul.bullets li { text-align: left; margin-bottom: 1.5px; line-height: 1.32; color: #1e293b; }
+p.skills-line { margin: 1.5px 0; line-height: 1.32; color: #1e293b; }
+strong { font-weight: 700; color: #0f172a; }
+a { color: #0284c7; text-decoration: none; }
 """
 
 
@@ -797,23 +899,23 @@ a { color: #1155cc; text-decoration: underline; }
 _TEMPLATE_METRICS = {
     "jake": {
         "page_margin_v": 0.30, "page_margin_h": 0.5,
-        "body_font": 9.6, "body_lh": 1.12,
-        "name_font": 18.0, "contact_font": 9.3, "contact_mb": 4.0,
-        "section_font": 11.0, "section_mt": 4.0,
-        "bullet_lh": 1.15, "bullets_mb": 2.0, "skills_lh": 1.2,
-        "section_rule": "1px solid #000000", "body_color": "#000000",
-        "bullet_align": "justify", "section_upper": False,
-        "right_color": "", "right_font": "",
+        "body_font": 9.6, "body_lh": 1.15,
+        "name_font": 20.0, "contact_font": 9.0, "contact_mb": 6.0,
+        "section_font": 11.0, "section_mt": 6.0,
+        "bullet_lh": 1.18, "bullets_mb": 3.0, "skills_lh": 1.2,
+        "section_rule": "1.5px solid #2563eb", "body_color": "#1e293b",
+        "bullet_align": "left", "section_upper": True,
+        "right_color": "#475569", "right_font": "9pt",
     },
     "standard": {
         "page_margin_v": 0.50, "page_margin_h": 0.6,
         "body_font": 10.0, "body_lh": 1.3,
-        "name_font": 21.0, "contact_font": 8.8, "contact_mb": 10.0,
-        "section_font": 10.0, "section_mt": 11.0,
+        "name_font": 22.0, "contact_font": 9.0, "contact_mb": 10.0,
+        "section_font": 10.5, "section_mt": 11.0,
         "bullet_lh": 1.32, "bullets_mb": 5.0, "skills_lh": 1.32,
-        "section_rule": "1px solid #444444", "body_color": "#111111",
+        "section_rule": "1.5px solid #0284c7", "body_color": "#1e293b",
         "bullet_align": "left", "section_upper": True,
-        "right_color": "#333", "right_font": "9pt",
+        "right_color": "#475569", "right_font": "9pt",
     },
 }
 
@@ -841,28 +943,30 @@ def _build_css(template: str, scale: float = 1.0) -> str:
     right_extra = ""
     if m["right_color"]:
         right_extra = f" color: {m['right_color']}; font-size: {s(float(m['right_font'][:-2]))}pt;"
-    section_upper = " text-transform: uppercase; letter-spacing: 0.6px;" if m["section_upper"] else ""
+    section_upper = " text-transform: uppercase; letter-spacing: 0.05em;" if m["section_upper"] else ""
     name_extra = " font-weight: 700; letter-spacing: 0.2px;" if template == "standard" else ""
-    subtext_color = " color: #333;" if template == "standard" else ""
+    subtext_color = " color: #475569;"
     plain_left = " font-style: italic;" if template == "standard" else ""
 
     return f"""
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,400;0,500;0,700;1,400&family=Space+Grotesk:wght@600;700&display=swap');
 @page {{ size: letter; margin: {pm_v}in {pm_h}in; }}
-body {{ font-family: Helvetica, Arial, sans-serif; font-size: {s(m['body_font'], 7.4)}pt; line-height: {s(m['body_lh'], 1.02)}; color: {m['body_color']}; }}
-h1.name {{ text-align: center; font-size: {s(m['name_font'], 14.0)}pt; margin: 0 0 {s(2.0)}px 0; line-height: 1.1;{name_extra} }}
+body {{ font-family: "DM Sans", Helvetica, Arial, sans-serif; font-size: {s(m['body_font'], 7.4)}pt; line-height: {s(m['body_lh'], 1.02)}; color: {m['body_color']}; }}
+h1.name {{ text-align: center; font-family: "Space Grotesk", sans-serif; font-size: {s(m['name_font'], 14.0)}pt; margin: 0 0 {s(2.0)}px 0; line-height: 1.1; color: #0f172a;{name_extra} }}
 p.contact {{ text-align: center; font-size: {s(m['contact_font'], 7.4)}pt; margin: 0 0 {s(m['contact_mb'], 2.0)}px 0;{subtext_color} }}
-h2.section {{ font-size: {s(m['section_font'], 9.0)}pt; font-weight: 700;{section_upper} color: {m['body_color']}; border-bottom: {m['section_rule']}; margin: {s(m['section_mt'], 2.0)}px 0 1px 0; padding-bottom: 1px; line-height: 1.1; }}
+h2.section {{ font-family: "Space Grotesk", sans-serif; font-size: {s(m['section_font'], 9.0)}pt; font-weight: 700;{section_upper} color: #0f172a; border-bottom: {m['section_rule']}; margin: {s(m['section_mt'], 2.0)}px 0 1px 0; padding-bottom: 1px; line-height: 1.1; }}
 table.row {{ width: 100%; border-collapse: collapse; }}
 table.row td {{ padding: 0; vertical-align: top; line-height: {s(m['body_lh'], 1.02)}; }}
-td.left {{ text-align: left; font-weight: 700; }}
-td.left.plain {{ font-weight: 400;{plain_left} }}
+td.left {{ text-align: left; font-weight: 700; color: #0f172a; }}
+td.left.plain {{ font-weight: 400;{plain_left} color: #334155; }}
 td.right {{ text-align: right;{right_extra} }}
 p.subtext {{ font-style: italic; margin: 0; line-height: {s(m['body_lh'], 1.02)};{subtext_color} }}
-p.plain {{ margin: 0; line-height: {s(m['body_lh'], 1.02)}; }}
+p.plain {{ margin: 0; line-height: {s(m['body_lh'], 1.02)}; color: #334155; }}
 ul.bullets {{ list-style-type: disc; margin: {s(1.5)}px 0 {s(m['bullets_mb'], 1.0)}px 0; padding-left: {s(14.0, 10.0)}px; }}
-ul.bullets li {{ text-align: {m['bullet_align']}; margin-bottom: {s(1.0)}px; line-height: {s(m['bullet_lh'], 1.02)}; }}
-p.skills-line {{ margin: {s(1.0)}px 0; line-height: {s(m['skills_lh'], 1.02)}; }}
-a {{ color: #1155cc; text-decoration: underline; }}
+ul.bullets li {{ text-align: {m['bullet_align']}; margin-bottom: {s(1.0)}px; line-height: {s(m['bullet_lh'], 1.02)}; color: #1e293b; }}
+p.skills-line {{ margin: {s(1.0)}px 0; line-height: {s(m['skills_lh'], 1.02)}; color: #1e293b; }}
+strong {{ font-weight: 700; color: #0f172a; }}
+a {{ color: #2563eb; text-decoration: none; }}
 """
 
 
@@ -971,7 +1075,7 @@ def resume_to_html(resume: dict, template: str = DEFAULT_TEMPLATE, scale: float 
     sections = []
 
     if resume.get("summary"):
-        sections.append(f'<h2 class="section">Summary</h2><p class="plain">{esc(resume["summary"])}</p>')
+        sections.append(f'<h2 class="section">Summary</h2><p class="plain">{_format_markdown_bold(resume["summary"])}</p>')
 
     if resume.get("education"):
         rows = ['<h2 class="section">Education</h2>']
@@ -995,7 +1099,7 @@ def resume_to_html(resume: dict, template: str = DEFAULT_TEMPLATE, scale: float 
                 f'</tr></table>'
             )
             if edu.get("details"):
-                rows.append(f'<p class="plain">{esc(edu["details"])}</p>')
+                rows.append(f'<p class="plain">{_format_markdown_bold(edu["details"])}</p>')
         sections.append("".join(rows))
 
     if resume.get("experience"):
@@ -1005,8 +1109,6 @@ def resume_to_html(resume: dict, template: str = DEFAULT_TEMPLATE, scale: float 
             title = exp.get("title", "")
             company = exp.get("company", "")
             if template == "standard":
-                # Reference layout: "Company | Title" bold on the left line,
-                # dates right — no separate italic company line.
                 heading = " | ".join(x for x in [company, title] if x)
                 rows.append(
                     f'<table class="row"><tr>'
@@ -1022,7 +1124,7 @@ def resume_to_html(resume: dict, template: str = DEFAULT_TEMPLATE, scale: float 
                     f'</tr></table>'
                 )
                 rows.append(f'<p class="subtext">{esc(company)}</p>')
-            bullets = "".join(f"<li>{esc(b)}</li>" for b in exp.get("bullets", []))
+            bullets = "".join(f"<li>{_format_markdown_bold(b)}</li>" for b in exp.get("bullets", []))
             rows.append(f'<ul class="bullets">{bullets}</ul>')
         sections.append("".join(rows))
 
@@ -1032,8 +1134,6 @@ def resume_to_html(resume: dict, template: str = DEFAULT_TEMPLATE, scale: float 
             name_html = esc(proj.get("name", ""))
             if proj.get("link"):
                 _url = _normalize_url(proj["link"])
-                # Show the real (shortened) URL as the clickable text so the
-                # link is visible and verifiable, not a generic "Live Link".
                 _label = re.sub(r"^https?://", "", _url).rstrip("/")
                 name_html += f' (<a href="{esc(_url)}">{esc(_label)}</a>)'
             rows.append(
@@ -1045,7 +1145,7 @@ def resume_to_html(resume: dict, template: str = DEFAULT_TEMPLATE, scale: float 
             if proj.get("tech_stack"):
                 tech_line = " · ".join(esc(t) for t in proj["tech_stack"])
                 rows.append(f'<p class="subtext">{tech_line}</p>')
-            bullets = "".join(f"<li>{esc(b)}</li>" for b in proj.get("bullets", []))
+            bullets = "".join(f"<li>{_format_markdown_bold(b)}</li>" for b in proj.get("bullets", []))
             rows.append(f'<ul class="bullets">{bullets}</ul>')
         sections.append("".join(rows))
 
@@ -1058,7 +1158,7 @@ def resume_to_html(resume: dict, template: str = DEFAULT_TEMPLATE, scale: float 
 
     if resume.get("certifications"):
         rows = ['<h2 class="section">Certifications</h2>']
-        bullets = "".join(f"<li>{esc(c)}</li>" for c in resume["certifications"])
+        bullets = "".join(f"<li>{_format_markdown_bold(c)}</li>" for c in resume["certifications"])
         rows.append(f'<ul class="bullets">{bullets}</ul>')
         sections.append("".join(rows))
 
@@ -1107,14 +1207,25 @@ def _render_at_scales(resume: dict, template: str, scales) -> tuple[bytes, int]:
     last_pages = 0
     for scale in scales:
         html_str = resume_to_html(resume, template=template, scale=scale)
-        buf = io.BytesIO()
-        result = pisa.CreatePDF(html_str, dest=buf)
-        if result.err:
-            raise RuntimeError(f"xhtml2pdf failed to render PDF ({result.err} errors)")
-        last_bytes = buf.getvalue()
-        last_pages = _pdf_page_count(last_bytes)
-        if last_pages <= 1:
-            break
+        
+        pw_bytes = _render_pdf_playwright(html_str)
+        if pw_bytes:
+            last_bytes = pw_bytes
+            last_pages = _pdf_page_count(pw_bytes)
+            if last_pages <= 1:
+                break
+        else:
+            # Strip out remote @import urls to avoid xhtml2pdf/reportlab font fetching errors on Windows
+            html_str_pisa = re.sub(r"@import url\([^)]+\);", "", html_str)
+            
+            buf = io.BytesIO()
+            result = pisa.CreatePDF(html_str_pisa, dest=buf)
+            if result.err:
+                raise RuntimeError(f"xhtml2pdf failed to render PDF ({result.err} errors)")
+            last_bytes = buf.getvalue()
+            last_pages = _pdf_page_count(last_bytes)
+            if last_pages <= 1:
+                break
     return last_bytes, last_pages
 
 
@@ -1132,41 +1243,60 @@ def _render_at_smallest_scale(resume: dict, template: str) -> tuple[bytes, int]:
     return _render_at_scales(resume, template, steps)
 
 
+def _render_pdf_playwright(html_str: str) -> bytes | None:
+    """Render HTML string to PDF using Playwright Chromium.
+    Returns PDF bytes or None if Playwright is unavailable or fails."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html_str, wait_until="networkidle")
+            pdf_bytes = page.pdf(
+                format="Letter",
+                print_background=True,
+                margin={"top": "0.4in", "bottom": "0.4in", "left": "0.5in", "right": "0.5in"}
+            )
+            browser.close()
+            if pdf_bytes:
+                return pdf_bytes
+    except Exception as e:
+        print(f"  [WARNING] Playwright PDF engine unavailable/failed: {e}")
+    return None
+
+
 def _render_pdf_single_page(resume: dict, template: str, jd_text: str = "") -> bytes:
     """Render the resume to a single-page PDF (bytes).
 
-    Single-page guarantee, ordered to preserve readability and JD relevance:
-      1. Try READABLE layout compression. A resume that already fits at scale
-         1.0 is rendered once, unchanged.
-      2. If it still overflows AND a job description is available, drop the
-         least JD-relevant experience/project bullet (never identity, skills,
-         summary, or an entry's last bullet) and retry the readable scales —
-         repeating so we shed low-value content instead of shrinking text.
-      3. Only if nothing more can be safely trimmed, fall back to EXTREME
-         (smaller) scales so the one-page guarantee always holds.
-
-    Without a `jd_text`, steps 1+3 run as pure compression (behavior matches
-    the prior scale-only fit).
+    Single-page guarantee with dual rendering engine:
+      1. Try Playwright Chromium first for pixel-perfect PDF rendering with
+         modern Google Fonts, flexbox/CSS3 support, and crisp typography.
+      2. Fall back to xhtml2pdf if Playwright is unavailable in the environment.
     """
-    # Step 1: readable compression only.
+    html_str = resume_to_html(resume, template=template)
+    pw_bytes = _render_pdf_playwright(html_str)
+    if pw_bytes:
+        pages = _pdf_page_count(pw_bytes)
+        if pages <= 1:
+            return pw_bytes
+
+    # Fallback / bullet-trimming pass via xhtml2pdf layout compressor
     current = resume
-    pdf_bytes, pages = _render_at_scales(current, template, _readable_scales(current, template))
+    scales = _readable_scales(current, template)
+    pdf_bytes, pages = _render_at_scales(current, template, scales)
     if pages <= 1:
         return pdf_bytes
 
-    # Step 2: prefer trimming the least JD-relevant bullets (retrying readable
-    # scales after each drop) over shrinking text further.
-    if jd_text:
-        for _ in range(40):
-            trimmed = _trim_one_least_relevant_bullet(current, jd_text)
-            if trimmed is None:
-                break  # nothing safe left to remove
-            current = trimmed
-            pdf_bytes, pages = _render_at_scales(current, template, _readable_scales(current, template))
-            if pages <= 1:
-                return pdf_bytes
+    while pages > 1 and jd_text:
+        trimmed = _trim_one_least_relevant_bullet(current, jd_text)
+        if trimmed is None:
+            break
+        current = trimmed
+        pdf_bytes, pages = _render_at_scales(current, template, scales)
 
-    # Step 3: final safety net — extreme scales on whatever content remains.
+    if pages <= 1:
+        return pdf_bytes
+
     pdf_bytes, pages = _render_at_scales(current, template, _FIT_SCALE_EXTREME)
     return pdf_bytes
 

@@ -139,11 +139,13 @@ export default function ResumePage() {
     setInput("");
     setRephrasing(true);
     try {
+      const currentJson = (preview as Record<string, unknown> | null) || (shown as Record<string, unknown> | null) || undefined;
       const res = await api.resume.rephrase({
         jd_text: jd,
         company: company.trim() || undefined,
         role: role.trim() || undefined,
         template,
+        current_tailored_json: currentJson,
       });
       setPreview(res.tailored_json);
       setDiff(res.diff);
@@ -517,7 +519,12 @@ function ResumeSelector({
 }) {
   const [open, setOpen] = useState(false);
   const current = resumes.find((r) => r.id === selectedId);
-  const label = (current?.parsed_json as any)?.name || current?.file_ref || "Default";
+  const getLabel = (r: ProfileResume | undefined) => {
+    if (!r) return "Base Resume";
+    if (r.is_primary) return "Primary Base Resume";
+    return r.file_ref || (r.parsed_json as any)?.name || "Saved Version";
+  };
+  const label = getLabel(current);
 
   return (
     <div className="relative">
@@ -530,9 +537,9 @@ function ResumeSelector({
         <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
       </button>
       {open && resumes.length > 0 && (
-        <div className="absolute left-0 top-full z-20 mt-1 w-56 overflow-hidden rounded-lg border border-border bg-card shadow-dropdown">
+        <div className="absolute left-0 top-full z-20 mt-1 w-64 overflow-hidden rounded-lg border border-border bg-card shadow-dropdown">
           {resumes.map((r) => {
-            const name = (r.parsed_json as any)?.name || r.file_ref || "Resume";
+            const itemLabel = getLabel(r);
             return (
               <button
                 key={r.id}
@@ -543,11 +550,11 @@ function ResumeSelector({
                 }}
                 className={cn(
                   "flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-muted",
-                  r.id === selectedId ? "text-foreground" : "text-muted-foreground"
+                  r.id === selectedId ? "font-semibold text-foreground bg-muted/40" : "text-muted-foreground"
                 )}
               >
-                <span className="truncate">{name}</span>
-                {r.is_primary && <span className="text-[10px] text-accent1">primary</span>}
+                <span className="truncate">{itemLabel}</span>
+                {r.is_primary && <span className="ml-2 rounded bg-accent1/10 px-1.5 py-0.5 text-[10px] font-semibold text-accent1">primary</span>}
               </button>
             );
           })}
