@@ -1278,6 +1278,7 @@ def run(user_id: str | None = None):
         return
 
     tailored_count = 0
+    skipped_no_credits = 0
 
     for lead in targets:
         company = lead.get("company") or lead.get("x_handle") or "Unknown"
@@ -1291,6 +1292,19 @@ def run(user_id: str | None = None):
             except Exception:
                 pass
             continue
+
+        # Credit gate before the expensive work. The credit is charged once
+        # drafting completes for this lead, so tailoring a lead the user can't
+        # pay for would be unbillable spend. Already-charged leads (a partially
+        # processed lead being re-run) are exempt so they can finish.
+        try:
+            if not repo.already_charged_for_lead(user_id, lead["id"]) \
+                    and not repo.has_sufficient_credits(user_id, 1):
+                skipped_no_credits += 1
+                print(f"Skipping {company} ({lead['id']}) -- no credits left.")
+                continue
+        except Exception as e:
+            print(f"  ⚠️  credit check failed for {company}, proceeding: {e}")
 
         try:
             tailored = tailor_resume(base_resume, company, role, jd_text)
@@ -1325,7 +1339,8 @@ def run(user_id: str | None = None):
         print(f"Tailored resume for {company} -> {filename} "
               f"(ATS keyword coverage: {coverage}%)")
 
-    print(f"\ntailor_resume: {tailored_count} resumes tailored.")
+    tail = f", {skipped_no_credits} skipped (no credits)" if skipped_no_credits else ""
+    print(f"\ntailor_resume: {tailored_count} resumes tailored{tail}.")
 
 
 if __name__ == "__main__":

@@ -443,14 +443,10 @@ def test_get_job_with_company_malformed_id_returns_none_not_error():
 
 
 # ---------------------------------------------------------------------------
-# Credits (lifetime, no reset) -- 1 credit per completed-pipeline lead
+# Credits (lifetime, no reset) -- 1 credit per lead whose PROCESSING completed
+# (tailored resume + outreach draft). Charged via the credit_transactions
+# ledger, before the Gmail send/draft step.
 # ---------------------------------------------------------------------------
-
-
-def _mark_sent(user_id: str, lead_id: str, status: str = "sent"):
-    """Move a lead to a credit-consuming terminal state (stamps sent_at)."""
-    from datetime import datetime, timezone
-    repo.update_lead(user_id, lead_id, {"status": status, "sent_at": datetime.now(timezone.utc)})
 
 
 def test_credits_free_plan_has_25_lifetime_and_no_reset():
@@ -464,38 +460,81 @@ def test_credits_free_plan_has_25_lifetime_and_no_reset():
     assert q["reset"] is None
 
 
-def test_credit_consumed_only_by_completed_pipeline_lead():
+def test_credit_charged_when_processing_completes():
     user = _make_user("credits-consume")
     uid = user["id"]
 
-    # A raw matched lead (never completed the pipeline) costs NOTHING.
+    # A raw matched lead (nothing processed yet) costs NOTHING.
     raw = repo.add_lead(uid, {"company": "Raw Co", "role": "Engineer"})
     assert repo.get_outreach_quota(uid)["used"] == 0
 
-    # A lead that reaches 'sent' costs 1 credit.
-    sent_lead = repo.add_lead(uid, {"company": "Sent Co", "role": "Engineer"})
-    _mark_sent(uid, sent_lead["id"], "sent")
+    # Processing completing for a lead charges exactly 1 credit.
+    assert repo.charge_lead_processing(uid, raw["id"]) is True
     assert repo.get_outreach_quota(uid)["used"] == 1
 
-    # A lead that reaches 'draft_created' also costs 1 credit.
-    draft_lead = repo.add_lead(uid, {"company": "Draft Co", "role": "Engineer"})
-    _mark_sent(uid, draft_lead["id"], "draft_created")
+    # A second processed lead charges another.
+    second = repo.add_lead(uid, {"company": "Second Co", "role": "Engineer"})
+    repo.charge_lead_processing(uid, second["id"])
     q = repo.get_outreach_quota(uid)
     assert q["used"] == 2
     assert q["remaining"] == 23  # 25 - 2
 
 
-def test_credits_are_lifetime_not_windowed():
-    """A completed lead sent long ago still counts -- credits never reset."""
+def test_credit_charge_is_idempotent_per_lead():
+    """Reprocessing a lead (retry, re-run, or the graph path re-drafting) must
+    never bill it twice."""
+    user = _make_user("credits-idempotent")
+    uid = user["id"]
+    lead = repo.add_lead(uid, {"company": "Once Co", "role": "Engineer"})
+
+    assert repo.charge_lead_processing(uid, lead["id"]) is True
+    # Every subsequent charge for the same lead is a no-op.
+    assert repo.charge_lead_processing(uid, lead["id"]) is False
+    assert repo.charge_lead_processing(uid, lead["id"]) is False
+    assert repo.get_outreach_quota(uid)["used"] == 1
+    assert repo.already_charged_for_lead(uid, lead["id"]) is True
+
+
+def test_sending_does_not_charge_an_additional_credit():
+    """The credit is spent at processing; the later send/draft step is free."""
     from datetime import datetime, timezone
+    user = _make_user("credits-send-free")
+    uid = user["id"]
+    lead = repo.add_lead(uid, {"company": "Send Co", "role": "Engineer"})
+    repo.charge_lead_processing(uid, lead["id"])
+    assert repo.get_outreach_quota(uid)["used"] == 1
+
+    # Advancing the lead through to 'sent' must NOT add a second credit.
+    repo.update_lead(uid, lead["id"], {
+        "status": "sent", "sent_at": datetime.now(timezone.utc),
+    })
+    assert repo.get_outreach_quota(uid)["used"] == 1
+
+
+def test_credits_survive_lead_status_advancing_and_deletion():
+    """Usage is recorded, not derived: it must not shrink as a lead advances
+    past 'pending_review', nor when the lead is deleted outright."""
+    from datetime import datetime, timezone
+    user = _make_user("credits-monotonic")
+    uid = user["id"]
+    lead = repo.add_lead(uid, {"company": "Moving Co", "role": "Engineer"})
+    repo.charge_lead_processing(uid, lead["id"])
+
+    for status in ("pending_review", "in_review", "approved", "rejected"):
+        repo.update_lead(uid, lead["id"], {"status": status})
+        assert repo.get_outreach_quota(uid)["used"] == 1, f"credit lost at {status}"
+
+    # Deleting the lead must not refund the work already paid for.
+    repo.delete_lead(uid, lead["id"])
+    assert repo.get_outreach_quota(uid)["used"] == 1
+
+
+def test_credits_are_lifetime_not_windowed():
+    """A lead processed long ago still counts -- credits never reset."""
     user = _make_user("credits-lifetime")
     uid = user["id"]
     old = repo.add_lead(uid, {"company": "Old Co", "role": "Engineer"})
-    # Stamp sent_at a year in the past; a monthly window would have excluded it.
-    repo.update_lead(uid, old["id"], {
-        "status": "sent",
-        "sent_at": datetime(2020, 1, 1, tzinfo=timezone.utc),
-    })
+    repo.charge_lead_processing(uid, old["id"])
     assert repo.get_outreach_quota(uid)["used"] == 1
 
 
@@ -503,8 +542,25 @@ def test_credits_are_per_tenant_isolated():
     a = _make_user("credits-a")
     b = _make_user("credits-b")
     la = repo.add_lead(a["id"], {"company": "A Co", "role": "Eng"})
-    _mark_sent(a["id"], la["id"], "sent")
+    repo.charge_lead_processing(a["id"], la["id"])
     # A consumed 1 credit; B's balance is untouched.
     assert repo.get_outreach_quota(a["id"])["used"] == 1
     assert repo.get_outreach_quota(b["id"])["used"] == 0
     assert repo.get_outreach_quota(b["id"])["remaining"] == 25
+
+
+def test_has_sufficient_credits_reflects_balance():
+    user = _make_user("credits-sufficient")
+    uid = user["id"]
+    assert repo.has_sufficient_credits(uid, 25) is True
+    assert repo.has_sufficient_credits(uid, 26) is False
+
+    # Burn all 25 credits, then nothing is affordable.
+    for i in range(25):
+        lead = repo.add_lead(uid, {"company": f"Co {i}", "role": "Eng"})
+        repo.charge_lead_processing(uid, lead["id"])
+
+    q = repo.get_outreach_quota(uid)
+    assert q["used"] == 25
+    assert q["remaining"] == 0
+    assert repo.has_sufficient_credits(uid, 1) is False

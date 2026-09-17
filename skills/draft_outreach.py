@@ -180,10 +180,21 @@ def run(user_id: str | None = None):
     ]
 
     drafted = 0
+    skipped_no_credits = 0
 
     for lead in targets:
         label = lead.get("company") or lead.get("x_handle") or lead["id"]
         resume_version = lead["resume_version"]
+
+        # Credit gate (authoritative). Processing completes at the end of this
+        # loop iteration and costs 1 credit, so refuse to spend an LLM call on
+        # a lead the user can't pay for. A lead already charged (a re-run of an
+        # earlier partial processing) is exempt -- it must be allowed to finish.
+        if not repo.already_charged_for_lead(user_id, lead["id"]) \
+                and not repo.has_sufficient_credits(user_id, 1):
+            skipped_no_credits += 1
+            print(f"Skipping {label} ({lead['id']}) -- no credits left.")
+            continue
 
         try:
             tailored_resume = load_tailored_resume(resume_version)
@@ -214,10 +225,21 @@ def run(user_id: str | None = None):
         repo.update_lead(user_id, lead["id"], {
             "outreach_draft": draft, "status": "pending_review", "failure_reason": None,
         })
+
+        # Processing is now COMPLETE for this lead (tailored resume + outreach
+        # draft both exist) -- this is the charge point. Idempotent, so a
+        # reprocessed lead is never billed twice.
+        try:
+            if repo.charge_lead_processing(user_id, lead["id"]):
+                print(f"  💳 charged 1 credit for {label} (processing complete)")
+        except Exception as e:
+            print(f"  ⚠️  failed to record credit charge for {label}: {e}")
+
         drafted += 1
         print(f"\nDrafted outreach for {label} [status -> pending_review]:\n{'-' * 60}\n{draft}\n{'-' * 60}")
 
-    print(f"\ndraft_outreach: {drafted} drafts written.")
+    tail = f", {skipped_no_credits} skipped (no credits)" if skipped_no_credits else ""
+    print(f"\ndraft_outreach: {drafted} drafts written{tail}.")
 
 
 if __name__ == "__main__":

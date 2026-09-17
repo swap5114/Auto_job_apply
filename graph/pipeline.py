@@ -462,6 +462,24 @@ Job description / hiring-signal text:
 Candidate's tailored resume for this lead (JSON):
 {json.dumps(tailored_resume, indent=2)}"""
 
+    user_id = state.get("user_id")
+    lead_id = state.get("lead_id")
+
+    # Credit gate (authoritative) for FIRST-TIME outreach only -- follow-ups are
+    # free. Processing completes the moment this draft lands (the tailored resume
+    # already exists), so don't spend an LLM call on a lead the user can't pay
+    # for. A lead already charged (re-processed via feed_graph) is exempt so it
+    # can finish.
+    if not is_followup and user_id and lead_id:
+        try:
+            from db import repository as repo
+            if not repo.already_charged_for_lead(user_id, lead_id) \
+                    and not repo.has_sufficient_credits(user_id, 1):
+                print(f"  ⛔ draft_node: no credits left, skipping {company}")
+                return {"status": "draft_skipped_no_credits"}
+        except Exception as e:
+            print(f"  ⚠️  draft_node: credit check failed for {company}, proceeding: {e}")
+
     try:
         draft = llm_generate(
             system_prompt=SYSTEM_PROMPT,
@@ -471,6 +489,18 @@ Candidate's tailored resume for this lead (JSON):
         # Strip any link/email that isn't this user's own resume contact.
         draft = sanitize_outreach_links(draft, tailored_resume)
         print(f"  ✍️  draft_node: {'follow-up' if is_followup else 'outreach'} drafted for {company}")
+
+        # Processing complete (tailored resume + outreach draft) -> charge 1
+        # credit. Follow-ups are deliberately free. Idempotent per lead, so the
+        # standalone skills path and this node can't double-bill the same lead.
+        if not is_followup and user_id and lead_id:
+            try:
+                from db import repository as repo
+                if repo.charge_lead_processing(user_id, lead_id):
+                    print(f"  💳 draft_node: charged 1 credit for {company} (processing complete)")
+            except Exception as e:
+                print(f"  ⚠️  draft_node: failed to record credit charge for {company}: {e}")
+
         return {
             "outreach_draft": draft,
             "status": "pending_review",

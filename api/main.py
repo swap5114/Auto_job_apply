@@ -1517,15 +1517,16 @@ def _pipeline_run_to_response(run: Optional[dict]) -> dict:
     }
 
 
-def _require_sufficient_credits(user_id: str, requested_leads: int) -> None:
-    """Reject a pipeline start when the user lacks enough credits for the
-    number of leads it will attempt.
+def _require_sufficient_credits(user_id: str, requested_leads: int = 1) -> None:
+    """Reject a processing request when the user lacks enough credits.
 
-    1 credit = 1 lead that completes to a real outreach (tailored resume +
-    draft/sent). We gate the run up front against the user's remaining
-    balance (the backend source of truth from get_outreach_quota) so a run can
-    never process more leads than the user can pay for. Raises HTTP 402 with a
-    clear {needed, remaining} message when the balance is insufficient.
+    1 credit = 1 lead whose processing completes (tailored resume + outreach
+    draft). This is a fail-fast gate for good UX; the authoritative per-lead
+    enforcement lives inside the processing loops (skills/tailor_resume.py and
+    skills/draft_outreach.py), because processing is field-driven and can touch
+    more leads than a single request nominally asks for.
+
+    Raises HTTP 402 with a clear message when the balance is insufficient.
     """
     needed = max(1, int(requested_leads or 0))
     quota = repo.get_outreach_quota(user_id)
@@ -1534,7 +1535,7 @@ def _require_sufficient_credits(user_id: str, requested_leads: int) -> None:
         raise HTTPException(
             status_code=402,
             detail=(
-                f"Not enough credits: this run needs {needed} "
+                f"Not enough credits: this needs {needed} "
                 f"credit{'s' if needed != 1 else ''} but you have {remaining} left. "
                 "Reduce the number of leads or upgrade your plan."
             ),
@@ -1650,6 +1651,11 @@ def retry_lead(lead_id: str, user_id: str = Depends(get_authenticated_user_id)):
     if repo.get_running_pipeline_run(user_id):
         raise HTTPException(status_code=409, detail="Pipeline already running")
 
+    # Retrying re-runs the processing chain, which costs a credit when it
+    # completes -- unless this lead already paid for its processing.
+    if not repo.already_charged_for_lead(user_id, lead_id):
+        _require_sufficient_credits(user_id, 1)
+
     try:
         repo.update_lead(user_id, lead_id, {"failure_reason": None})
     except repo.NotFoundError:
@@ -1678,6 +1684,10 @@ async def upload_csv(file: UploadFile = File(...), user_id: str = Depends(get_au
 
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Please upload a .csv file")
+
+    # CSV-sourced leads run the same paid processing chain; require at least
+    # one credit before starting (per-lead enforcement happens in the loops).
+    _require_sufficient_credits(user_id, 1)
 
     save_path = os.path.join(PROJECT_ROOT, "config", "uploaded_companies.csv")
     try:
@@ -1711,6 +1721,9 @@ def trigger_find_emails(user_id: str = Depends(get_authenticated_user_id)):
 @app.post("/api/pipeline/tailor-resumes")
 def trigger_tailor_resumes(user_id: str = Depends(get_authenticated_user_id)):
     """Run the resume tailoring skill for the caller's leads that need it."""
+    # Tailoring is the first paid step of processing; a credit is consumed once
+    # the matching draft completes. Per-lead enforcement is inside run().
+    _require_sufficient_credits(user_id, 1)
     try:
         from skills.tailor_resume import run
         run(user_id=user_id)
@@ -1722,6 +1735,9 @@ def trigger_tailor_resumes(user_id: str = Depends(get_authenticated_user_id)):
 @app.post("/api/pipeline/draft-outreach")
 def trigger_draft_outreach(user_id: str = Depends(get_authenticated_user_id)):
     """Run the outreach drafting skill for the caller's leads."""
+    # Drafting completes processing and charges the credit. Per-lead
+    # enforcement is inside run().
+    _require_sufficient_credits(user_id, 1)
     try:
         from skills.draft_outreach import run
         run(user_id=user_id)
@@ -1733,6 +1749,9 @@ def trigger_draft_outreach(user_id: str = Depends(get_authenticated_user_id)):
 @app.post("/api/pipeline/feed-graph")
 def trigger_feed_graph(user_id: str = Depends(get_authenticated_user_id)):
     """Feed the caller's pending leads into the LangGraph review pipeline."""
+    # Feeding runs the graph, whose tailor/draft nodes re-do paid processing.
+    # Per-lead enforcement is inside draft_node.
+    _require_sufficient_credits(user_id, 1)
     try:
         from orchestrator.feed_graph import feed_pending_leads
         count = feed_pending_leads(user_id=user_id)

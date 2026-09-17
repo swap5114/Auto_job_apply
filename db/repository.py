@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 
 from db.models import (
     Company,
+    CreditTransaction,
     DemoBuild,
     DemoUsageDaily,
     EnrichmentCache,
@@ -1201,19 +1202,33 @@ def check_and_increment_demo_quota(user_id: str, max_daily: int = 5) -> bool:
 # ---------------------------------------------------------------------------
 # Credits (per-user, LIFETIME — no reset)
 #
-# The metered resource is a "completed-pipeline lead" — a lead that made it
-# all the way through the pipeline to an actual outreach action (status
-# 'sent' or 'draft_created', both stamp sent_at). Each such lead costs 1
-# credit. The free tier gets 25 credits for the LIFETIME of the account (no
-# monthly reset); paid plans get more. This is the single backend source of
-# truth; the frontend reads it via GET /api/outreach/quota.
+# 1 credit = 1 lead whose PROCESSING COMPLETED: a tailored resume AND an
+# outreach draft were both produced for it. That is the point at which real
+# money has already been spent on the lead (the per-lead LLM calls for
+# research, tailoring and drafting), and it happens BEFORE the Gmail
+# send/draft step. Charging here rather than at send time aligns billing with
+# cost: a lead that is fully processed and then rejected at review still
+# consumed the compute it cost.
 #
-# A lead that never completes the pipeline (no contact email, tailoring/draft
-# failed, rejected at review) never reaches sent/draft_created, so it never
-# costs a credit -- exactly the "1 credit per completed-pipeline lead" rule.
+# Usage is RECORDED in the credit_transactions ledger, never derived from lead
+# status. The completion marker ("pending_review") is transient -- leads move
+# on to in_review/approved/sent -- so a status-derived count would shrink over
+# time and silently hand credits back. Each charge is single-shot via a unique
+# (user_id, idempotency_key), so reprocessing, retries, and the two parallel
+# processing paths can never double-bill the same lead.
+#
+# NOT charged:
+#   - follow-up drafts (free, by product decision)
+#   - leads that fail before both artifacts exist (no contact found,
+#     tailor_failed, draft_failed)
+#   - the Gmail send/draft step itself (already paid for at processing)
+#
+# The free tier gets 25 credits for the LIFETIME of the account (no monthly
+# reset); paid plans get more. This is the single backend source of truth; the
+# frontend reads it via GET /api/outreach/quota.
 # ---------------------------------------------------------------------------
 
-# Lifetime credit allowance per plan (1 credit = 1 completed-pipeline lead).
+# Lifetime credit allowance per plan (1 credit = 1 fully-processed lead).
 # Keep in sync with the copy shown in the UI (frontend/src/lib/quota.ts falls
 # back to these same numbers offline).
 PLAN_CREDIT_LIMIT: dict[str, int] = {
@@ -1225,55 +1240,72 @@ PLAN_CREDIT_LIMIT: dict[str, int] = {
 # Back-compat alias -- older references to PLAN_OUTREACH_LIMIT still resolve.
 PLAN_OUTREACH_LIMIT = PLAN_CREDIT_LIMIT
 
-# Outcomes that consume a credit (a completed-pipeline lead that produced a
-# real outreach action -- both put a message in the world).
+# Ledger reasons.
+CREDIT_REASON_LEAD_PROCESSED = "lead_processed"
+CREDIT_REASON_ADJUSTMENT = "adjustment"
+
+# Retained for reference/back-compat: the statuses that used to define a
+# credit-consuming outcome under the old send-time metering. No longer used to
+# compute usage.
 _OUTREACH_SENT_STATUSES = ("sent", "draft_created")
 
 
-def count_outreach_used(user_id: str, since: Optional[datetime] = None) -> int:
-    """Count credits this user has consumed = leads that completed the
-    pipeline to an outreach action (status sent/draft_created).
+def _lead_processed_key(lead_id: str) -> str:
+    """The idempotency key for a lead's one-and-only processing charge.
 
-    LIFETIME by default (no reset): every such lead the user has ever had
-    counts. `since` is retained for callers that still want a windowed
-    count, but the credit system no longer passes it.
+    Deliberately keyed on lead_id ALONE (not the run, path, or attempt) so
+    every route into processing -- the standalone skills chain, the LangGraph
+    draft node, retries, and re-runs -- collapses onto the same key and bills
+    the lead exactly once.
     """
-    from sqlalchemy import func
+    return f"{CREDIT_REASON_LEAD_PROCESSED}:{lead_id}"
 
+
+def count_credits_used(user_id: str, since: Optional[datetime] = None) -> int:
+    """Total credits this user has consumed, from the ledger.
+
+    LIFETIME by default (no reset). `since` filters by charge time for callers
+    that want a window; the credit system itself never passes it.
+    """
     with get_session() as session:
         stmt = (
-            select(func.count())
-            .select_from(Lead)
-            .where(
-                Lead.user_id == user_id,
-                Lead.status.in_(_OUTREACH_SENT_STATUSES),
-                Lead.sent_at.is_not(None),
-            )
+            select(func.coalesce(func.sum(CreditTransaction.amount), 0))
+            .where(CreditTransaction.user_id == user_id)
         )
         if since is not None:
-            stmt = stmt.where(Lead.sent_at >= since)
+            stmt = stmt.where(CreditTransaction.created_at >= since)
         return int(session.scalar(stmt) or 0)
+
+
+def count_outreach_used(user_id: str, since: Optional[datetime] = None) -> int:
+    """Back-compat alias for count_credits_used.
+
+    Kept so existing callers/tests referring to the old name keep working; the
+    semantics are now "credits consumed per the ledger", not "leads at
+    sent/draft_created".
+    """
+    return count_credits_used(user_id, since=since)
 
 
 def get_outreach_quota(user_id: str) -> dict:
     """Return this user's LIFETIME credit balance:
     {plan, used, limit, remaining, reset} — the backend source of truth.
 
-    - used:      credits consumed (completed-pipeline leads, lifetime)
+    - used:      credits consumed (fully-processed leads, lifetime, from the ledger)
     - limit:     the plan's lifetime credit allowance
     - remaining: credits left (never below 0)
     - reset:     null -- credits are lifetime and never reset
 
-    The key/response shape is unchanged so the existing frontend + the
-    OutreachQuotaResponse model keep working; only the semantics moved from
-    "per month" to "lifetime".
+    The response shape is intentionally unchanged so the existing frontend
+    (frontend/src/lib/quota.ts) and the OutreachQuotaResponse model keep
+    working; only what `used` counts has changed.
     """
     user = get_user(user_id)
     plan = (user or {}).get("plan") or "free"
     if plan not in PLAN_CREDIT_LIMIT:
         plan = "free"
     limit = PLAN_CREDIT_LIMIT[plan]
-    used = count_outreach_used(user_id)  # lifetime
+    used = count_credits_used(user_id)  # lifetime, from the ledger
     return {
         "plan": plan,
         "used": used,
@@ -1281,6 +1313,69 @@ def get_outreach_quota(user_id: str) -> dict:
         "remaining": max(0, limit - used),
         "reset": None,  # lifetime credits never reset
     }
+
+
+def get_remaining_credits(user_id: str) -> int:
+    """Credits this user has left (never below 0)."""
+    return int(get_outreach_quota(user_id).get("remaining", 0))
+
+
+def has_sufficient_credits(user_id: str, needed: int = 1) -> bool:
+    """True when the user can afford `needed` more processed leads."""
+    return get_remaining_credits(user_id) >= max(0, int(needed or 0))
+
+
+def charge_lead_processing(
+    user_id: str, lead_id: str, amount: int = 1,
+) -> bool:
+    """Charge 1 credit for a lead whose processing just completed.
+
+    Idempotent: the unique (user_id, idempotency_key) constraint means a second
+    call for the same lead is a no-op. Returns True if this call actually wrote
+    the charge, False if the lead was already charged.
+
+    Callers must invoke this only once BOTH artifacts exist (tailored resume +
+    outreach draft). It is intentionally not called for follow-up drafts.
+    """
+    if not user_id or not lead_id or not _is_valid_uuid(lead_id):
+        return False
+
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from db.models import _uuid
+
+    key = _lead_processed_key(lead_id)
+    with get_session() as session:
+        # ON CONFLICT DO NOTHING makes the charge atomic and single-shot even
+        # if two concurrent workers finish the same lead at once.
+        stmt = (
+            pg_insert(CreditTransaction.__table__)
+            .values(
+                id=_uuid(),
+                user_id=user_id,
+                lead_id=lead_id,
+                amount=int(amount),
+                reason=CREDIT_REASON_LEAD_PROCESSED,
+                idempotency_key=key,
+                created_at=datetime.now(timezone.utc),
+            )
+            .on_conflict_do_nothing(constraint="uq_credit_tx_user_key")
+        )
+        result = session.execute(stmt)
+        return bool(result.rowcount)
+
+
+def already_charged_for_lead(user_id: str, lead_id: str) -> bool:
+    """True when this lead has already consumed its processing credit."""
+    if not user_id or not lead_id or not _is_valid_uuid(lead_id):
+        return False
+    with get_session() as session:
+        found = session.scalar(
+            select(CreditTransaction.id).where(
+                CreditTransaction.user_id == user_id,
+                CreditTransaction.idempotency_key == _lead_processed_key(lead_id),
+            )
+        )
+        return found is not None
 
 
 def get_daily_demo_usage(user_id: str, max_daily: int = 5) -> dict:

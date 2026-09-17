@@ -440,36 +440,23 @@ def run(user_id: str | None = None) -> dict:
         print(f"No leads to process (statuses: {', '.join(statuses)}).")
         return summary
 
-    # --- Monthly outreach quota (backend-enforced) -----------------------
-    # Compute the remaining allowance once, then decrement locally as we send
-    # so we don't re-query per lead. Once exhausted, remaining leads are left
-    # untouched and counted as skipped_quota (they stay 'approved' for next
-    # cycle). Quota is not enforced on the legacy single-operator CLI path.
-    remaining_quota: Optional[int] = None
+    # --- No credit gate here, by design ---------------------------------
+    # Credits are charged when a lead's PROCESSING completes (tailored resume +
+    # outreach draft), which happens strictly before this step. Every lead that
+    # reaches here has therefore already been paid for, so re-checking the
+    # balance would wrongly block a user at their limit from sending outreach
+    # they already own. `quota_limit` is still reported for context.
     if user_id is not None:
         try:
-            q = repo.get_outreach_quota(target_user)
-            remaining_quota = int(q.get("remaining", 0))
-            summary["quota_limit"] = int(q.get("limit", 0))
-        except Exception as e:
-            print(f"  ⚠️  Could not read outreach quota, proceeding without cap: {e}")
-            remaining_quota = None
+            summary["quota_limit"] = int(repo.get_outreach_quota(target_user).get("limit", 0))
+        except Exception:
+            pass
 
     for lead in leads:
-        if remaining_quota is not None and remaining_quota <= 0:
-            summary["skipped_quota"] = summary.get("skipped_quota", 0) + 1
-            continue
-
         outcome = process_approved_lead(service, lead, target_user, direct_send, sender)
         summary[outcome] = summary.get(outcome, 0) + 1
 
-        # Only successfully-actioned outreach consumes the allowance.
-        if remaining_quota is not None and outcome in ("sent", "draft_created"):
-            remaining_quota -= 1
-
     tail = ""
-    if summary.get("skipped_quota"):
-        tail = f", {summary['skipped_quota']} skipped (quota reached)"
     print(
         f"\nDone: {summary['sent']} sent, {summary['draft_created']} drafts, "
         f"{summary['skipped_no_email']} no-email, {summary['failed']} failed{tail}."

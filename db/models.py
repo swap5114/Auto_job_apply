@@ -141,6 +141,7 @@ class User(Base):
     demo_builds = relationship("DemoBuild", back_populates="user", cascade="all, delete-orphan")
     demo_usages = relationship("DemoUsageDaily", back_populates="user", cascade="all, delete-orphan")
     settings = relationship("UserSettings", back_populates="user", cascade="all, delete-orphan", uselist=False)
+    credit_transactions = relationship("CreditTransaction", back_populates="user", cascade="all, delete-orphan")
 
 
 class Resume(Base):
@@ -443,6 +444,50 @@ class DemoBuild(Base):
 
     __table_args__ = (
         Index("ix_demo_builds_user_created", "user_id", "created_at"),
+    )
+
+
+class CreditTransaction(Base):
+    """Append-only ledger of credit consumption — the source of truth for
+    "credits used".
+
+    Why a ledger instead of deriving usage from lead status: a credit is now
+    charged when a lead's PROCESSING completes (tailored resume + outreach
+    draft both exist), which is marked by the transient status
+    "pending_review". Status keeps moving after that (in_review -> approved ->
+    sent/rejected), so any status-derived count would shrink as leads advance
+    and silently hand credits back. Recording the charge as an immutable event
+    makes usage monotonic, auditable, and independent of a lead's later
+    lifecycle (including deletion, via ondelete=SET NULL on lead_id).
+
+    `idempotency_key` is what makes a charge single-shot. Both processing
+    paths (the standalone skills chain and the LangGraph draft node) and every
+    retry/re-run funnel through the same key (e.g. "lead_processed:<lead_id>"),
+    so a lead can never be billed twice no matter how many times it is
+    reprocessed.
+    """
+    __tablename__ = "credit_transactions"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Kept nullable + SET NULL so deleting a lead never erases the charge it
+    # already incurred (the work was done and paid for).
+    lead_id = Column(UUID(as_uuid=False), ForeignKey("leads.id", ondelete="SET NULL"), nullable=True)
+    # Credits consumed by this event. Positive = charge; negative allows a
+    # refund/grant adjustment without rewriting history.
+    amount = Column(Integer, nullable=False, default=1)
+    # Machine reason: "lead_processed" (the only charge today) | "adjustment".
+    # Follow-up drafts are deliberately NOT charged.
+    reason = Column(String, nullable=False, default="lead_processed")
+    idempotency_key = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+    user = relationship("User", back_populates="credit_transactions")
+
+    __table_args__ = (
+        # The single-shot guarantee: one charge per (user, key).
+        UniqueConstraint("user_id", "idempotency_key", name="uq_credit_tx_user_key"),
+        Index("ix_credit_transactions_user_created", "user_id", "created_at"),
     )
 
 

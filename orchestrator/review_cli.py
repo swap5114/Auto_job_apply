@@ -13,6 +13,27 @@ from graph.pipeline import (
 from db import repository as repo
 from db.current_user import get_current_user_id
 
+# Statuses that mean a lead completed the pipeline to a real outreach action
+# (a message put in the world) — these are the credit-consuming outcomes.
+# Keep in sync with db.repository._OUTREACH_SENT_STATUSES.
+_OUTREACH_COMPLETED_STATUSES = ("sent", "draft_created")
+
+
+def _stamp_outreach_completion(update_fields: dict, final_status: str) -> dict:
+    """When a lead's final status is a completed-outreach status (sent /
+    draft_created), stamp `sent_at` so the lead is counted as 1 consumed
+    credit. Credit accounting (db.repository.count_outreach_used) requires a
+    non-null `sent_at`, so without this the outreach would never be metered.
+
+    Mutates and returns `update_fields`. Only sets `sent_at` for completed
+    outreach and never overwrites an already-present value (idempotent across
+    re-approvals / re-sends).
+    """
+    if final_status in _OUTREACH_COMPLETED_STATUSES and "sent_at" not in update_fields:
+        from datetime import datetime, timezone
+        update_fields["sent_at"] = datetime.now(timezone.utc)
+    return update_fields
+
 
 def get_all_thread_ids(user_id: Optional[str] = None, checkpointer=None) -> List[str]:
     """Queries the checkpoints table for registered thread IDs.
@@ -196,6 +217,7 @@ def approve_lead(
             update_fields["contact_email"] = final.values["contact_email"]
         if final.values.get("contact_name"):
             update_fields["contact_name"] = final.values["contact_name"]
+    _stamp_outreach_completion(update_fields, final_status)
 
     try:
         repo.update_lead(user_id, lead_id, update_fields)
@@ -267,6 +289,7 @@ def edit_lead(
             update_fields["contact_email"] = final.values["contact_email"]
         if final.values.get("contact_name"):
             update_fields["contact_name"] = final.values["contact_name"]
+    _stamp_outreach_completion(update_fields, final_status)
 
     try:
         repo.update_lead(user_id, lead_id, update_fields)
