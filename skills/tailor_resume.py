@@ -1249,7 +1249,10 @@ def _render_pdf_playwright(html_str: str) -> bytes | None:
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            )
             page = browser.new_page()
             page.set_content(html_str, wait_until="networkidle")
             pdf_bytes = page.pdf(
